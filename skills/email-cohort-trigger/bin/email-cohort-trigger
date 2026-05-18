@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+# email-cohort-trigger — design behavioral triggers + cohort transitions.
+# Reads clients/<client>/events.yaml; emits a target-tool trigger spec.
+#
+# Modes:
+#   --mode bootstrap  — write a starter events.yaml template
+#   --mode design     — produce trigger spec for a named cohort
+#   --mode spec       — emit only the API-shaped spec (assumes design has run)
+#
+# Exit codes:
+#   0 — spec written
+#   1 — gate fail
+#   3 — substrate-gap, missing events.yaml, stale events.yaml
+#   4 — invalid args
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+export FLYWHEEL_ROOT="$SUBSTRATE_ROOT"
+
+# shellcheck disable=SC1091
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+MODE="design"
+COHORT=""
+TARGET_TOOL="generic"
+OUT=""
+ACCEPT_STALE_EVENTS=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)              CLIENT="$2"; shift 2 ;;
+    --mode)                MODE="$2"; shift 2 ;;
+    --cohort)              COHORT="$2"; shift 2 ;;
+    --target-tool)         TARGET_TOOL="$2"; shift 2 ;;
+    --out)                 OUT="$2"; shift 2 ;;
+    --accept-stale-events) ACCEPT_STALE_EVENTS=1; shift ;;
+    --help|-h)             sed -n '2,15p' "$0" | sed 's/^# //'; exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 4 ;;
+  esac
+done
+
+[ -n "$CLIENT" ] || { echo "REFUSED: --client required" >&2; exit 4; }
+
+case "$MODE" in
+  bootstrap|design|spec) ;;
+  *) skill_refuse "invalid-mode" "got '$MODE'; expected bootstrap, design, or spec" ;;
+esac
+
+case "$TARGET_TOOL" in
+  customer-io|iterable|webhook|generic) ;;
+  *) skill_refuse "invalid-target-tool" "got '$TARGET_TOOL'; expected customer-io, iterable, webhook, or generic" ;;
+esac
+
+EVENTS_YAML="$SUBSTRATE_ROOT/clients/$CLIENT/events.yaml"
+TODAY="$(date -u +%Y-%m-%d)"
+
+# --- BOOTSTRAP MODE -----------------------------------------------------
+
+if [ "$MODE" = "bootstrap" ]; then
+  echo "=== email-cohort-trigger: bootstrap events.yaml for $CLIENT ===" >&2
+  if [ -f "$EVENTS_YAML" ]; then
+    echo "  ! events.yaml already exists at $EVENTS_YAML" >&2
+    echo "  Refusing to overwrite. Edit the existing file or delete it first." >&2
+    exit 3
+  fi
+  mkdir -p "$(dirname "$EVENTS_YAML")"
+  cat > "$EVENTS_YAML" <<EOF
+# events.yaml — canonical product event taxonomy for $CLIENT
+# Read by skills/email-cohort-trigger and skills/email-sequence-design.
+#
+# Schema rules:
+#   - last_updated must be within freshness_window_days; otherwise the skill refuses.
+#   - source_system must be declared (amplitude / segment / posthog / mixpanel / custom).
+#   - every event has a last_observed date; events past 90 days are flagged "decommissioned" candidates.
+#   - every cohort has an enter_on, exit_on, timeout_days, and icp_cell.
+
+version: 0.1
+last_updated: $TODAY
+freshness_window_days: 30
+source_system: amplitude
+
+events:
+  - name: trial.started
+    description: A user created a new trial account.
+    surface: signup-flow
+    properties:
+      - email
+      - signup_source
+    icp_cells: [primary-icp]
+    last_observed: $TODAY
+
+  - name: trial.activated
+    description: User completed the activation milestone (varies by product).
+    surface: product-core
+    properties:
+      - first_activation_event
+    icp_cells: [primary-icp]
+    last_observed: $TODAY
+
+  - name: trial.activated.no-teammate-96h
+    description: Trial activated but no teammate invited within 96 hours.
+    surface: derived-trigger
+    properties:
+      - account_id
+    icp_cells: [primary-icp]
+    last_observed: $TODAY
+
+  - name: team.member.invited
+    description: A teammate received an invite to the workspace.
+    surface: team-management
+    properties:
+      - inviter_id
+      - invitee_email
+    icp_cells: [primary-icp]
+    last_observed: $TODAY
+
+  - name: trial.cancelled
+    description: User cancelled the trial before conversion.
+    surface: billing
+    properties:
+      - cancellation_reason
+    icp_cells: [primary-icp]
+    last_observed: $TODAY
+
+cohorts:
+  - id: paid-trial-stuck-on-activation
+    description: Trial users who activated but did not invite a teammate within 96 hours.
+    enter_on: trial.activated.no-teammate-96h
+    exit_on:
+      - team.member.invited
+      - trial.cancelled
+      - cohort.timeout
+    timeout_days: 14
+    icp_cell: primary-icp
+EOF
+  echo "  ✓ wrote $EVENTS_YAML" >&2
+  echo "  Edit the file to match your product's real events. Then run with --mode design." >&2
+  echo "PASS: $EVENTS_YAML"
+  exit 0
+fi
+
+# --- DESIGN / SPEC MODE -------------------------------------------------
+
+[ -n "$COHORT" ] || { echo "REFUSED: --cohort required for $MODE mode" >&2; exit 4; }
+
+echo "=== email-cohort-trigger: $MODE mode for cohort '$COHORT' ===" >&2
+
+skill_preflight "email-cohort-trigger" "$CLIENT"
+preflight_rc=$?
+if [ "$preflight_rc" -ne 0 ]; then
+  exit "$preflight_rc"
+fi
+
+if [ ! -f "$EVENTS_YAML" ]; then
+  skill_refuse "events-yaml-missing" "clients/$CLIENT/events.yaml not found. Run with --mode bootstrap first."
+fi
+
+# Validate freshness using python (yaml-light parsing).
+PYRESULT="$(python3 - "$EVENTS_YAML" "$COHORT" <<'PY'
+import sys
+import re
+from datetime import datetime, timedelta
+
+path, cohort = sys.argv[1:3]
+
+# Lightweight YAML walker — does not depend on PyYAML, parses the contract this skill enforces.
+data = open(path, "r", encoding="utf-8").read()
+
+def get_top_scalar(key):
+    m = re.search(rf"^{re.escape(key)}\s*:\s*(.+?)\s*$", data, flags=re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+last_updated = get_top_scalar("last_updated")
+freshness_days_str = get_top_scalar("freshness_window_days")
+source_system = get_top_scalar("source_system")
+
+if not last_updated:
+    print("REFUSED|missing-last-updated")
+    sys.exit(3)
+if not freshness_days_str:
+    print("REFUSED|missing-freshness-window")
+    sys.exit(3)
+if not source_system:
+    print("REFUSED|missing-source-system")
+    sys.exit(3)
+
+try:
+    last_updated_dt = datetime.strptime(last_updated, "%Y-%m-%d")
+except ValueError:
+    print(f"REFUSED|invalid-last-updated-format|{last_updated}")
+    sys.exit(3)
+
+freshness_days = int(freshness_days_str)
+if datetime.utcnow() - last_updated_dt > timedelta(days=freshness_days):
+    age = (datetime.utcnow() - last_updated_dt).days
+    print(f"REFUSED|events-yaml-stale|age={age}d window={freshness_days}d")
+    sys.exit(3)
+
+# Walk events list. Pull every "  - name: <name>" up to the cohorts: section.
+cohort_split = re.split(r"^cohorts:\s*$", data, maxsplit=1, flags=re.MULTILINE)
+events_section = cohort_split[0]
+event_names = [
+    m.strip()
+    for m in re.findall(r"^\s*-\s*name:\s*(\S+)\s*$", events_section, flags=re.MULTILINE)
+]
+
+# Walk cohorts list
+if len(cohort_split) < 2:
+    print("REFUSED|no-cohorts-section")
+    sys.exit(3)
+cohort_section = cohort_split[1]
+cohort_ids = [
+    m.strip()
+    for m in re.findall(r"^\s*-\s*id:\s*(\S+)\s*$", cohort_section, flags=re.MULTILINE)
+]
+
+if cohort not in cohort_ids:
+    # Suggest closest by simple Levenshtein
+    def lev(a, b):
+        if len(a) < len(b): return lev(b, a)
+        if not b: return len(a)
+        prev = list(range(len(b)+1))
+        for i, ca in enumerate(a):
+            curr = [i+1]
+            for j, cb in enumerate(b):
+                ins = prev[j+1] + 1
+                dl = curr[j] + 1
+                sub = prev[j] + (ca != cb)
+                curr.append(min(ins, dl, sub))
+            prev = curr
+        return prev[-1]
+    closest = sorted(cohort_ids, key=lambda c: lev(c, cohort))[:3] if cohort_ids else []
+    print(f"REFUSED|cohort-not-found|{cohort}|suggestions={','.join(closest)}")
+    sys.exit(3)
+
+# Pull cohort attributes
+cohort_block = re.search(
+    rf"-\s*id:\s*{re.escape(cohort)}\b.*?(?=^\s*-\s*id:|\Z)",
+    cohort_section, flags=re.MULTILINE | re.DOTALL,
+)
+if cohort_block is None:
+    print(f"REFUSED|cohort-block-not-found|{cohort}")
+    sys.exit(3)
+block = cohort_block.group(0)
+
+def grab(field):
+    m = re.search(rf"^\s*{re.escape(field)}\s*:\s*(.+?)\s*$", block, flags=re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+description = grab("description") or ""
+enter_on = grab("enter_on") or ""
+icp_cell = grab("icp_cell") or ""
+timeout_days = grab("timeout_days") or ""
+
+# exit_on is a YAML list; collect items
+exit_on = []
+exit_match = re.search(r"^\s*exit_on:\s*\n((?:\s+-\s+.+\n)+)", block, flags=re.MULTILINE)
+if exit_match:
+    exit_on = [line.strip().lstrip("-").strip() for line in exit_match.group(1).strip().split("\n") if line.strip()]
+
+# Validate triggers
+if not enter_on or enter_on == "always" or enter_on == "broadcast":
+    print(f"REFUSED|broadcast-trigger|enter_on={enter_on}")
+    sys.exit(3)
+if enter_on not in event_names:
+    print(f"REFUSED|enter-event-undeclared|{enter_on}")
+    sys.exit(3)
+if not exit_on:
+    print(f"REFUSED|no-exit-events|cohort={cohort}")
+    sys.exit(3)
+if not timeout_days:
+    print(f"REFUSED|no-timeout|cohort={cohort}")
+    sys.exit(3)
+
+# Decommissioned-event check: pull last_observed for enter event.
+def last_observed_for(name):
+    m = re.search(
+        rf"-\s*name:\s*{re.escape(name)}\b.*?last_observed:\s*([0-9-]+)",
+        data, flags=re.MULTILINE | re.DOTALL,
+    )
+    return m.group(1) if m else None
+
+stale_events = []
+for ev in [enter_on] + exit_on:
+    if ev in ("cohort.timeout", "cohort.exit"):
+        continue
+    obs = last_observed_for(ev)
+    if obs:
+        try:
+            obs_dt = datetime.strptime(obs, "%Y-%m-%d")
+            if datetime.utcnow() - obs_dt > timedelta(days=90):
+                stale_events.append(f"{ev}|{obs}")
+        except ValueError:
+            stale_events.append(f"{ev}|invalid-date")
+
+print(f"OK|{description}|{enter_on}|{','.join(exit_on)}|{timeout_days}|{icp_cell}|{','.join(stale_events)}")
+PY
+)" || true
+
+# Parse python result
+case "$PYRESULT" in
+  REFUSED\|*)
+    err="${PYRESULT#REFUSED|}"
+    skill_refuse "$(echo "$err" | cut -d'|' -f1)" "$err"
+    ;;
+  OK\|*)
+    payload="${PYRESULT#OK|}"
+    DESCRIPTION="$(echo "$payload" | awk -F'|' '{print $1}')"
+    ENTER_ON="$(echo "$payload" | awk -F'|' '{print $2}')"
+    EXIT_ON="$(echo "$payload" | awk -F'|' '{print $3}')"
+    TIMEOUT_DAYS="$(echo "$payload" | awk -F'|' '{print $4}')"
+    ICP_CELL="$(echo "$payload" | awk -F'|' '{print $5}')"
+    STALE_EVENTS="$(echo "$payload" | awk -F'|' '{print $6}')"
+    ;;
+  *)
+    echo "REFUSED: unexpected validator output: $PYRESULT" >&2
+    exit 1
+    ;;
+esac
+
+if [ -n "$STALE_EVENTS" ] && [ "$ACCEPT_STALE_EVENTS" -ne 1 ]; then
+  skill_refuse "decommissioned-event" "events with last_observed > 90 days ago: $STALE_EVENTS — pass --accept-stale-events with a substrate-cited reason to override."
+fi
+
+echo "  ✓ events.yaml validated; cohort '$COHORT' resolved" >&2
+echo "    enter_on=$ENTER_ON exit_on=$EXIT_ON timeout=${TIMEOUT_DAYS}d icp_cell=$ICP_CELL" >&2
+
+# --- emit trigger spec ---
+
+[ -n "$OUT" ] || OUT="$SUBSTRATE_ROOT/clients/$CLIENT/email/triggers/$COHORT.md"
+mkdir -p "$(dirname "$OUT")"
+
+linked_sequence_path="clients/$CLIENT/email/sequences/$COHORT/"
+linked_sequence_full="$SUBSTRATE_ROOT/$linked_sequence_path"
+sequence_link_block=""
+if [ -d "$linked_sequence_full" ]; then
+  sequence_link_block="The sequence \`$linked_sequence_path\` is wired against this cohort. Trigger fires route subscribers into step-01 of that sequence."
+else
+  sequence_link_block="No sequence wired yet. Run: \`substrate email-sequence-design --client $CLIENT --cohort $COHORT --sequence-id $COHORT --trigger-event $ENTER_ON --purpose <purpose> --target-conversion <event>\`"
+fi
+
+# Tool-specific spec body
+emit_customer_io_spec() {
+  cat <<EOF
+\`\`\`yaml
+# Customer.io campaign trigger spec
+# Apply via Customer.io API or UI: Campaigns → Triggered Campaigns → New Trigger.
+# Smoke-test: POST a synthetic event to Customer.io and confirm the campaign fires once.
+
+name: $COHORT
+type: triggered_campaign
+trigger:
+  event: $ENTER_ON
+  segment_filter: <see ICP cell mapping>
+exit_conditions:
+  conversion_events:
+$(for e in $(echo "$EXIT_ON" | tr ',' ' '); do echo "    - $e"; done)
+  unsubscribe: true
+  timeout_days: $TIMEOUT_DAYS
+deduplication: account_id
+icp_cell: $ICP_CELL
+\`\`\`
+EOF
+}
+
+emit_iterable_spec() {
+  cat <<EOF
+\`\`\`yaml
+# Iterable journey trigger spec
+# Apply via Iterable Studio: Journeys → Create → Entry Trigger.
+# Smoke-test: trigger entry via API track endpoint with eventName=$ENTER_ON.
+
+name: $COHORT
+type: journey
+entry:
+  triggerType: event
+  eventName: $ENTER_ON
+exit:
+  conversionEvents:
+$(for e in $(echo "$EXIT_ON" | tr ',' ' '); do echo "    - $e"; done)
+  unsubscribe: true
+  journeyTimeoutDays: $TIMEOUT_DAYS
+icpCell: $ICP_CELL
+\`\`\`
+EOF
+}
+
+emit_webhook_spec() {
+  cat <<EOF
+\`\`\`yaml
+# Generic webhook trigger spec
+# The product emits this POST to a configured email tool when the trigger fires.
+
+endpoint: <configured target endpoint>
+method: POST
+content_type: application/json
+idempotency_header: X-Idempotency-Key
+expected_payload:
+  cohort: $COHORT
+  event: $ENTER_ON
+  account_id: <id>
+  email: <subscriber email>
+  timestamp: <ISO 8601>
+exit_events:
+$(for e in $(echo "$EXIT_ON" | tr ',' ' '); do echo "  - $e"; done)
+timeout_days: $TIMEOUT_DAYS
+icp_cell: $ICP_CELL
+\`\`\`
+EOF
+}
+
+emit_generic_spec() {
+  cat <<EOF
+\`\`\`yaml
+# Vendor-neutral trigger spec
+# Translate to your email tool's API. The substrate is the same regardless of vendor.
+
+cohort_id: $COHORT
+description: $DESCRIPTION
+enter_event: $ENTER_ON
+exit_events:
+$(for e in $(echo "$EXIT_ON" | tr ',' ' '); do echo "  - $e"; done)
+timeout_days: $TIMEOUT_DAYS
+icp_cell: $ICP_CELL
+deduplication_key: account_id
+\`\`\`
+EOF
+}
+
+case "$TARGET_TOOL" in
+  customer-io) SPEC_BODY="$(emit_customer_io_spec)" ;;
+  iterable)    SPEC_BODY="$(emit_iterable_spec)" ;;
+  webhook)     SPEC_BODY="$(emit_webhook_spec)" ;;
+  generic)     SPEC_BODY="$(emit_generic_spec)" ;;
+esac
+
+{
+  cat <<EOF
+---
+asset_type: trigger spec
+client: $CLIENT
+cohort: $COHORT
+target_tool: $TARGET_TOOL
+authored_date: $TODAY
+events_yaml: clients/$CLIENT/events.yaml
+icp_cell: $ICP_CELL
+---
+
+# Trigger spec, $COHORT, $TARGET_TOOL
+
+## Cohort
+
+\`$COHORT\` — $DESCRIPTION
+
+ICP cell: \`$ICP_CELL\` (mapped in \`clients/$CLIENT/02-icp.md\`).
+
+## Enter event
+
+\`$ENTER_ON\` — declared in \`clients/$CLIENT/events.yaml\`.
+
+## Exit events
+
+EOF
+  for e in $(echo "$EXIT_ON" | tr ',' ' '); do
+    echo "- \`$e\`"
+  done
+  cat <<EOF
+
+## Timeout policy
+
+Cohort membership expires after $TIMEOUT_DAYS days regardless of enter/exit state.
+
+## Tool spec
+
+$SPEC_BODY
+
+## Linked sequence
+
+$sequence_link_block
+
+## Substrate citations
+
+- Events taxonomy: \`clients/$CLIENT/events.yaml\`
+- ICP cell mapping: \`clients/$CLIENT/02-icp.md\` (cell \`$ICP_CELL\`)
+- Conversion narrative: \`clients/$CLIENT/06-conversion-narrative.md\`
+- Product knowledge: \`clients/$CLIENT/05-product-knowledge.md\`
+
+## Patterns grounding this trigger
+
+- knowledge/patterns/one-segment-one-trigger.md (the cohort-trigger unit)
+- knowledge/patterns/engagement-decay-as-relevance-signal.md (exit-on-conversion is mandatory)
+
+## Smoke-test instructions
+
+1. Trigger an event \`$ENTER_ON\` on a test account in $TARGET_TOOL.
+2. Confirm the campaign / journey fires exactly once for that account.
+3. Trigger one of the exit events; confirm the account drops out of the campaign.
+4. Wait $TIMEOUT_DAYS days on a separate test account with no exit events; confirm timeout drop.
+
+EOF
+} > "$OUT"
+
+echo "  → wrote $OUT" >&2
+echo "PASS: $OUT (tool=$TARGET_TOOL, exits=$(echo "$EXIT_ON" | tr ',' ' ' | wc -w | tr -d ' '), timeout=${TIMEOUT_DAYS}d)"
+exit 0

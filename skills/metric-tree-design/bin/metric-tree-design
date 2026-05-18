@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""metric-tree-design, design the client's north-star + supporting metric tree.
+
+Per the metric-tree-not-metric-stack pattern, organize metrics structurally:
+north-star (root), 2-4 input metrics (branches), supporting metrics, behavioral
+leaves. The skill produces a markdown tree (with ASCII tree art) and a YAML
+artifact. Refuses without ICP. Refuses with >4 input metrics or >12 leaves
+(tree must fit on one page).
+
+Usage:
+    metric-tree-design --client <client> [--north-star <metric-name>] \
+        [--input-axes acquisition,activation,retention,monetization,referral] \
+        [--depth 3] [--update]
+
+Outputs:
+    clients/<client>/analytics/metric-tree.md
+    clients/<client>/analytics/metric-tree.yaml
+    clients/<client>/analytics/metric-tree-audit-checklist.md
+
+Exit codes:
+    0, tree written
+    1, written with warnings (data-gap or cadence-missing flags)
+    3, refused (substrate gap, missing ICP, too-many-inputs, too-many-leaves)
+    4, invalid args
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+
+# Default tree templates per axis-frame. Each template is a per-input-axis list
+# of (supporting metric, behavioral leaf) tuples. The skill instantiates a
+# default tree from the template, then surfaces gaps for the operator to fill.
+
+DEFAULT_NORTH_STAR_CANDIDATES = [
+    {
+        "id": "weekly-active-revenue-cohorts",
+        "name": "Weekly active paying cohorts (W1-W12 retention curve)",
+        "definition": "Cohorts of paying users still active in week N, computed weekly. The retention curve IS the north-star.",
+        "source_system": "amplitude (or warehouse stitch)",
+        "cadence": "weekly",
+        "rationale": "Per Casey Winters: retention is the trunk of the tree. A weekly active paying cohort number is the truest read of whether the product is worth what people pay.",
+    },
+    {
+        "id": "annual-recurring-revenue",
+        "name": "Annual Recurring Revenue (ARR)",
+        "definition": "Annualized recurring subscription revenue; ARR_t = sum of monthly subscription value * 12 across all active subscribers at time t.",
+        "source_system": "stripe",
+        "cadence": "daily",
+        "rationale": "Per Tunguz / Reichheld: ARR is the canonical SaaS revenue metric. As a north-star it has the virtue of being source-system definite and the limitation of lagging behavior.",
+    },
+    {
+        "id": "monthly-active-customers",
+        "name": "Monthly Active Customers (MAC) by ICP cell",
+        "definition": "Distinct ICP-fit-positive customers with at least one product session in the trailing 30 days, segmented by ICP cell.",
+        "source_system": "amplitude + hubspot",
+        "cadence": "weekly",
+        "rationale": "Per Lenny Rachitsky's named-company tree examples: MAC by ICP cell is the cleanest 'who is using this and is it the right who' read.",
+    },
+]
+
+INPUT_METRIC_TEMPLATES = {
+    "acquisition": {
+        "id": "weekly-new-customer-cohorts",
+        "name": "Weekly new paying customer cohorts",
+        "definition": "Distinct paying customers who started their first paid subscription in the named week.",
+        "source_system": "stripe + hubspot",
+        "cadence": "weekly",
+        "supporting": [
+            {
+                "id": "weekly-icp-fit-trial-signups",
+                "name": "Weekly ICP-fit trial signups",
+                "definition": "Trial signups whose firmographic match the ICP definition; signal of acquisition quality, not volume.",
+                "source_system": "amplitude + hubspot",
+                "cadence": "daily",
+            },
+            {
+                "id": "trial-to-paid-conversion-rate",
+                "name": "Trial-to-paid conversion rate (W4)",
+                "definition": "Of weekly ICP-fit trial cohort, share that converted to paid by week 4.",
+                "source_system": "stripe + amplitude",
+                "cadence": "weekly",
+            },
+        ],
+        "leaves": [
+            {
+                "id": "icp-fit-signup-rate",
+                "name": "ICP-fit signup rate",
+                "definition": "Share of all signups whose firmographic data matches the ICP definition.",
+                "source_system": "hubspot",
+                "cadence": "daily",
+            },
+        ],
+    },
+    "activation": {
+        "id": "trial-activation-rate",
+        "name": "Trial activation rate (within window N)",
+        "definition": "Share of weekly trial cohort that hit the activation event within the canonical window (named by activation-funnel-audit).",
+        "source_system": "amplitude",
+        "cadence": "weekly",
+        "supporting": [
+            {
+                "id": "time-to-activation-median",
+                "name": "Median time to activation (hours)",
+                "definition": "Median hours from signup to activation event for the cohort that activated.",
+                "source_system": "amplitude",
+                "cadence": "weekly",
+            },
+            {
+                "id": "activation-by-signup-source",
+                "name": "Activation rate by signup source",
+                "definition": "Activation rate split by signup_source property. Identifies channels delivering qualified vs unqualified signups.",
+                "source_system": "amplitude",
+                "cadence": "weekly",
+            },
+        ],
+        "leaves": [
+            {
+                "id": "first-value-event-completion",
+                "name": "First-value event completion rate (D1)",
+                "definition": "Share of new signups that complete the named first-value event within 24 hours.",
+                "source_system": "amplitude",
+                "cadence": "daily",
+            },
+            {
+                "id": "onboarding-step-dropoff",
+                "name": "Onboarding step dropoff rate",
+                "definition": "Per-step dropoff in the onboarding flow; surfaces the highest-friction step.",
+                "source_system": "amplitude",
+                "cadence": "weekly",
+            },
+        ],
+    },
+    "retention": {
+        "id": "w4-retention-rate",
+        "name": "W4 cohort retention rate",
+        "definition": "Share of activated paying users in cohort C still active in week 4.",
+        "source_system": "amplitude (cohort retention)",
+        "cadence": "weekly",
+        "supporting": [
+            {
+                "id": "monthly-net-revenue-retention",
+                "name": "Net Revenue Retention (NRR)",
+                "definition": "Trailing 12-month NRR: (start ARR - churn ARR + expansion ARR) / start ARR for the named cohort.",
+                "source_system": "stripe",
+                "cadence": "monthly",
+            },
+            {
+                "id": "monthly-gross-revenue-retention",
+                "name": "Gross Revenue Retention (GRR)",
+                "definition": "Trailing 12-month GRR: (start ARR - churn ARR) / start ARR.",
+                "source_system": "stripe",
+                "cadence": "monthly",
+            },
+            {
+                "id": "monthly-churn-rate",
+                "name": "Monthly logo churn rate",
+                "definition": "Distinct churned customers in month / start-of-month customer count.",
+                "source_system": "stripe",
+                "cadence": "monthly",
+            },
+        ],
+        "leaves": [
+            {
+                "id": "weekly-engagement-decay",
+                "name": "Weekly engagement decay flags",
+                "definition": "Active customers whose session count in trailing 7 days is more than 1.5 SD below their trailing-30 baseline; leading indicator of churn.",
+                "source_system": "amplitude",
+                "cadence": "daily",
+            },
+        ],
+    },
+    "monetization": {
+        "id": "monthly-revenue-per-customer",
+        "name": "Monthly average revenue per customer (ARPC)",
+        "definition": "Sum of monthly subscription revenue / distinct paying customers; tracks pricing power and tier-mix.",
+        "source_system": "stripe",
+        "cadence": "monthly",
+        "supporting": [
+            {
+                "id": "expansion-revenue-rate",
+                "name": "Expansion revenue rate",
+                "definition": "Trailing-quarter expansion ARR (upsell, seat-add, tier-up) / start-of-quarter ARR.",
+                "source_system": "stripe",
+                "cadence": "monthly",
+            },
+            {
+                "id": "downgrade-revenue-rate",
+                "name": "Downgrade revenue rate",
+                "definition": "Trailing-quarter downgrade ARR (tier-down, seat-removal) / start-of-quarter ARR.",
+                "source_system": "stripe",
+                "cadence": "monthly",
+            },
+        ],
+        "leaves": [
+            {
+                "id": "weekly-upgrade-events",
+                "name": "Weekly upgrade event count",
+                "definition": "Count of paid_started or upgrade_initiated events in the week.",
+                "source_system": "amplitude",
+                "cadence": "weekly",
+            },
+        ],
+    },
+    "referral": {
+        "id": "monthly-referral-driven-signups",
+        "name": "Monthly referral-driven signups",
+        "definition": "Signups whose first_touch_source = referral or whose self-reported source = referral.",
+        "source_system": "hubspot",
+        "cadence": "monthly",
+        "supporting": [
+            {
+                "id": "invite-send-rate",
+                "name": "Per-account invite send rate",
+                "definition": "Share of activated accounts that send at least one teammate invite within window N.",
+                "source_system": "amplitude",
+                "cadence": "monthly",
+            },
+        ],
+        "leaves": [
+            {
+                "id": "invite-acceptance-rate",
+                "name": "Invite-to-signup conversion",
+                "definition": "Share of teammate invites that convert to a workspace signup within 7 days.",
+                "source_system": "amplitude",
+                "cadence": "weekly",
+            },
+        ],
+    },
+}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    return 3
+
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/")
+    if not (client_root / "positioning").is_dir() and not (client_root / "positioning.md").is_file():
+        fails.append(f"positioning layer missing: clients/{client}/positioning/")
+    return len(fails) == 0, fails
+
+
+def parse_input_axes(axes: str) -> list[str]:
+    parsed = [a.strip() for a in axes.split(",") if a.strip()]
+    invalid = [a for a in parsed if a not in INPUT_METRIC_TEMPLATES]
+    if invalid:
+        raise ValueError(f"unknown input axes: {invalid}; valid: {list(INPUT_METRIC_TEMPLATES)}")
+    return parsed
+
+
+def select_north_star(name: str | None) -> dict:
+    if name is None:
+        return DEFAULT_NORTH_STAR_CANDIDATES[0]
+    for cand in DEFAULT_NORTH_STAR_CANDIDATES:
+        if cand["id"] == name or cand["name"] == name:
+            return cand
+    # Allow a custom name; the skill flags it for operator review.
+    return {
+        "id": name.lower().replace(" ", "-"),
+        "name": name,
+        "definition": "[operator-defined; replace with one-sentence definition]",
+        "source_system": "[operator-defined]",
+        "cadence": "[operator-defined]",
+        "rationale": "Operator-supplied north-star; substrate cannot validate without rationale text.",
+    }
+
+
+def build_tree(north_star: dict, axes: list[str]) -> dict:
+    """Build a tree dict. Returns {north_star, inputs: [{...}], leaves}.
+    Each input has supporting + leaves nested.
+    """
+    tree = {
+        "north_star": dict(north_star),
+        "inputs": [],
+    }
+    for axis in axes:
+        tpl = INPUT_METRIC_TEMPLATES[axis]
+        tree["inputs"].append({
+            "axis": axis,
+            "id": tpl["id"],
+            "name": tpl["name"],
+            "definition": tpl["definition"],
+            "source_system": tpl["source_system"],
+            "cadence": tpl["cadence"],
+            "supporting": [dict(s) for s in tpl["supporting"]],
+            "leaves": [dict(l) for l in tpl["leaves"]],
+        })
+    return tree
+
+
+def count_leaves(tree: dict) -> int:
+    n = 0
+    for inp in tree["inputs"]:
+        n += len(inp.get("leaves", []))
+        # supporting metrics one level above leaves do not count as leaves.
+    return n
+
+
+def validate_tree(tree: dict, accept_gaps: bool) -> tuple[bool, list[str], list[str]]:
+    """Return (ok, errors, warnings)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    n_inputs = len(tree["inputs"])
+    if n_inputs > 4:
+        errors.append(f"too-many-inputs: {n_inputs} > 4. Per the metric-tree-not-metric-stack pattern, more than 4 inputs is a sign the team has not picked.")
+    if n_inputs == 0:
+        errors.append("zero-inputs: at least one input metric is required.")
+
+    n_leaves = count_leaves(tree)
+    if n_leaves > 12:
+        errors.append(f"too-many-leaves: {n_leaves} > 12. Tree must fit on one page; prune.")
+
+    # Check every node has a source-system + cadence.
+    nodes_to_check: list[dict] = [tree["north_star"]]
+    for inp in tree["inputs"]:
+        nodes_to_check.append(inp)
+        nodes_to_check.extend(inp.get("supporting", []))
+        nodes_to_check.extend(inp.get("leaves", []))
+
+    for node in nodes_to_check:
+        ss = (node.get("source_system") or "").strip()
+        if not ss or ss.startswith("[operator-defined"):
+            msg = f"data-gap: node `{node.get('id') or node.get('name')}` has no source_system."
+            if accept_gaps:
+                warnings.append(msg)
+            else:
+                errors.append(msg)
+        cad = (node.get("cadence") or "").strip()
+        if not cad or cad.startswith("[operator-defined"):
+            msg = f"cadence-missing: node `{node.get('id') or node.get('name')}` has no cadence."
+            if accept_gaps:
+                warnings.append(msg)
+            else:
+                errors.append(msg)
+
+    return len(errors) == 0, errors, warnings
+
+
+def render_yaml(tree: dict, today: str) -> str:
+    """Hand-render YAML so the file works without PyYAML."""
+    lines: list[str] = []
+    lines.append(f"# metric-tree.yaml — generated by metric-tree-design on {today}")
+    lines.append("# Read by: dashboard-spec, lift-test-design, open-goal, analytics-monthly-refresh.")
+    lines.append("")
+    lines.append("version: 0.1")
+    lines.append(f"last_updated: {today}")
+    lines.append("freshness_window_days: 90")
+    lines.append("")
+    lines.append("north_star:")
+    ns = tree["north_star"]
+    lines.append(f"  id: {ns['id']}")
+    lines.append(f"  name: {_quote_if(ns['name'])}")
+    lines.append(f"  definition: {_quote_if(ns['definition'])}")
+    lines.append(f"  source_system: {_quote_if(ns['source_system'])}")
+    lines.append(f"  cadence: {ns['cadence']}")
+    lines.append("  node_kind: north-star")
+    lines.append("  parent_id: null")
+    lines.append(f"  rationale: {_quote_if(ns.get('rationale', ''))}")
+    lines.append("")
+    lines.append("inputs:")
+    for inp in tree["inputs"]:
+        lines.append(f"  - id: {inp['id']}")
+        lines.append(f"    name: {_quote_if(inp['name'])}")
+        lines.append(f"    axis: {inp['axis']}")
+        lines.append(f"    definition: {_quote_if(inp['definition'])}")
+        lines.append(f"    source_system: {_quote_if(inp['source_system'])}")
+        lines.append(f"    cadence: {inp['cadence']}")
+        lines.append("    node_kind: input")
+        lines.append(f"    parent_id: {ns['id']}")
+        if inp.get("supporting"):
+            lines.append("    supporting:")
+            for s in inp["supporting"]:
+                lines.append(f"      - id: {s['id']}")
+                lines.append(f"        name: {_quote_if(s['name'])}")
+                lines.append(f"        definition: {_quote_if(s['definition'])}")
+                lines.append(f"        source_system: {_quote_if(s['source_system'])}")
+                lines.append(f"        cadence: {s['cadence']}")
+                lines.append("        node_kind: supporting")
+                lines.append(f"        parent_id: {inp['id']}")
+        if inp.get("leaves"):
+            lines.append("    leaves:")
+            for l in inp["leaves"]:
+                lines.append(f"      - id: {l['id']}")
+                lines.append(f"        name: {_quote_if(l['name'])}")
+                lines.append(f"        definition: {_quote_if(l['definition'])}")
+                lines.append(f"        source_system: {_quote_if(l['source_system'])}")
+                lines.append(f"        cadence: {l['cadence']}")
+                lines.append("        node_kind: leaf")
+                lines.append(f"        parent_id: {inp['id']}")
+    return "\n".join(lines) + "\n"
+
+
+def _quote_if(s: str) -> str:
+    if not s:
+        return '""'
+    if any(c in s for c in [":", "{", "}", "[", "]", ",", "&", "*", "#", "?", "|", ">", "<", "=", "!", "%", "@", "`", '"']):
+        # double-quote and escape internal "
+        return '"' + s.replace('"', '\\"') + '"'
+    return s
+
+
+def render_tree_art(tree: dict) -> str:
+    """ASCII tree visualization."""
+    lines: list[str] = []
+    ns = tree["north_star"]
+    lines.append(f"[ROOT, north-star]  {ns['name']}  ({ns['cadence']}, source: {ns['source_system']})")
+    inputs = tree["inputs"]
+    for i, inp in enumerate(inputs):
+        last_input = (i == len(inputs) - 1)
+        edge = "└── " if last_input else "├── "
+        cont = "    " if last_input else "│   "
+        lines.append(f"{edge}[INPUT/{inp['axis']}]  {inp['name']}  ({inp['cadence']}, source: {inp['source_system']})")
+
+        sups = inp.get("supporting", [])
+        leaves = inp.get("leaves", [])
+
+        # supporting metrics
+        for j, s in enumerate(sups):
+            last_sup = (j == len(sups) - 1) and not leaves
+            edge2 = "└── " if last_sup else "├── "
+            lines.append(f"{cont}{edge2}[SUPPORTING]  {s['name']}  ({s['cadence']}, source: {s['source_system']})")
+
+        # leaves
+        for k, l in enumerate(leaves):
+            last_leaf = (k == len(leaves) - 1)
+            edge2 = "└── " if last_leaf else "├── "
+            lines.append(f"{cont}{edge2}[LEAF]  {l['name']}  ({l['cadence']}, source: {l['source_system']})")
+
+    return "\n".join(lines)
+
+
+def render_md(tree: dict, client: str, today: str, errors: list[str], warnings: list[str]) -> str:
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: metric tree, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append(f"client: {client}")
+    lines.append("patterns_grounded: [metric-tree-not-metric-stack, goalpost-discipline-vs-metric-drift]")
+    lines.append("produced_by: metric-tree-design")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Metric tree, {client}, {today}")
+    lines.append("")
+    lines.append(
+        "Per the `metric-tree-not-metric-stack` pattern, metrics organize as a tree, not a flat "
+        "stack. The north-star is the root. Two-to-four input metrics are first-level branches "
+        "(each captures a lever). Supporting metrics decompose each input. Behavioral leading "
+        "indicators sit at the leaves."
+    )
+    lines.append("")
+    lines.append(
+        "Per `goalpost-discipline-vs-metric-drift`, every node carries a definition and a "
+        "source-system. The audit checklist is regenerated each quarter; mid-quarter changes are "
+        "logged as overrides."
+    )
+    lines.append("")
+
+    lines.append("## Tree visualization")
+    lines.append("")
+    lines.append("```")
+    lines.append(render_tree_art(tree))
+    lines.append("```")
+    lines.append("")
+
+    lines.append("## North-star")
+    lines.append("")
+    ns = tree["north_star"]
+    lines.append(f"**Metric:** {ns['name']}  ")
+    lines.append(f"**ID:** `{ns['id']}`  ")
+    lines.append(f"**Definition:** {ns['definition']}  ")
+    lines.append(f"**Source system:** {ns['source_system']}  ")
+    lines.append(f"**Cadence:** {ns['cadence']}  ")
+    lines.append(f"**Rationale:** {ns.get('rationale', '')}")
+    lines.append("")
+
+    lines.append("## Input metrics (branches)")
+    lines.append("")
+    lines.append(
+        "Each input metric represents a lever. Per the pattern, a tree with more than 4 inputs is "
+        "a sign the team has not picked; this tree carries "
+        f"{len(tree['inputs'])} input(s)."
+    )
+    lines.append("")
+    for inp in tree["inputs"]:
+        lines.append(f"### Input: {inp['name']}  (`{inp['axis']}`)")
+        lines.append("")
+        lines.append(f"- **ID:** `{inp['id']}`")
+        lines.append(f"- **Definition:** {inp['definition']}")
+        lines.append(f"- **Source system:** {inp['source_system']}")
+        lines.append(f"- **Cadence:** {inp['cadence']}")
+        lines.append(f"- **Parent:** `{ns['id']}` (north-star)")
+        lines.append("")
+        if inp.get("supporting"):
+            lines.append("**Supporting metrics:**")
+            lines.append("")
+            lines.append("| ID | Metric | Definition | Cadence | Source |")
+            lines.append("|---|---|---|---|---|")
+            for s in inp["supporting"]:
+                lines.append(f"| `{s['id']}` | {s['name']} | {s['definition']} | {s['cadence']} | {s['source_system']} |")
+            lines.append("")
+        if inp.get("leaves"):
+            lines.append("**Behavioral leaves (leading indicators):**")
+            lines.append("")
+            lines.append("| ID | Metric | Definition | Cadence | Source |")
+            lines.append("|---|---|---|---|---|")
+            for l in inp["leaves"]:
+                lines.append(f"| `{l['id']}` | {l['name']} | {l['definition']} | {l['cadence']} | {l['source_system']} |")
+            lines.append("")
+
+    lines.append("## Validation summary")
+    lines.append("")
+    lines.append(f"- Inputs: {len(tree['inputs'])} / 4 max")
+    lines.append(f"- Leaves: {count_leaves(tree)} / 12 max")
+    if errors:
+        lines.append("")
+        lines.append("**Errors:**")
+        lines.append("")
+        for e in errors:
+            lines.append(f"- {e}")
+    if warnings:
+        lines.append("")
+        lines.append("**Warnings:**")
+        lines.append("")
+        for w in warnings:
+            lines.append(f"- {w}")
+    lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- ICP: `clients/{client}/icp/icp.md`")
+    lines.append(f"- Positioning: `clients/{client}/positioning/positioning.md`")
+    lines.append(f"- Sources: `clients/{client}/analytics/sources.yaml`")
+    lines.append(f"- Events taxonomy: `clients/{client}/events.yaml`")
+    lines.append("- Pattern: `knowledge/patterns/metric-tree-not-metric-stack.md`")
+    lines.append("- Pattern: `knowledge/patterns/goalpost-discipline-vs-metric-drift.md`")
+    lines.append("")
+
+    lines.append("## How dashboards read this tree")
+    lines.append("")
+    lines.append("`dashboard-spec` reads the YAML companion file (`metric-tree.yaml`) and emits "
+                 "dashboard panels that cite tree node IDs. A panel referencing a metric not in this "
+                 "tree fails preflight. A goal opening against a metric not in this tree fails "
+                 "preflight. The tree IS the contract.")
+    lines.append("")
+
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append(f"- `skills/dashboard-spec --client {client} --audience exec --decision narrative-drift`")
+    lines.append(f"- `skills/lift-test-design --client {client} --metric <id-from-tree>`")
+    lines.append("- `routines/analytics-monthly-refresh.md`")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_audit_checklist(tree: dict, client: str, today: str) -> str:
+    lines: list[str] = []
+    lines.append(f"# Metric tree audit checklist, {client}")
+    lines.append("")
+    lines.append(f"Last regenerated: {today}. Run quarterly. Per `goalpost-discipline-vs-metric-drift`, "
+                 "the contract is that every node's definition is honored across the quarter.")
+    lines.append("")
+    lines.append("## Per-node checklist")
+    lines.append("")
+    nodes = [tree["north_star"]]
+    for inp in tree["inputs"]:
+        nodes.append(inp)
+        for s in inp.get("supporting", []):
+            nodes.append(s)
+        for l in inp.get("leaves", []):
+            nodes.append(l)
+    for node in nodes:
+        nid = node.get("id", "(no-id)")
+        nname = node.get("name", "(no-name)")
+        lines.append(f"### {nid} — {nname}")
+        lines.append("")
+        lines.append("- [ ] Source-system query unchanged from last quarter? (if changed, log override)")
+        lines.append("- [ ] Cadence honored? (cadence: " + str(node.get("cadence", "(missing)")) + ")")
+        lines.append("- [ ] Definition unchanged? (current: " + str(node.get("definition", "(missing)")[:80]) + "...)")
+        lines.append("- [ ] Owner unchanged?")
+        lines.append("- [ ] Freshness window honored?")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="metric-tree-design")
+    p.add_argument("--client", required=True)
+    p.add_argument("--north-star", default=None,
+                   help="north-star metric id or name (default: weekly-active-revenue-cohorts)")
+    p.add_argument("--input-axes", default="acquisition,activation,retention,monetization",
+                   help="comma list, max 4")
+    p.add_argument("--depth", type=int, default=3)
+    p.add_argument("--update", action="store_true", help="refresh existing tree, surface drift")
+    p.add_argument("--accept-gaps", action="store_true",
+                   help="treat data-gap and cadence-missing as warnings, not errors")
+    args = p.parse_args()
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap (icp + positioning required)", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        return 3
+
+    try:
+        axes = parse_input_axes(args.input_axes)
+    except ValueError as e:
+        print(f"REFUSED: invalid-input-axes, {e}", file=sys.stderr)
+        return 4
+
+    if len(axes) > 4:
+        return refuse(
+            "too-many-inputs",
+            f"got {len(axes)} input axes; max 4 per the pattern. Pick the 4 most important.",
+        )
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    north_star = select_north_star(args.north_star)
+    tree = build_tree(north_star, axes)
+
+    ok2, errors, warnings = validate_tree(tree, accept_gaps=args.accept_gaps)
+
+    out_dir = SUBSTRATE_ROOT / "clients" / args.client / "analytics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    md_path = out_dir / "metric-tree.md"
+    yaml_path = out_dir / "metric-tree.yaml"
+    audit_path = out_dir / "metric-tree-audit-checklist.md"
+
+    md_path.write_text(render_md(tree, args.client, today, errors, warnings), encoding="utf-8")
+    yaml_path.write_text(render_yaml(tree, today), encoding="utf-8")
+    audit_path.write_text(render_audit_checklist(tree, args.client, today), encoding="utf-8")
+
+    print(f"[metric-tree-design] md: {md_path}", file=sys.stderr)
+    print(f"[metric-tree-design] yaml: {yaml_path}", file=sys.stderr)
+    print(f"[metric-tree-design] audit: {audit_path}", file=sys.stderr)
+    print(
+        f"  inputs={len(tree['inputs'])} leaves={count_leaves(tree)} "
+        f"errors={len(errors)} warnings={len(warnings)}",
+        file=sys.stderr,
+    )
+    if errors:
+        print("REFUSED:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        return 3
+
+    print(str(md_path))
+    return 1 if warnings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

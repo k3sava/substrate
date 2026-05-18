@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# substrate-bootstrap-prospect — initialize a clients/<prospect>/ from public surface
+#
+# Bootstraps the 10-layer context scaffold for a consulting prospect from
+# their public sources (LP URL, blog, pricing, careers, public reviews).
+# Used by the consulting-poc skill in Phase 0.
+#
+# Usage:
+#   substrate-bootstrap-prospect <prospect-slug> [--lp <url>] [--blog <url>] [--reviews <url>]
+#
+# Output:
+#   clients/<prospect-slug>/ with:
+#     00-INDEX.md
+#     BRIEF.md (template, operator fills before Phase 1)
+#     positioning/
+#     icp/
+#     voc/inbox/
+#     voc/cadence-contract.md
+#     competitive/
+#     market-context/
+#     product-knowledge/
+#     brand-voice/
+#     conversion-narrative/
+#     strategy/
+#     diagnostics/phase-0-audit.md (template)
+#     proposal-draft.md (filled from template)
+#     public-sources.md (URLs + ingest log)
+#
+# This bootstrap is read-only on the public surface; it does not mirror
+# content, just records URLs and timestamps. The actual ingest happens
+# via downstream skills (positioning-forge, icp-cut, etc.) in Phase 1.
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}}"
+
+usage() {
+  cat <<EOF
+substrate-bootstrap-prospect — initialize clients/<prospect>/ scaffold
+
+Usage:
+  substrate-bootstrap-prospect <prospect-slug> [--lp <url>] [--blog <url>] [--reviews <url>] [--careers <url>] [--pricing <url>]
+
+Required:
+  <prospect-slug>       short kebab-case identifier (e.g. acme-corp)
+
+Optional URL flags (record-only; populates public-sources.md):
+  --lp <url>            primary landing page
+  --blog <url>          blog index
+  --reviews <url>       G2 / Capterra / TrustRadius public reviews
+  --careers <url>       careers page (signals about org shape + AI readiness)
+  --pricing <url>       pricing page
+
+Examples:
+  substrate-bootstrap-prospect acme --lp https://acme.com --reviews https://www.g2.com/products/acme
+
+After bootstrap, run consulting-poc Phase 0 audit:
+  substrate consulting-poc --prospect acme --mode phase-0
+EOF
+  exit 0
+}
+
+[ $# -ge 1 ] || usage
+case "${1:-}" in -h|--help) usage ;; esac
+
+PROSPECT="$1"; shift
+LP=""; BLOG=""; REVIEWS=""; CAREERS=""; PRICING=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --lp)       LP="$2"; shift 2 ;;
+    --blog)     BLOG="$2"; shift 2 ;;
+    --reviews)  REVIEWS="$2"; shift 2 ;;
+    --careers)  CAREERS="$2"; shift 2 ;;
+    --pricing)  PRICING="$2"; shift 2 ;;
+    *) echo "unknown flag: $1" >&2; exit 4 ;;
+  esac
+done
+
+# slug validation
+case "$PROSPECT" in
+  *[^a-z0-9-]*) echo "slug must be kebab-case [a-z0-9-]: $PROSPECT" >&2; exit 4 ;;
+esac
+
+CLIENT_ROOT="$SUBSTRATE_ROOT/clients/$PROSPECT"
+if [ -d "$CLIENT_ROOT" ]; then
+  echo "client already exists: $CLIENT_ROOT" >&2
+  echo "  rerun with a different slug, or remove the directory if you meant to start over." >&2
+  exit 4
+fi
+
+echo "== bootstrapping clients/$PROSPECT/ =="
+
+mkdir -p "$CLIENT_ROOT"/{positioning,icp,voc/inbox,voc/processed,competitive,market-context,product-knowledge,brand-voice,conversion-narrative,strategy,diagnostics}
+
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+TODAY=$(date -u +%Y-%m-%d)
+
+cat > "$CLIENT_ROOT/00-INDEX.md" <<EOF
+---
+title: $PROSPECT, substrate index
+status: bootstrapped
+created: $NOW
+last_updated: $TODAY
+phase: 0
+---
+
+# $PROSPECT
+
+Substrate scaffold bootstrapped from public surface on $TODAY.
+Phase 0 audit lives at [diagnostics/phase-0-audit.md](diagnostics/phase-0-audit.md).
+Proposal draft lives at [proposal-draft.md](proposal-draft.md).
+
+## Layers (10)
+
+- [BRIEF.md](BRIEF.md), the canonical brief operator fills before Phase 1.
+- [positioning/](positioning/), the positioning layer.
+- [icp/](icp/), ICP and persona cuts.
+- [voc/](voc/), voice-of-customer (inbox, processed, cadence-contract).
+- [competitive/](competitive/), competitive landscape including [status-quo.md](competitive/status-quo.md).
+- [market-context/](market-context/), the surrounding market.
+- [product-knowledge/](product-knowledge/), what the product actually does.
+- [brand-voice/](brand-voice/), voice + design tokens.
+- [conversion-narrative/](conversion-narrative/), funnel + measurement.
+- [strategy/](strategy/), the bets, JTBD list, agent-jtbd-map.
+
+## Public sources ingested
+
+See [public-sources.md](public-sources.md).
+
+## Status
+
+- Phase 0 (free diagnostic): pending
+- Phase 1 (5-day POC): not started
+- Phase 2 (continuation): not applicable
+
+EOF
+
+cat > "$CLIENT_ROOT/BRIEF.md" <<EOF
+---
+title: $PROSPECT BRIEF (substrate canonical)
+status: stub
+last_updated: $TODAY
+---
+
+# Canonical brief
+
+The single source of truth for who $PROSPECT is, who they sell to, and what they sell. Every skill reads from here. Refuses to run on a stub.
+
+Operator: fill these in before Phase 1 kicks off.
+
+## What they offer
+
+(One sentence the buyer would recognize.)
+
+## Who they sell to
+
+(Pinned ICP — verifiable against \`icp/00-INDEX.md\`.)
+
+## Why now
+
+(The trigger that brings buyers to look. Cite \`voc/processed/\`.)
+
+## What's the alternative
+
+(Including status quo, named in \`competitive/status-quo.md\`.)
+
+## Allowed claims
+
+(In writing. \`positioning/allowed-claims.md\`.)
+
+## Banned claims / kill list
+
+(Including any voice rules. \`brand-voice/banned-claims.md\`.)
+
+## The 3-question positioning rubric
+
+1. What category are you in?
+2. What's the alternative buyers are choosing?
+3. What's the unique value only you provide?
+
+(Each answer cites a substrate path.)
+EOF
+
+# public-sources.md
+{
+  echo "---"
+  echo "title: $PROSPECT public sources"
+  echo "status: ingested"
+  echo "last_updated: $TODAY"
+  echo "---"
+  echo ""
+  echo "# Public sources for $PROSPECT"
+  echo ""
+  echo "Recorded $NOW. Substrate skills read these in Phase 1."
+  echo ""
+  echo "| Source | URL | Notes |"
+  echo "|---|---|---|"
+  [ -n "$LP" ]       && echo "| Landing page | $LP | hero, narrative, CTAs |"
+  [ -n "$BLOG" ]     && echo "| Blog | $BLOG | content cadence, voice signal |"
+  [ -n "$PRICING" ]  && echo "| Pricing | $PRICING | packaging, anchor design |"
+  [ -n "$REVIEWS" ]  && echo "| Reviews | $REVIEWS | voc, status-quo signal |"
+  [ -n "$CAREERS" ]  && echo "| Careers | $CAREERS | org shape, AI readiness signal |"
+} > "$CLIENT_ROOT/public-sources.md"
+
+# Phase 0 diagnostic template
+cat > "$CLIENT_ROOT/diagnostics/phase-0-audit.md" <<EOF
+---
+title: $PROSPECT, Phase 0 audit
+status: stub
+prospect: $PROSPECT
+phase: 0
+audit_date: $TODAY
+---
+
+# Phase 0 audit
+
+The diagnostic the operator carries into the discovery call. Substrate-grounded; every claim cites a path.
+
+## Positioning audit (skill: positioning-forge)
+
+- LP says: TBD (cite \`public-sources.md\`)
+- Reviews say: TBD (cite \`public-sources.md\`)
+- Drift score (0–10): TBD
+- Top mismatch: TBD
+
+## AEO triangle status (skills: aeo-tune, aeo-relevance, aeo-manual-action)
+
+- Presence (do they appear in target prompts): TBD %
+- Relevance (right framing when cited): TBD %
+- Manual-action (off-domain mention density rank): TBD
+
+## Status-quo competitor map (skill: status-quo-frame)
+
+- Largest alternative buyers chose: TBD
+- Frequency in reviews: TBD %
+- Counter-frame opportunity: TBD
+
+## Tier A pattern coverage (knowledge/patterns/)
+
+| Pattern | Operationalized? | Evidence |
+|---|---|---|
+| substrate-runs-loop-humans-run-alignment | TBD | TBD |
+| context-not-capability | TBD | TBD |
+| frontline-as-pmm-substrate | TBD | TBD |
+| narrative-as-strategy | TBD | TBD |
+| status-quo-is-the-competitor | TBD | TBD |
+| agents-mapped-to-jtbd | TBD | TBD |
+| eval-as-data-analysis | TBD | TBD |
+| measurement-correlated-short-signals | TBD | TBD |
+| build-for-next-model | TBD | TBD |
+| diagnose-before-execute | TBD | TBD |
+| ... (full 20 in knowledge/patterns/INDEX.md) | | |
+
+Coverage score: TBD / 20
+
+## Top 3 leverage gaps
+
+1. TBD
+2. TBD
+3. TBD
+
+## Recommendation
+
+Either: ready for Phase 1 (5-day POC, fixed price), or: not yet ready (specify what's missing).
+
+EOF
+
+# proposal-draft.md from template
+if [ -f "$SUBSTRATE_ROOT/templates/consulting-proposal.md" ]; then
+  cp "$SUBSTRATE_ROOT/templates/consulting-proposal.md" "$CLIENT_ROOT/proposal-draft.md"
+  # Light token replacement — operator fills the rest after the call.
+  sed -i.bak "s|{{PROSPECT_SLUG}}|$PROSPECT|g; s|{{DATE}}|$TODAY|g" "$CLIENT_ROOT/proposal-draft.md"
+  rm "$CLIENT_ROOT/proposal-draft.md.bak"
+fi
+
+# Pre-seed per-client config that gates depend on. Operator edits before any
+# competitive-scout / pre-publish-check / aeo-tune run.
+if [ -f "$SUBSTRATE_ROOT/templates/competitors-example.yaml" ]; then
+  cp "$SUBSTRATE_ROOT/templates/competitors-example.yaml" "$CLIENT_ROOT/competitors.yaml"
+fi
+if [ -f "$SUBSTRATE_ROOT/templates/verticals-example.yaml" ]; then
+  cp "$SUBSTRATE_ROOT/templates/verticals-example.yaml" "$CLIENT_ROOT/verticals.yaml"
+fi
+
+# Voc cadence stub
+cat > "$CLIENT_ROOT/voc/cadence-contract.md" <<EOF
+---
+title: $PROSPECT, voc cadence contract
+status: stub
+last_updated: $TODAY
+---
+
+# Cadence contract
+
+(Operator: fill this with the prospect during Phase 0 close.)
+
+| Role | Minimum weekly contact | Format |
+|---|---|---|
+| Founder | 3 conversations | live call |
+| Head of GTM | 5 conversations | live call |
+| PMM lead | 5 conversations + 1 win/loss | call or async |
+| ... | ... | ... |
+
+The skill \`frontline-contact\` refuses to advance Phase 1 past Day 4 without 3 logged calls.
+EOF
+
+# Status-quo competitor stub
+cat > "$CLIENT_ROOT/competitive/status-quo.md" <<EOF
+---
+title: $PROSPECT, status-quo competitor
+status: stub
+last_updated: $TODAY
+---
+
+# Status quo as competitor
+
+In most B2B categories, no-decision wins more deals than any named competitor. Skill \`status-quo-frame\` populates this file in Phase 1.
+
+- The buyer's current path: TBD
+- Friction in that path: TBD
+- Trigger that breaks status quo: TBD
+- Objection to switching: TBD
+- Win-loss frequency vs status quo: TBD %
+- Counter-frame: TBD
+EOF
+
+echo "== bootstrap done =="
+echo ""
+echo "  $CLIENT_ROOT/"
+echo "  ├── 00-INDEX.md"
+echo "  ├── BRIEF.md           (operator: fill before Phase 1)"
+echo "  ├── competitors.yaml   (operator: edit list of named rivals)"
+echo "  ├── verticals.yaml     (operator: edit per-vertical taxonomy)"
+echo "  ├── public-sources.md  (URLs recorded)"
+echo "  ├── proposal-draft.md  (templated; operator: fill the {{tokens}})"
+echo "  ├── diagnostics/phase-0-audit.md (operator: complete during/after the call)"
+echo "  └── ... 10-layer scaffold"
+echo ""
+echo "next: substrate consulting-poc --prospect $PROSPECT --mode phase-0"

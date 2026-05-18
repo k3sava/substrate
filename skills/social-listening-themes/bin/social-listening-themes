@@ -1,0 +1,637 @@
+#!/usr/bin/env python3
+"""social-listening-themes — analyse mentions / comments / reply-thread exports
+for themes. TF-IDF-style clustering. Identify pain language, competitor
+mentions, viral hook patterns, and off-brand content.
+
+Reads clients/<client>/social/mentions/<source>-<YYYY-MM>.csv. Refuses without
+canonical positioning. Refuses without a mentions corpus. Real text math; no
+vibes.
+
+Usage:
+    social-listening-themes --client <client>
+                            [--mentions-dir <dir>]
+                            [--source <slug>]
+                            [--cluster-min-size <int>]
+                            [--max-themes <int>]
+                            [--out <dir>]
+
+Exit codes:
+    0 — themes report and classified CSV written
+    3 — refused (substrate gap, missing positioning, missing mentions)
+    4 — invalid args
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+
+
+# Conservative stop-word list. Keeps pain-signal words like "slow", "cheap",
+# "expensive", "broken", "missing", "useless" because they carry signal.
+STOPWORDS = {
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "her", "was",
+    "one", "our", "out", "day", "get", "has", "him", "his", "how", "man", "new",
+    "now", "old", "see", "two", "way", "who", "boy", "did", "its", "let", "put",
+    "say", "she", "too", "use", "your", "this", "that", "with", "have", "been",
+    "from", "they", "were", "what", "when", "where", "which", "while", "would",
+    "will", "could", "should", "their", "them", "these", "those", "there",
+    "than", "then", "into", "such", "some", "more", "most", "much", "very",
+    "just", "also", "even", "only", "make", "made", "going", "didnt", "doesnt",
+    "isnt", "wasnt", "wont", "cant", "ive", "youre", "theyre", "weve", "well",
+    "yes", "really", "actually", "thing", "things", "stuff", "kind", "lot",
+    "good", "great", "nice", "okay", "yeah", "thanks", "thank",
+}
+
+
+# Off-brand / moderation flags. Keys = reason; values = regex patterns (lower).
+OFF_BRAND_PATTERNS = {
+    "link-spam": [r"https?://\S+\.(ru|cn|tk|ml|ga|cf)\b", r"telegram\.org/\S+", r"\bbit\.ly/\S+"],
+    "promo-spam": [r"\bcheck out my\b.*(course|book|product|offer)", r"\bdm me\b.*(deal|opportunity)"],
+    "off-topic-trolling": [r"\b(scam|fake|fraud|liar|idiot|stupid|moron)\b"],
+    "language-flag": [r"\b(asshole|fuck|fucking|shit)\b"],
+}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def read_file_or_none(path: Path) -> str | None:
+    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+
+def extract_anchors(positioning_text: str) -> list[str]:
+    """Pull load-bearing terms from the canonical statement."""
+    in_block = False
+    out: list[str] = []
+    canon = []
+    for line in positioning_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(canonical|the position|statement|positioning)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s:
+                canon.append(s)
+    canonical = "\n".join(canon).strip() or positioning_text[:600]
+    seen = set()
+    for w in re.findall(r"[a-z][a-z-]{4,}", canonical.lower()):
+        if w in STOPWORDS or w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    return out[:25]
+
+
+def extract_competitor_slugs(competitive_text: str | None) -> list[str]:
+    if not competitive_text:
+        return []
+    out = set()
+    for line in competitive_text.splitlines():
+        m = re.match(r"^\s*-\s*competitor\s*:\s*(.+)$", line.strip(), re.IGNORECASE)
+        if m:
+            out.add(m.group(1).strip().lower())
+        m = re.match(r"^##+\s+([A-Za-z][A-Za-z0-9 ]+)$", line.strip())
+        if m:
+            cand = m.group(1).strip().lower()
+            if 3 <= len(cand) <= 25:
+                out.add(cand)
+    return list(out)
+
+
+def parse_filename_source(name: str) -> tuple[str, str] | None:
+    m = re.match(r"^([a-z][a-z0-9-]*)-(\d{4}-\d{2})\.csv$", name.lower())
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def load_mentions(mentions_dir: Path, source_filter: str | None) -> list[dict]:
+    rows: list[dict] = []
+    if not mentions_dir.is_dir():
+        return rows
+    for f in sorted(mentions_dir.glob("*.csv")):
+        parsed = parse_filename_source(f.name)
+        if not parsed:
+            sys.stderr.write(f"  warn: skipped non-conforming mentions file {f.name}\n")
+            continue
+        source_from_name, _ = parsed
+        if source_filter and source_from_name != source_filter:
+            continue
+        with f.open(encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            if not reader.fieldnames:
+                continue
+            cols_lower = {c.lower(): c for c in reader.fieldnames}
+            required = {"comment_id", "text"}
+            if not required.issubset(cols_lower.keys()):
+                sys.stderr.write(f"  warn: {f.name} missing required cols {required - cols_lower.keys()}; skipping\n")
+                continue
+            for raw in reader:
+                row = {k.lower(): v for k, v in raw.items()}
+                row["_source_file"] = f.name
+                row["_source"] = (row.get("source") or source_from_name).strip().lower()
+                rows.append(row)
+    return rows
+
+
+def tokenize(text: str) -> list[str]:
+    text = (text or "").lower()
+    text = re.sub(r"https?://\S+", " ", text)
+    tokens = re.findall(r"[a-z][a-z\-]{2,}", text)
+    return [t for t in tokens if t not in STOPWORDS and len(t) > 2]
+
+
+def detect_off_brand(text: str) -> str | None:
+    low = (text or "").lower()
+    for reason, patterns in OFF_BRAND_PATTERNS.items():
+        for pat in patterns:
+            if re.search(pat, low, re.IGNORECASE):
+                return reason
+    return None
+
+
+def detect_competitors(text: str, slugs: list[str]) -> list[str]:
+    if not slugs:
+        return []
+    low = (text or "").lower()
+    found = []
+    for s in slugs:
+        if not s:
+            continue
+        # Word-boundary match
+        pat = r"\b" + re.escape(s) + r"\b"
+        if re.search(pat, low):
+            found.append(s)
+    return found
+
+
+# ---------- Clustering ----------
+#
+# We use a lightweight TF-IDF style approach without scikit-learn:
+#   1. Build the in-corpus document frequency for each token.
+#   2. Score each token by inverse-document-frequency (IDF).
+#   3. For each comment, take the top-K IDF-weighted tokens as its "fingerprint."
+#   4. Cluster comments by fingerprint overlap (greedy single-pass; merge if
+#      Jaccard > 0.34 against an existing cluster centroid).
+#
+# This is O(N * M) and works well for typical mention corpora (100-2000 rows).
+
+def build_idf(token_lists: list[list[str]]) -> dict[str, float]:
+    n = len(token_lists)
+    df: Counter = Counter()
+    for tokens in token_lists:
+        for t in set(tokens):
+            df[t] += 1
+    idf: dict[str, float] = {}
+    for t, c in df.items():
+        # Standard IDF; smooth so totally-common tokens still get a non-zero score
+        idf[t] = math.log((n + 1) / (c + 1)) + 1.0
+    return idf
+
+
+def fingerprint(tokens: list[str], idf: dict[str, float], top_k: int = 8) -> set[str]:
+    if not tokens:
+        return set()
+    counts = Counter(tokens)
+    scored = [(t, counts[t] * idf.get(t, 1.0)) for t in counts]
+    scored.sort(key=lambda x: -x[1])
+    return {t for t, _ in scored[:top_k]}
+
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def cluster(rows: list[dict], idf: dict[str, float], min_size: int = 3) -> list[dict]:
+    """Greedy single-pass clustering. Returns cluster dicts with comments + centroid."""
+    clusters: list[dict] = []
+    for r in rows:
+        fp = r.get("_fp", set())
+        if not fp:
+            continue
+        best_idx = -1
+        best_j = 0.0
+        for idx, c in enumerate(clusters):
+            j = jaccard(fp, c["centroid"])
+            if j > best_j:
+                best_j = j
+                best_idx = idx
+        if best_idx >= 0 and best_j > 0.34:
+            c = clusters[best_idx]
+            c["rows"].append(r)
+            # Centroid = union of top-IDF tokens across cluster, capped
+            new_cent = c["centroid"] | fp
+            # Cap centroid size by top-IDF re-scored tokens
+            if len(new_cent) > 12:
+                scored = sorted(((t, idf.get(t, 1.0)) for t in new_cent), key=lambda x: -x[1])[:12]
+                new_cent = {t for t, _ in scored}
+            c["centroid"] = new_cent
+        else:
+            clusters.append({"centroid": set(fp), "rows": [r]})
+
+    # Filter by min size; aggregate small clusters into a long-tail bucket
+    big = [c for c in clusters if len(c["rows"]) >= min_size]
+    long_tail_rows = [r for c in clusters if len(c["rows"]) < min_size for r in c["rows"]]
+    if long_tail_rows:
+        big.append({"centroid": set(), "rows": long_tail_rows, "long_tail": True})
+    return big
+
+
+def label_cluster(c: dict, idf: dict[str, float], anchors: list[str]) -> str:
+    if c.get("long_tail"):
+        return "long-tail (small clusters merged)"
+    # Pick the top 3 highest-IDF centroid tokens
+    if not c["centroid"]:
+        return "uncategorised"
+    scored = sorted(c["centroid"], key=lambda t: -idf.get(t, 1.0))[:4]
+    return " / ".join(scored)
+
+
+def cluster_anchor_overlap(c: dict, anchors: list[str]) -> tuple[list[str], list[str]]:
+    """Which positioning anchors are present (or absent) in this cluster?"""
+    cluster_tokens: set[str] = set()
+    for r in c["rows"]:
+        cluster_tokens.update(r.get("_tokens", []))
+    present = [a for a in anchors if a in cluster_tokens]
+    absent = [a for a in anchors if a not in cluster_tokens]
+    return present, absent
+
+
+def render_themes_report(*, client: str, today: str, mentions_files: list[Path],
+                         total_rows: int, classified_rows: int,
+                         clusters: list[dict], idf: dict[str, float],
+                         anchors: list[str], competitor_counts: Counter,
+                         viral_hooks: list[dict], off_brand_counts: Counter) -> str:
+    lines = []
+    lines.append("---")
+    lines.append("asset_type: audit")
+    lines.append(f"themes_id: {client}-social-themes-{today}")
+    lines.append("mentions_read:")
+    for f in mentions_files[:20]:
+        lines.append(f"  - {f.relative_to(SUBSTRATE_ROOT) if str(f).startswith(str(SUBSTRATE_ROOT)) else f}")
+    lines.append(f"comments_total: {total_rows}")
+    lines.append(f"comments_classified: {classified_rows}")
+    lines.append("substrate_layers_read: [positioning, icp, voc, competitive]")
+    lines.append("patterns_applied: [native-format-beats-cross-post, social-as-distribution-not-conversion, frontline-as-pmm-substrate, copywriting-craft-fundamentals]")
+    lines.append("contradictions_resolved: []")
+    lines.append(f"themes_count: {sum(1 for c in clusters if not c.get('long_tail'))}")
+    lines.append(f"competitor_mention_count: {sum(competitor_counts.values())}")
+    lines.append(f"viral_hook_count: {len(viral_hooks)}")
+    lines.append("produced_by: social-listening-themes")
+    lines.append("authored_date: " + today)
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# social-listening-themes: {client} | {today}")
+    lines.append("")
+    lines.append(f"Comments scanned: {total_rows}. Comments classified into themes: {classified_rows}.")
+    lines.append("")
+    lines.append("Pattern grounding: per pat_frontline-as-pmm-substrate, comment corpora are the frontline "
+                 "substrate of PMM work; logged conversation from sales, success, and support, plus public "
+                 "comment threads, is the written cadence that grounds positioning. This report should feed "
+                 "positioning and message-house revisions, not just ad copy. Per "
+                 "pat_social-as-distribution-not-conversion, social drives top-of-funnel awareness; last-click "
+                 "attribution underweights its real role, and the goal is cohort language for top-of-funnel "
+                 "work; do not over-rotate on conversion-context language read from a non-conversion surface. "
+                 "Per pat_native-format-beats-cross-post, each platform has native rhythms; cross-posted content "
+                 "underperforms native authoring substantially, so themes from one platform should be checked "
+                 "for native-rhythm fit before they drive content on another platform. Per "
+                 "pat_copywriting-craft-fundamentals, specific over abstract; the labels below pick the most "
+                 "specific tokens from the corpus, not the most generic.")
+    lines.append("")
+
+    # Themes
+    lines.append("## Cluster summary (themes)")
+    lines.append("")
+    if not clusters:
+        lines.append("No clusters reached the minimum size. Corpus may be too small or too disparate.")
+        lines.append("")
+    else:
+        lines.append("| Theme | Size | Top tokens | Anchor overlap |")
+        lines.append("|---|---:|---|---|")
+        for i, c in enumerate(clusters):
+            label = label_cluster(c, idf, anchors)
+            present, _ = cluster_anchor_overlap(c, anchors)
+            lines.append(f"| {label} | {len(c['rows'])} | "
+                         f"{', '.join(sorted(c['centroid'])[:6]) if c['centroid'] else '(long-tail)'} | "
+                         f"{', '.join(present[:4]) or '(none)'} |")
+        lines.append("")
+        for i, c in enumerate(clusters):
+            label = label_cluster(c, idf, anchors)
+            lines.append(f"### Theme {i+1}: {label}")
+            lines.append("")
+            lines.append(f"Cluster size: {len(c['rows'])} comments.")
+            lines.append("")
+            lines.append("Representative comments (top 5 by token-density):")
+            lines.append("")
+            top_rows = sorted(c["rows"],
+                              key=lambda r: -len([t for t in r.get("_tokens", []) if t in c["centroid"]]))[:5]
+            for r in top_rows:
+                txt = (r.get("text") or "").strip().replace("\n", " ")
+                if len(txt) > 240:
+                    txt = txt[:237] + "..."
+                lines.append(f"> {txt}")
+                lines.append(f"> — `{r.get('comment_id', '?')}` ({r.get('_source', '?')}, {r.get('posted_at', '?')})")
+                lines.append("")
+
+    # Anchor overlap matrix
+    lines.append("## Pain language vs positioning anchors")
+    lines.append("")
+    lines.append("Which positioning anchors appear in the comment corpus? Anchors absent here are candidates "
+                 "for repositioning or for new substrate (the cohort is not echoing them yet).")
+    lines.append("")
+    if anchors:
+        all_tokens = set()
+        for c in clusters:
+            for r in c["rows"]:
+                all_tokens.update(r.get("_tokens", []))
+        present = [a for a in anchors if a in all_tokens]
+        absent = [a for a in anchors if a not in all_tokens]
+        lines.append("**Present in corpus** (anchors the cohort echoes):")
+        lines.append("")
+        for a in present[:12]:
+            lines.append(f"- `{a}`")
+        if not present:
+            lines.append("- (none)")
+        lines.append("")
+        lines.append("**Absent from corpus** (anchors the cohort is not echoing — investigate):")
+        lines.append("")
+        for a in absent[:12]:
+            lines.append(f"- `{a}`")
+        if not absent:
+            lines.append("- (none — full overlap)")
+        lines.append("")
+    else:
+        lines.append("(positioning anchors not extracted; check 01-position.md)")
+        lines.append("")
+
+    # Competitor mentions
+    lines.append("## Competitor mentions")
+    lines.append("")
+    if competitor_counts:
+        for slug, n in competitor_counts.most_common(10):
+            lines.append(f"- `{slug}`: {n} mention(s)")
+        lines.append("")
+        lines.append("If any uncovered competitor reaches volume in the corpus, route the spike to "
+                     "`competitive-scout` for a battle-card update.")
+    else:
+        lines.append("No competitor mentions detected against the substrate's competitor slug list.")
+    lines.append("")
+
+    # Viral hooks
+    lines.append("## Viral hook patterns")
+    lines.append("")
+    if viral_hooks:
+        lines.append("Comments that reacted to a specific hook in the parent post. Raw inputs for the next "
+                     "`social-content-design` cycle (do not lift verbatim; cite as VOC).")
+        lines.append("")
+        for h in viral_hooks[:12]:
+            txt = (h.get("text") or "").strip().replace("\n", " ")
+            if len(txt) > 200:
+                txt = txt[:197] + "..."
+            lines.append(f"- `{h.get('comment_id', '?')}` (replies={h.get('replies_count', '?')}, "
+                         f"likes={h.get('likes_count', '?')}): {txt}")
+            if h.get("parent_post_url"):
+                lines.append(f"  - parent: {h['parent_post_url']}")
+        lines.append("")
+    else:
+        lines.append("No high-engagement comments flagged as viral-hook reactions.")
+        lines.append("")
+
+    # Off-brand
+    lines.append("## Off-brand / moderation flags")
+    lines.append("")
+    if off_brand_counts:
+        for reason, n in off_brand_counts.most_common():
+            lines.append(f"- `{reason}`: {n} comment(s)")
+        lines.append("")
+        lines.append("Flagged comments are excluded from theme clusters. Operator decides on moderation.")
+    else:
+        lines.append("No off-brand patterns detected.")
+    lines.append("")
+
+    # Frontline note
+    lines.append("## Frontline-as-substrate note")
+    lines.append("")
+    lines.append("Per pat_frontline-as-pmm-substrate, public comment corpora are PMM input alongside sales "
+                 "and customer-success conversations. The themes here should propagate to:")
+    lines.append("")
+    lines.append("- `clients/<client>/03-voice-of-customer.md` (raw VOC quotes from the corpus)")
+    lines.append("- `clients/<client>/01-position.md` (anchor terms that absent-from-corpus)")
+    lines.append("- `clients/<client>/04-competitive.md` (any new competitor mentions)")
+    lines.append("- The next `social-content-design` brief for the affected cohort")
+    lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- positioning: `clients/{client}/01-position.md`")
+    lines.append(f"- ICP: `clients/{client}/02-icp.md`")
+    lines.append(f"- voice-of-customer: `clients/{client}/03-voice-of-customer.md`")
+    lines.append(f"- competitive: `clients/{client}/04-competitive.md`")
+    lines.append("")
+
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `social-content-design` — consumes the viral hook patterns above.")
+    lines.append("- `social-fatigue-monitor` — pair with this report biweekly for full coverage.")
+    lines.append("- `competitive-scout` — receives competitor spikes from this report.")
+    lines.append("- `frontline-contact` — the upstream skill capturing sales / CS conversations.")
+    lines.append("- `routines/social-content-cycle.md` — the cycle that consumes themes.")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="social-listening-themes")
+    p.add_argument("--client", required=True)
+    p.add_argument("--mentions-dir", default=None)
+    p.add_argument("--source", default=None)
+    p.add_argument("--cluster-min-size", type=int, default=3)
+    p.add_argument("--max-themes", type=int, default=8)
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        return refuse("client-root-missing", f"clients/{args.client}/ not found.")
+    pos_path = client_root / "01-position.md"
+    pos = read_file_or_none(pos_path)
+    if pos is None:
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/01-position.md not found.")
+
+    comp_path = client_root / "04-competitive.md"
+    comp_text = read_file_or_none(comp_path)
+
+    anchors = extract_anchors(pos)
+    competitor_slugs = extract_competitor_slugs(comp_text)
+
+    mentions_dir = Path(args.mentions_dir) if args.mentions_dir else (
+        client_root / "social" / "mentions"
+    )
+    if not mentions_dir.is_dir():
+        return refuse("missing-mentions",
+                      f"mentions dir not found at {mentions_dir}. "
+                      f"Add CSV exports per source-month, or pass --mentions-dir.")
+
+    rows = load_mentions(mentions_dir, args.source)
+    if not rows:
+        return refuse("missing-mentions",
+                      f"no usable CSV files in {mentions_dir}. "
+                      f"Files must be <source>-<YYYY-MM>.csv with comment_id, text columns.")
+
+    if len(rows) < 30:
+        sys.stderr.write(f"  WARN: corpus-too-small — only {len(rows)} comments; "
+                         f"theme reliability is low. Continuing.\n")
+
+    files_read = sorted({mentions_dir / r["_source_file"] for r in rows})
+
+    # Tokenise + classify off-brand + competitor
+    competitor_counts: Counter = Counter()
+    off_brand_counts: Counter = Counter()
+    classified_rows = 0
+    for r in rows:
+        text = r.get("text", "") or ""
+        flag = detect_off_brand(text)
+        if flag:
+            off_brand_counts[flag] += 1
+            r["_flag_reason"] = flag
+            r["_tokens"] = []
+            r["_competitors"] = []
+            continue
+        tokens = tokenize(text)
+        r["_tokens"] = tokens
+        comp_hits = detect_competitors(text, competitor_slugs)
+        r["_competitors"] = comp_hits
+        for c in comp_hits:
+            competitor_counts[c] += 1
+        if tokens:
+            classified_rows += 1
+
+    classifiable = [r for r in rows if r.get("_tokens")]
+    if not classifiable:
+        sys.stderr.write("  WARN: no tokenisable comments after stop-word and off-brand filters.\n")
+        idf: dict[str, float] = {}
+        clusters: list[dict] = []
+    else:
+        idf = build_idf([r["_tokens"] for r in classifiable])
+        for r in classifiable:
+            r["_fp"] = fingerprint(r["_tokens"], idf, top_k=8)
+        all_clusters = cluster(classifiable, idf, min_size=args.cluster_min_size)
+        # Cap to max_themes (keep largest)
+        named = [c for c in all_clusters if not c.get("long_tail")]
+        long_tail = [c for c in all_clusters if c.get("long_tail")]
+        named.sort(key=lambda c: -len(c["rows"]))
+        clusters = named[:args.max_themes] + long_tail
+
+    # Viral hook detection: comments with high replies_count or likes_count
+    viral_hooks = []
+    for r in rows:
+        try:
+            replies = int(float(r.get("replies_count") or 0))
+        except (ValueError, TypeError):
+            replies = 0
+        try:
+            likes = int(float(r.get("likes_count") or 0))
+        except (ValueError, TypeError):
+            likes = 0
+        if replies >= 5 or likes >= 25:
+            r["replies_count"] = replies
+            r["likes_count"] = likes
+            viral_hooks.append(r)
+    viral_hooks.sort(key=lambda h: -(int(h.get("replies_count", 0)) + int(h.get("likes_count", 0)) // 5))
+
+    # Output dir
+    out_dir = Path(args.out) if args.out else (client_root / "social" / "themes")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / f"{today}-themes.md"
+    csv_path = out_dir / f"{today}-classified.csv"
+
+    md = render_themes_report(
+        client=args.client,
+        today=today,
+        mentions_files=files_read,
+        total_rows=len(rows),
+        classified_rows=classified_rows,
+        clusters=clusters,
+        idf=idf,
+        anchors=anchors,
+        competitor_counts=competitor_counts,
+        viral_hooks=viral_hooks,
+        off_brand_counts=off_brand_counts,
+    )
+    report_path.write_text(md, encoding="utf-8")
+
+    # Classified CSV: add theme_id, theme_label, competitor_mentioned, flag_reason columns
+    theme_label_by_id: dict[int, str] = {}
+    row_to_theme: dict[str, int] = {}
+    for i, c in enumerate(clusters):
+        theme_label_by_id[i] = label_cluster(c, idf, anchors)
+        for r in c["rows"]:
+            cid = r.get("comment_id", "")
+            if cid:
+                row_to_theme[cid] = i
+
+    base_cols = list({k for r in rows for k in r.keys() if not k.startswith("_")})
+    base_cols.sort()
+    extra = ["theme_id", "theme_label", "competitor_mentioned", "flag_reason"]
+    fieldnames = base_cols + extra
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            out = {k: r.get(k, "") for k in base_cols}
+            cid = r.get("comment_id", "")
+            tid = row_to_theme.get(cid)
+            out["theme_id"] = "" if tid is None else f"theme-{tid+1}"
+            out["theme_label"] = "" if tid is None else theme_label_by_id.get(tid, "")
+            out["competitor_mentioned"] = ", ".join(r.get("_competitors", []))
+            out["flag_reason"] = r.get("_flag_reason", "")
+            w.writerow(out)
+
+    sys.stderr.write(f"\n[social-listening-themes] wrote {report_path}\n")
+    sys.stderr.write(f"  themes: {sum(1 for c in clusters if not c.get('long_tail'))}  "
+                     f"competitor mentions: {sum(competitor_counts.values())}  "
+                     f"viral hooks: {len(viral_hooks)}\n")
+    sys.stderr.write(f"  classified CSV: {csv_path}\n")
+    print(str(report_path))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

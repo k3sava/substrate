@@ -1,0 +1,122 @@
+# Example social-media calendar.
+#
+# Copy to clients/<client>/social/calendar.yaml and edit to fit your cadence.
+# This is the planner that `social-content-design` reads when called with
+# `--calendar-slot <slot-id>`. The skill resolves the slot and applies the
+# slot's defaults (theme, cohort, purpose, platform) when arguments aren't
+# passed on the command line.
+#
+# The calendar is a planning surface, not a scheduling tool. Substrate does
+# not auto-publish; the operator schedules through the platform of their
+# choice.
+#
+# Schema:
+#   week_of: <YYYY-MM-DD>     # the Monday of the week
+#   slots:
+#     - id: <slot-id>         # unique within a week
+#       day: <weekday>        # mon|tue|wed|thu|fri|sat|sun
+#       time_local: <HH:MM>   # local-time hint, not enforced
+#       platform: <platform>  # linkedin-long|x-thread|tiktok|...
+#       cohort: <cohort>      # buyer-state slug
+#       purpose: <purpose>    # thought-leadership|teardown|story|...
+#       author: <lane>        # personal|corporate (default personal)
+#       theme: <theme>        # one-line topic anchor
+#
+# Per `pat_creator-not-corporate`, default `author: personal`. Reserve
+# `author: corporate` for announcement copy (product launches, hiring, brand
+# moments) and do not measure the corporate handle on the same metrics as
+# personal accounts.
+#
+# Per `pat_native-format-beats-cross-post`, each slot is its own native
+# authoring lane. Two slots on the same theme on different platforms are
+# rewrites, not cross-posts.
+
+week_of: "2026-05-04"
+
+slots:
+  - id: "mon-linkedin-long-thought"
+    day: mon
+    time_local: "08:30"
+    platform: linkedin-long
+    cohort: solution-aware-head-of-sales
+    purpose: thought-leadership
+    author: personal
+    theme: "category-shift the cohort hasn't articulated yet"
+
+  - id: "tue-x-thread-teardown"
+    day: tue
+    time_local: "13:00"
+    platform: x-thread
+    cohort: problem-aware
+    purpose: teardown
+    author: personal
+    theme: "named artifact teardown, contrarian beat"
+
+  - id: "wed-tiktok-hook"
+    day: wed
+    time_local: "18:00"
+    platform: tiktok
+    cohort: unaware
+    purpose: hot-take
+    author: personal
+    theme: "9-to-5 friction the cohort feels every Tuesday"
+
+  - id: "thu-linkedin-text-customer"
+    day: thu
+    time_local: "10:00"
+    platform: linkedin-text
+    cohort: most-aware
+    purpose: customer-spotlight
+    author: personal
+    theme: "outcome from a real customer's voice"
+
+  - id: "fri-x-single-news"
+    day: fri
+    time_local: "11:00"
+    platform: x-single
+    cohort: solution-aware-head-of-sales
+    purpose: news
+    author: personal
+    theme: "platform change + 30-day cohort implication"
+
+  - id: "fri-corporate-announcement"
+    day: fri
+    time_local: "15:00"
+    platform: linkedin-text
+    cohort: most-aware
+    purpose: news
+    author: corporate
+    theme: "product launch announcement (corporate handle)"
+
+# Cadence rules (per `pat_native-format-beats-cross-post` and
+# `pat_creator-not-corporate`):
+#   - 4-6 personal-account slots per week is the sustainable cadence for a
+#     B2B program with one named operator. Two operators can sustain 8-10.
+#   - 1-2 corporate-announcement slots per week is the upper bound; more is
+#     announcement-fatigue and corrodes the corporate-handle audience.
+#   - Each slot is a native rewrite. Do not duplicate the same body across
+#     platforms; rewrite for the surface.
+#
+# Measurement (per `pat_social-as-distribution-not-conversion`):
+#   - Track per-platform engagement rate, not aggregate.
+#   - Track follower growth per personal account separately from the
+#     corporate handle.
+#   - Track branded-search lift in the 30-90 days after a campaign launches;
+#     this is the cohort-level signal.
+#   - Do not allocate budget on last-click CAC; the channel is structurally
+#     undercount on that metric.
+
+# Optional: declare campaign-windows that span multiple slots
+campaigns:
+  - id: "may-launch-pickup"
+    window_start: "2026-05-04"
+    window_end: "2026-05-18"
+    theme: "speed-to-lead launch"
+    slot_ids: ["mon-linkedin-long-thought", "tue-x-thread-teardown",
+               "thu-linkedin-text-customer", "fri-corporate-announcement"]
+    measurement_contract: "goals/measurement-contracts/may-launch-pickup.md"
+
+# Optional: kill-switch overrides per slot
+overrides:
+  pause_until: null    # YYYY-MM-DD; if set, skill skips slots before this date
+  reason: ""           # operator-supplied note

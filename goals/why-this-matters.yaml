@@ -1,0 +1,130 @@
+# Per-goal operator narrative — what each goal is really about, in plain English.
+# The ledger (`goals/ledger.md`) is the falsifiable measurement spec.
+# This file is the why-this-matters + intel + decision + scoring narrative,
+# rendered into the daily dashboard for browser viewers (not terminal users).
+#
+# Schema v2 (2026-05-02): nested `tags` (taste_type, function_seam, surface,
+# review_ask), structured `collaborators[]` with function badges, and
+# `decision_makers` split into owner / resolver / seam_stakeholders.
+#
+# This file holds substrate's OWN goal narratives. Substrate is its own
+# first client; goals are scored in public. Forks should copy this file's
+# structure into private fork `clients/<your-client>/goals/why-this-matters.yaml`,
+# replacing entries with their own goals.
+
+schema_version: 2026-05-02
+
+bets:
+
+  G-001:
+    headline: "Until one stranger pays, substrate's thesis is unfalsified marketing."
+    tags:
+      taste_type: [positioning]
+      function_seam: [marketing-x-sales]
+      surface: [outbound, internal]
+      review_ask: "is the productized POC offer sharp enough to convert one stranger in ninety days"
+    why: |
+      Revenue is the test substrate's thesis cannot fool. The framework
+      either produces a closing offer or it does not. After one closes,
+      calibration begins; until then, every claim is theoretical.
+    intel:
+      - context: README.md §What Substrate is
+      - principles: PRINCIPLES.md §The thesis
+      - skill: skills/consulting-poc/SKILL.md
+      - template: templates/consulting-proposal.md
+      - origin: ORIGIN.md §v1.0 launch
+    collaborators:
+      - name: kesava
+        function: PMM
+        role: owner
+    decision_makers:
+      owner: kesava
+      resolver: kesava
+      seam_stakeholders: []
+    decision: |
+      If this lands: Phase 2 retainer offers go live; second engagement
+      opens at higher predicted_p; sanitized case study ships back to
+      public substrate.
+      If this misses by 2026-08-07: ICP is mistargeted before pricing is
+      mispriced. First fix is sharpening which prospect cohort and which
+      jobs-to-be-done; second fix is pricing.
+    measurement_contract: goals/measurement-contracts/substrate-first-paid-engagement-2026-08-07.md
+    score:
+      brier: null
+      resolved_at: null
+      outcome: pending
+
+  G-002:
+    headline: "First inbound is the leading indicator that the discovery surface is load-bearing."
+    tags:
+      taste_type: [aeo-seo]
+      function_seam: [marketing-x-sales]
+      surface: [content, internal]
+      review_ask: "is the AEO surface dense enough to surface substrate to a stranger in fifty-four days"
+    why: |
+      Stars are vanity until they convert to messages. Inbound is the
+      proof that the AEO + open-source surface drives action, not just
+      attention. No inbound in 54 days means the surface needs density,
+      not more distribution.
+    intel:
+      - context: README.md
+      - aeo: docs/llms.txt
+      - aeo: docs/index.html
+      - codex: codex.iamkesava.com
+    collaborators:
+      - name: kesava
+        function: PMM
+        role: owner
+    decision_makers:
+      owner: kesava
+      resolver: kesava
+      seam_stakeholders: []
+    decision: |
+      If this lands: AEO surface is working; double down on density (more
+      codex content, more substrate.iamkesava.com pages) and add per-vertical
+      AEO pages.
+      If this misses by 2026-06-30: discovery surface needs review before
+      more distribution effort. Audit AEO presence in major assistants,
+      fix gaps, then redistribute.
+    measurement_contract: goals/measurement-contracts/substrate-first-inbound-prospect-2026-06-30.md
+    score:
+      brier: null
+      resolved_at: null
+      outcome: pending
+
+  G-003:
+    headline: "100 stars is the bar for the README hook to count as sharp."
+    tags:
+      taste_type: [positioning]
+      function_seam: [marketing-x-product]
+      surface: [content]
+      review_ask: "is the README opener sharp enough to convert casual visitors to watchers at 100x baseline"
+    why: |
+      Stars feed the inbound funnel that feeds the engagement funnel.
+      They do not pay rent, but they signal whether the opening sentence
+      survives a stranger's three-second scan. Below 100 in 90 days, the
+      hook is not sharp.
+    intel:
+      - context: README.md §thesis
+      - origin: ORIGIN.md
+      - landing: docs/index.html
+    collaborators:
+      - name: kesava
+        function: PMM
+        role: owner
+    decision_makers:
+      owner: kesava
+      resolver: kesava
+      seam_stakeholders: []
+    decision: |
+      If this lands: README hook works; distribution effort moves to
+      vertical AEO (per-vertical codex pages, ChatGPT and Perplexity
+      citations).
+      If this misses by 2026-08-07: README needs a sharper opening and a
+      more shareable wedge. Iterate the opening sentence, post on
+      HackerNews / Reddit / PMM Slack groups, retry next quarter.
+    measurement_contract: goals/measurement-contracts/substrate-100-stars-2026-08-07.md
+    score:
+      brier: null
+      resolved_at: null
+      outcome: pending

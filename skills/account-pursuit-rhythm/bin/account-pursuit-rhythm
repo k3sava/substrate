@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""account-pursuit-rhythm — design a 30/60/90-day pursuit rhythm for a tier.
+
+Produces an org-level cadence contract: touches per week, channel rotation,
+content gates, hand-off rules between SDR / AE / CS, and review checkpoints
+at day 30, 60, 90. Operationalizes pat_rhythm-beats-blast.
+
+Usage:
+    account-pursuit-rhythm --client <client> --tier 1A|1B|2
+                           [--horizon 30|60|90] [--mode design|audit]
+                           [--audit-input <existing-rhythm.md>]
+                           [--output <path>]
+
+Exit codes:
+    0 — rhythm spec written (or audit passed)
+    1 — preflight refused
+    2 — input invalid
+    3 — audit found violations
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+
+# ---- Cadence skeletons per tier ----
+
+@dataclass
+class Touch:
+    day: int
+    channel: str  # email | linkedin | voice | sms | video
+    gate: str
+    owner: str    # SDR | AE | SDR-AE | marketing
+    notes: str = ""
+
+
+def build_tier_1a_rhythm(horizon: int) -> list[Touch]:
+    """Tier 1A: 12 touches in first 30d, 6 in 31-60, 4 in 61-90.
+
+    Multi-thread to 3-5 buyers from day 1. Setup-heavy first 4 touches.
+    """
+    touches = [
+        # Setup phase (touches 1-4)
+        Touch(day=1,  channel="email",    gate="setup-alternative",        owner="SDR"),
+        Touch(day=2,  channel="linkedin", gate="setup-context",            owner="SDR"),
+        Touch(day=4,  channel="voice",    gate="setup-cost",               owner="SDR"),
+        Touch(day=6,  channel="email",    gate="proof-voc",                owner="SDR"),
+        # Follow-through (touches 5-9)
+        Touch(day=9,  channel="email",    gate="proof-differentiator",     owner="SDR"),
+        Touch(day=12, channel="linkedin", gate="follow-through-reframe",   owner="SDR"),
+        Touch(day=15, channel="video",    gate="follow-through-personal",  owner="AE"),
+        Touch(day=18, channel="email",    gate="follow-through-objection", owner="SDR-AE"),
+        Touch(day=22, channel="voice",    gate="follow-through-ask",       owner="AE"),
+        # Re-open (touches 10-12)
+        Touch(day=25, channel="email",    gate="reopen-curiosity",         owner="SDR"),
+        Touch(day=28, channel="linkedin", gate="reopen-share",             owner="SDR"),
+        Touch(day=30, channel="email",    gate="breakup-soft",             owner="SDR"),
+    ]
+    if horizon >= 60:
+        touches += [
+            Touch(day=37, channel="email",    gate="reopen-curiosity",  owner="AE",
+                  notes="executive-level reframe; AE owns the touch"),
+            Touch(day=44, channel="linkedin", gate="reopen-share",      owner="AE"),
+            Touch(day=50, channel="email",    gate="proof-voc",         owner="SDR",
+                  notes="new VoC quote (rotate from days 1-30)"),
+            Touch(day=55, channel="voice",    gate="follow-through-ask", owner="AE"),
+            Touch(day=58, channel="email",    gate="proof-differentiator", owner="SDR"),
+            Touch(day=60, channel="email",    gate="breakup-soft",       owner="AE"),
+        ]
+    if horizon >= 90:
+        touches += [
+            Touch(day=70, channel="linkedin", gate="reopen-share", owner="AE"),
+            Touch(day=78, channel="email",    gate="reopen-curiosity", owner="AE",
+                  notes="quarterly check-in; reference an industry shift"),
+            Touch(day=85, channel="email",    gate="proof-voc",      owner="SDR"),
+            Touch(day=90, channel="email",    gate="breakup-final",  owner="AE",
+                  notes="formal close; demote to nurture or drop at day 90 review"),
+        ]
+    return touches
+
+
+def build_tier_1b_rhythm(horizon: int) -> list[Touch]:
+    touches = [
+        Touch(day=1,  channel="email",    gate="setup-alternative",        owner="SDR"),
+        Touch(day=3,  channel="linkedin", gate="setup-context",            owner="SDR"),
+        Touch(day=6,  channel="email",    gate="setup-cost",               owner="SDR"),
+        Touch(day=10, channel="email",    gate="proof-voc",                owner="SDR"),
+        Touch(day=14, channel="voice",    gate="follow-through-ask",       owner="SDR"),
+        Touch(day=18, channel="email",    gate="follow-through-objection", owner="SDR-AE"),
+        Touch(day=22, channel="email",    gate="breakup-soft",             owner="SDR"),
+        Touch(day=25, channel="linkedin", gate="reopen-share",             owner="SDR"),
+        Touch(day=28, channel="email",    gate="reopen-curiosity",         owner="SDR"),
+        Touch(day=30, channel="email",    gate="breakup-final",            owner="SDR"),
+    ]
+    if horizon >= 60:
+        touches += [
+            Touch(day=42, channel="email",    gate="reopen-curiosity", owner="SDR"),
+            Touch(day=50, channel="linkedin", gate="reopen-share",     owner="SDR"),
+            Touch(day=55, channel="email",    gate="proof-differentiator", owner="SDR"),
+            Touch(day=60, channel="email",    gate="breakup-soft",     owner="SDR"),
+        ]
+    if horizon >= 90:
+        touches += [
+            Touch(day=75, channel="email",    gate="reopen-curiosity", owner="SDR"),
+            Touch(day=85, channel="linkedin", gate="reopen-share",     owner="SDR"),
+            Touch(day=90, channel="email",    gate="breakup-final",    owner="SDR"),
+        ]
+    return touches
+
+
+def build_tier_2_rhythm(horizon: int) -> list[Touch]:
+    touches = [
+        Touch(day=1,  channel="email",    gate="setup-alternative",        owner="SDR"),
+        Touch(day=4,  channel="email",    gate="setup-cost",               owner="SDR"),
+        Touch(day=7,  channel="linkedin", gate="setup-context",            owner="SDR"),
+        Touch(day=12, channel="email",    gate="follow-through-objection", owner="SDR"),
+        Touch(day=17, channel="voice",    gate="follow-through-ask",       owner="SDR"),
+        Touch(day=21, channel="email",    gate="reopen-curiosity",         owner="SDR"),
+        Touch(day=26, channel="linkedin", gate="reopen-share",             owner="SDR"),
+        Touch(day=30, channel="email",    gate="breakup-final",            owner="SDR"),
+    ]
+    if horizon >= 60:
+        touches += [
+            Touch(day=50, channel="email",    gate="reopen-curiosity", owner="marketing",
+                  notes="content-led nurture; marketing owns"),
+            Touch(day=60, channel="email",    gate="breakup-soft",     owner="marketing"),
+        ]
+    if horizon >= 90:
+        touches += [
+            Touch(day=85, channel="email",    gate="reopen-curiosity", owner="marketing",
+                  notes="quarterly nurture or drop"),
+        ]
+    return touches
+
+
+# ---- Validators ----
+
+def check_no_consecutive_same_channel_gate(touches: list[Touch]) -> list[str]:
+    """Per pat_rhythm-beats-blast: no two consecutive touches on same channel + gate."""
+    issues = []
+    for i in range(1, len(touches)):
+        prev, curr = touches[i - 1], touches[i]
+        if prev.channel == curr.channel and prev.gate == curr.gate:
+            issues.append(
+                f"day {prev.day} → day {curr.day}: consecutive same channel ({prev.channel}) "
+                f"+ gate ({prev.gate}) violates rhythm-beats-blast")
+    return issues
+
+
+def check_tier_1a_minimum_density(touches: list[Touch]) -> list[str]:
+    """Tier 1A must have ≥12 touches in first 30 days."""
+    issues = []
+    in_30 = [t for t in touches if t.day <= 30]
+    if len(in_30) < 12:
+        issues.append(f"tier 1A under-pursuit: {len(in_30)} touches in first 30d (need ≥12)")
+    return issues
+
+
+def check_tier_2_max_density(touches: list[Touch]) -> list[str]:
+    """Tier 2 must have ≤10 touches in first 30 days (uneconomic above that)."""
+    issues = []
+    in_30 = [t for t in touches if t.day <= 30]
+    if len(in_30) > 10:
+        issues.append(f"tier 2 over-pursuit: {len(in_30)} touches in first 30d (cap is 10; uneconomic above that)")
+    return issues
+
+
+def check_max_gap(touches: list[Touch], tier: str) -> list[str]:
+    """Tier 1A max gap is 5 days in first 30; tier 1B max 7; tier 2 max 10."""
+    if not touches:
+        return []
+    max_gap = {"1A": 5, "1B": 7, "2": 10}.get(tier, 7)
+    issues = []
+    in_30 = [t for t in touches if t.day <= 30]
+    for i in range(1, len(in_30)):
+        gap = in_30[i].day - in_30[i - 1].day
+        if gap > max_gap:
+            issues.append(
+                f"day {in_30[i - 1].day} → day {in_30[i].day}: {gap}-day gap > tier-{tier} max ({max_gap})"
+            )
+    return issues
+
+
+# ---- Substrate readers ----
+
+def read_positioning_path(client: str) -> str | None:
+    pos_dir = SUBSTRATE_ROOT / "clients" / client / "positioning"
+    if pos_dir.is_dir():
+        for f in pos_dir.glob("positioning-canonical-statement*.md"):
+            return str(f.relative_to(SUBSTRATE_ROOT))
+    sub_pos = SUBSTRATE_ROOT / "clients" / client / "substrate"
+    if sub_pos.is_dir():
+        for f in sub_pos.glob("positioning-canonical-statement*.md"):
+            return str(f.relative_to(SUBSTRATE_ROOT))
+    return None
+
+
+# ---- Audit mode ----
+
+def parse_existing_rhythm(text: str) -> list[Touch]:
+    """Parse a rhythm.md table back into Touch objects, for audit."""
+    touches = []
+    in_table = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("| Day") or stripped.startswith("|---"):
+            in_table = True
+            continue
+        if in_table and stripped.startswith("|"):
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if len(cells) < 4:
+                continue
+            try:
+                day = int(re.search(r"\d+", cells[0]).group(0))
+            except (ValueError, AttributeError):
+                continue
+            channel = cells[1].lower()
+            gate = cells[2]
+            owner = cells[3] if len(cells) > 3 else ""
+            notes = cells[4] if len(cells) > 4 else ""
+            touches.append(Touch(day=day, channel=channel, gate=gate, owner=owner, notes=notes))
+        elif in_table and not stripped.startswith("|"):
+            in_table = False
+    return touches
+
+
+# ---- Output rendering ----
+
+def render_rhythm_spec(client: str, tier: str, horizon: int,
+                       touches: list[Touch], pos_path: str | None) -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    contradiction_position = {
+        "1A": "Holland/Nelson — hand-personalize every touch; multithread 3-5 buyers from day 1",
+        "1B": "hybrid — smart-vars + 1-2 hand sentences per touch; multithread 2-3 buyers",
+        "2":  "Barrows/Bertuzzi/Roberge — scaled cadence with smart variables; single-thread",
+    }[tier]
+
+    multithread_spec = {
+        "1A": "Day 1: SDR reaches 3-5 buyers (economic buyer + 2-3 decision-makers + 1-2 users). AE owns the executive-level touch from day 7.",
+        "1B": "Day 1: SDR reaches 2-3 buyers (primary + 1-2 secondary). AE engages on first reply or day 18, whichever earlier.",
+        "2":  "Day 1: SDR reaches 1 primary buyer. Multi-thread only if first touch returns a referral.",
+    }[tier]
+
+    in_30 = [t for t in touches if t.day <= 30]
+    in_60 = [t for t in touches if 30 < t.day <= 60]
+    in_90 = [t for t in touches if 60 < t.day <= 90]
+
+    lines = [
+        "---",
+        "asset_type: account-pursuit-rhythm",
+        f"client: {client}",
+        f"tier: {tier}",
+        f"horizon_days: {horizon}",
+        f"date: {today}",
+        f"touches_total: {len(touches)}",
+        f"touches_30d: {len(in_30)}",
+        f"touches_31_60d: {len(in_60)}",
+        f"touches_61_90d: {len(in_90)}",
+        "---",
+        "",
+        f"# Pursuit rhythm — tier {tier} — {horizon}-day horizon",
+        "",
+        f"**Client:** {client}",
+        f"**Tier:** {tier}",
+        f"**Horizon:** {horizon} days",
+        f"**Total touches:** {len(touches)}",
+        "",
+        "## Architectural notes",
+        "",
+        f"This rhythm operationalizes `pat_rhythm-beats-blast` for tier {tier}.",
+        f"Channel rotation enforced (no two consecutive touches on same channel + gate).",
+        f"Content-gate progression mirrors buyer-state advancement (Setup → Follow-Through → Re-open → Breakup).",
+        "",
+        "## Personalization mode",
+        "",
+        f"`con_personalization-vs-scale` position applied: **{contradiction_position}**.",
+        "",
+        "## Multi-thread spec",
+        "",
+        multithread_spec,
+        "",
+        "## Cadence schedule",
+        "",
+        "| Day | Channel | Gate | Owner | Notes |",
+        "|---|---|---|---|---|",
+    ]
+    for t in touches:
+        lines.append(f"| {t.day} | {t.channel} | {t.gate} | {t.owner} | {t.notes or ''} |")
+
+    lines += [
+        "",
+        "## Hand-off rules",
+        "",
+        "| Trigger | From | To | Action |",
+        "|---|---|---|---|",
+        "| Prospect replies (any channel) | SDR | AE | AE picks up next touch within 24h; SDR remains threaded |",
+        "| Meeting booked | SDR | AE | AE owns meeting + follow-up; SDR drops back to nurture-quality role |",
+        "| High-intent surge (per intent feed) | SDR | AE | AE accelerates next touch; SDR pauses scheduled cadence |",
+        "| Trigger event detected | (any) | (current owner) | Inject a trigger-anchored touch within 48h, replacing the next scheduled touch |",
+        "| Contract signature | AE | CS | CS reads positioning + ICP + status-quo; same canonical narrative carries through |",
+        "| Day-30 review: no engagement | SDR | (review) | Demote to tier 1B (if 1A) or to nurture (if 1B/2) |",
+        "| Day-90 review: no engagement | (any) | (review) | Drop or move to quarterly nurture (per ABM tier policy) |",
+        "",
+        "## Review checkpoints",
+        "",
+        "### Day 30",
+        "- Did the account engage (open + click + reply)? If no on all three: demote one tier.",
+        "- Did the account move (meeting booked / new buyer surfaced)? If yes: AE picks up.",
+        "- If no signals at all: continue to day 60 with tightened content gates.",
+        "",
+        "### Day 60",
+        "- Re-score intent (any new feed signals?).",
+        "- Re-check trigger feed (any new trigger events?).",
+        "- If no engagement and no triggers: demote to nurture, drop SDR-active status.",
+        "",
+        "### Day 90",
+        "- Final close-the-loop touch (breakup-final, AE-owned for tier 1A).",
+        "- Move to nurture queue with quarterly content-led re-engagement.",
+        "- Add to next quarter's tier-review pool.",
+        "",
+        "## Demote / drop criteria",
+        "",
+        "- Demote (1A → 1B → 2): no engagement at day-30 review.",
+        "- Drop to nurture: no engagement at day-60 review.",
+        "- Disqualify: account moved to anti-ICP (acquired into out-of-scope parent, vertical pivot, etc.).",
+        "",
+        "## Substrate cited",
+        "",
+        f"- `clients/{client}/icp/00-INDEX.md`",
+    ]
+    if pos_path:
+        lines.append(f"- `{pos_path}`")
+    lines += [
+        "",
+        "## Patterns grounded",
+        "",
+        "- `knowledge/patterns/rhythm-beats-blast.md`",
+        "- `knowledge/patterns/account-not-lead-as-unit.md`",
+        "- `knowledge/patterns/trigger-events-beat-cadence-blast.md`",
+        "",
+        "## Contradictions resolved",
+        "",
+        f"- `knowledge/contradictions/personalization-vs-scale.md` (position: {tier} → {contradiction_position[:60]}...)",
+        "",
+        "## Hand-off to outbound-sequence-design",
+        "",
+        f"Pipe each touch through `substrate outbound-sequence-design --tier {tier}` to compose the actual copy.",
+        "Reads this rhythm spec for cadence positions; emits per-touch markdown in the configured output dir.",
+    ]
+    return "\n".join(lines)
+
+
+# ---- Main ----
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--client", required=True)
+    p.add_argument("--tier", required=True, choices=["1A", "1B", "2"])
+    p.add_argument("--horizon", type=int, default=90, choices=[30, 60, 90])
+    p.add_argument("--mode", default="design", choices=["design", "audit"])
+    p.add_argument("--audit-input", default=None)
+    p.add_argument("--output", default=None)
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        print(f"REFUSED: client root missing — {client_root}", file=sys.stderr)
+        return 1
+
+    pos_path = read_positioning_path(args.client)
+    if pos_path is None:
+        print(f"REFUSED: canonical positioning statement missing for {args.client}", file=sys.stderr)
+        return 1
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # ---- Audit mode ----
+    if args.mode == "audit":
+        if not args.audit_input:
+            print("REFUSED: --mode audit requires --audit-input <existing-rhythm.md>", file=sys.stderr)
+            return 2
+        audit_file = Path(args.audit_input)
+        if not audit_file.is_file():
+            print(f"REFUSED: audit input not found — {audit_file}", file=sys.stderr)
+            return 2
+
+        text = audit_file.read_text(encoding="utf-8")
+        touches = parse_existing_rhythm(text)
+        if not touches:
+            print(f"REFUSED: could not parse cadence schedule from {audit_file}", file=sys.stderr)
+            return 2
+
+        print(f"[account-pursuit-rhythm audit] {audit_file}: parsed {len(touches)} touches", file=sys.stderr)
+        all_issues = []
+        all_issues += check_no_consecutive_same_channel_gate(touches)
+        if args.tier == "1A":
+            all_issues += check_tier_1a_minimum_density(touches)
+        if args.tier == "2":
+            all_issues += check_tier_2_max_density(touches)
+        all_issues += check_max_gap(touches, args.tier)
+
+        if all_issues:
+            print(f"\nFAIL audit: {len(all_issues)} issue(s)", file=sys.stderr)
+            for i in all_issues:
+                print(f"  · {i}", file=sys.stderr)
+            return 3
+        print(f"\nPASS audit: rhythm valid")
+        return 0
+
+    # ---- Design mode ----
+    builders = {
+        "1A": build_tier_1a_rhythm,
+        "1B": build_tier_1b_rhythm,
+        "2":  build_tier_2_rhythm,
+    }
+    touches = builders[args.tier](args.horizon)
+
+    # Self-validate the produced rhythm
+    issues = check_no_consecutive_same_channel_gate(touches)
+    if args.tier == "1A":
+        issues += check_tier_1a_minimum_density(touches)
+    if args.tier == "2":
+        issues += check_tier_2_max_density(touches)
+    issues += check_max_gap(touches, args.tier)
+
+    if issues:
+        print(f"REFUSED: produced rhythm has {len(issues)} self-check issue(s):", file=sys.stderr)
+        for i in issues:
+            print(f"  · {i}", file=sys.stderr)
+        return 3
+
+    spec = render_rhythm_spec(args.client, args.tier, args.horizon, touches, pos_path)
+
+    if args.output:
+        out_path = Path(args.output).resolve()
+    else:
+        out_dir = client_root / "sales" / "pursuit-rhythms"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{today}-tier-{args.tier}-rhythm.md"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(spec, encoding="utf-8")
+
+    print(f"[account-pursuit-rhythm] tier={args.tier} horizon={args.horizon}d touches={len(touches)}", file=sys.stderr)
+    print(f"[account-pursuit-rhythm] wrote {out_path}", file=sys.stderr)
+    print(f"PASS: tier-{args.tier} rhythm → {out_path.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,70 @@
+# competitor-pricing.yaml — per-client competitor pricing matrix
+#
+# Used by:
+#   - skills/pricing-strategic       (read in --mode wtp-survey, --mode anchor-design, --mode review)
+#
+# Drop this file at: clients/<client>/competitive/competitor-pricing.yaml
+# The matrix is *informational*. Per the Mickos rule, do not ship a pricing page from
+# competitor scans; the WTP curve is the load-bearing input. The competitor matrix is
+# context (Simon's category-anchor, Kahneman's reference-price drift watch).
+#
+# Field reference:
+#   slug              required   the competitor slug (matches competitors.yaml)
+#   tiers             required   per-tier price object
+#     monthly_usd     required   numeric monthly price in USD; null when contact-sales
+#     model           optional   contact-sales | flat | per-seat | per-usage | freemium
+#     currency        optional   default USD; cite source for FX if non-USD
+#     last_verified   optional   YYYY-MM-DD; freshness for the snapshot
+#     notes           optional   any disclaimers (commitment minimums, annual-only, etc.)
+
+competitors:
+  example-competitor-a:
+    last_verified: 2026-04-15
+    tiers:
+      starter:
+        monthly_usd: 49
+        model: flat
+        notes: per-seat available; 5-seat minimum on monthly billing
+      growth:
+        monthly_usd: 149
+        model: flat
+      enterprise:
+        monthly_usd: null
+        model: contact-sales
+        notes: typical mid-market deal $1,800-3,200 ARR
+
+  example-competitor-b:
+    last_verified: 2026-04-12
+    tiers:
+      free:
+        monthly_usd: 0
+        model: freemium
+        notes: 100 events/month, branded outbound
+      starter:
+        monthly_usd: 79
+        model: flat
+      growth:
+        monthly_usd: 199
+        model: flat
+      enterprise:
+        monthly_usd: null
+        model: contact-sales
+
+  example-competitor-c:
+    last_verified: 2026-03-30
+    tiers:
+      starter:
+        monthly_usd: 39
+        model: per-seat
+      growth:
+        monthly_usd: 119
+        model: per-seat
+        notes: 3-seat minimum
+      enterprise:
+        monthly_usd: 299
+        model: per-seat
+
+# How to use (operator):
+# 1. Run substrate competitive-scout --client <client> to populate the matrix from web data.
+# 2. Verify each entry against the competitor's pricing page; mark `last_verified`.
+# 3. Reference this matrix in pricing-strategic --mode anchor-design and --mode review.

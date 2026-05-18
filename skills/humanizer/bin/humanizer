@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# humanizer — anti-AI writing pass on any draft.
+#
+# Layered:
+#   1. Detection — runs Vale with all 11 substrate rule packs (KillList, WeakVerbs, AbstractNouns, ThroatClearing, Cliches, BannedVocab, NegativeParallelism, MetaCommentary, ParticiplePhrases, ChatbotArtifacts, CopulaAvoidance, DeadPhrases)
+#   2. Audit — posts the asset + Vale findings to Claude CLI for the
+#              "what makes this obviously AI-generated?" question (when --audit)
+#   3. Rewrite — generates <asset>.humanized.md with span-by-span fixes (when --rewrite)
+#
+# Usage:
+#   humanizer <asset-path> [--strict] [--rewrite] [--audit] [--report-only]
+#
+# Exit:
+#   0 — clean (no errors; warnings allowed unless --strict)
+#   1 — error-level violations found
+#   2 — file not found / vale missing / claude CLI missing (only with --rewrite/--audit)
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+ASSET="${1:?asset path required}"
+[ -f "$ASSET" ] || { echo "asset not found: $ASSET" >&2; exit 2; }
+
+STRICT=0
+REWRITE=0
+AUDIT=0
+REPORT_ONLY=0
+
+shift
+while [ "${1:-}" != "" ]; do
+  case "$1" in
+    --strict)      STRICT=1; shift ;;
+    --rewrite)     REWRITE=1; shift ;;
+    --audit)       AUDIT=1; shift ;;
+    --report-only) REPORT_ONLY=1; shift ;;
+    *) shift ;;
+  esac
+done
+
+command -v vale > /dev/null || { echo "vale not installed (brew install vale)" >&2; exit 2; }
+
+cd "$SUBSTRATE_ROOT"
+
+case "$ASSET" in
+  /*) REL="${ASSET#$SUBSTRATE_ROOT/}" ;;
+  *)  REL="$ASSET" ;;
+esac
+
+echo "=== humanizer: $ASSET ===" >&2
+
+# === Layer 1: Detection (Vale) ===
+vale_json=$(vale --output=JSON "$REL" 2>/dev/null || true)
+
+if [ -z "$vale_json" ] || [ "$vale_json" = "{}" ]; then
+  echo "  detection: clean (vale 0 findings)" >&2
+  if [ "$REPORT_ONLY" -eq 1 ]; then
+    echo "{}"
+  fi
+  echo "PASS: $ASSET (humanizer: 0 findings)"
+  exit 0
+fi
+
+# Count + summarize
+counts=$(echo "$vale_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print('0 0 0'); sys.exit(0)
+e = w = s = 0
+by_rule = {}
+for path, alerts in d.items():
+    for a in alerts:
+        sev = a.get('Severity', '?')
+        if sev == 'error': e += 1
+        elif sev == 'warning': w += 1
+        elif sev == 'suggestion': s += 1
+        rule = a.get('Check', '?')
+        by_rule[rule] = by_rule.get(rule, 0) + 1
+print(f'{e} {w} {s}')
+for rule, n in sorted(by_rule.items(), key=lambda x: -x[1]):
+    print(f'  {n:>3d}  {rule}', file=sys.stderr)
+")
+errors=$(echo "$counts" | awk 'NR==1 {print $1}')
+warnings=$(echo "$counts" | awk 'NR==1 {print $2}')
+
+echo "  detection: errors=${errors:-0}  warnings=${warnings:-0}" >&2
+echo "" >&2
+
+if [ "$REPORT_ONLY" -eq 1 ]; then
+  echo "$vale_json"
+  exit 0
+fi
+
+# Top 12 findings on stderr
+echo "$vale_json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+shown = 0
+for path, alerts in d.items():
+    for a in alerts:
+        if shown >= 12: break
+        sev = a.get('Severity', '?').upper()
+        line = a.get('Line', 0)
+        check = a.get('Check', '?')
+        msg = a.get('Message', '')
+        match = a.get('Match', '')
+        print(f'  [{sev:>10s}] L{line:>4d}  {check:32s}  \"{match}\" — {msg}')
+        shown += 1
+" >&2
+
+# === Layer 2: Audit (when --audit) ===
+if [ "$AUDIT" -eq 1 ]; then
+  if command -v claude > /dev/null; then
+    echo "" >&2
+    echo "  audit: asking 'what makes this obviously AI-generated?'..." >&2
+    audit_q="Read the draft at $REL plus these Vale findings (next paragraph). Answer in 200 words: what additional tells beyond the rule-pack hits make this read as AI-generated? Be specific; cite exact phrases."
+    audit_ans=$(echo "$vale_json" | claude --print --model claude-haiku-4-5-20251001 "$audit_q
+
+Vale findings JSON below:
+$(cat <<EOF | head -40
+
+EOF
+)" 2>/dev/null | head -30)
+    if [ -n "$audit_ans" ]; then
+      echo "  audit answer:" >&2
+      echo "$audit_ans" | sed 's/^/    /' >&2
+    else
+      echo "  audit: claude CLI returned empty" >&2
+    fi
+  else
+    echo "  audit: skipped (claude CLI not on PATH)" >&2
+  fi
+fi
+
+# === Layer 3: Rewrite (when --rewrite) ===
+if [ "$REWRITE" -eq 1 ]; then
+  if ! command -v claude > /dev/null; then
+    echo "" >&2
+    echo "  rewrite: skipped (claude CLI not on PATH; install Claude Code)" >&2
+  else
+    OUT="${ASSET%.md}.humanized.md"
+    # Resolve the brand-voice canon for the active client. Order:
+    #   1. clients/<client>/brand-voice/voice-dna-*.md  (operator-authored)
+    #   2. clients/<client>/substrate/voice-dna-*.md    (legacy location)
+    #   3. knowledge/voice/how-we-write.md              (substrate default)
+    voice_client="${SUBSTRATE_CLIENT:-${CLIENT:-}}"
+    if [ -z "$voice_client" ]; then
+      case "$ASSET" in
+        */clients/*/*) voice_client=$(echo "$ASSET" | sed -E 's@.*/clients/([^/]+)/.*@\1@') ;;
+      esac
+    fi
+    voice_canon=""
+    if [ -n "$voice_client" ]; then
+      voice_canon=$(ls "$SUBSTRATE_ROOT/clients/$voice_client/brand-voice/voice-dna-"*.md 2>/dev/null | head -1)
+      [ -z "$voice_canon" ] && voice_canon=$(ls "$SUBSTRATE_ROOT/clients/$voice_client/substrate/voice-dna-"*.md 2>/dev/null | head -1)
+    fi
+    [ -z "$voice_canon" ] && voice_canon="$SUBSTRATE_ROOT/knowledge/voice/how-we-write.md"
+    voice_rel="${voice_canon#$SUBSTRATE_ROOT/}"
+    echo "" >&2
+    echo "  rewrite: generating $OUT (voice canon: $voice_rel)..." >&2
+    rewrite_q="You are humanizer (skills/humanizer/SKILL.md). Read $voice_rel as your style canon. Read the draft at $REL plus the Vale findings JSON below. Produce a rewrite that fixes EVERY error-level violation, preserves the underlying claims and evidence, and matches the canonical voice. The rewrite is non-destructive; output the full markdown content of the rewritten file. NO em-dashes. NO kill-list words. NO negative parallelisms. NO meta-commentary. NO chatbot artifacts."
+    claude --print --model claude-sonnet-4-6 "$rewrite_q
+
+Vale findings JSON:
+$vale_json
+" 2>/dev/null > "$OUT"
+    if [ -s "$OUT" ]; then
+      echo "  rewrite: $OUT written ($(wc -l < "$OUT") lines)" >&2
+    else
+      rm -f "$OUT"
+      echo "  rewrite: claude CLI returned empty; no output written" >&2
+    fi
+  fi
+fi
+
+echo "" >&2
+
+# Strict mode: warnings count too
+if [ "$STRICT" -eq 1 ]; then
+  fail_count=$((errors + warnings))
+else
+  fail_count=$errors
+fi
+
+if [ "$fail_count" -eq 0 ]; then
+  echo "PASS: $ASSET (humanizer: $errors errors, $warnings warnings)"
+  exit 0
+fi
+
+echo "FAIL: $ASSET (humanizer: $errors errors, $warnings warnings)"
+exit 1

@@ -1,0 +1,1058 @@
+#!/usr/bin/env python3
+"""event-taxonomy-audit, audit clients/<client>/events.yaml against production stream.
+
+Reads:
+    clients/<client>/events.yaml                     declared taxonomy
+    clients/<client>/analytics/<source>/<YYYY-MM>.csv  production event stream
+                                                     (one or more sources)
+    clients/<client>/icp/icp.md                       ICP cells (for cross-check)
+    clients/<client>/positioning/positioning.md       positioning vocabulary
+
+Runs five drift checks per the event-taxonomy-as-product-knowledge pattern:
+    1. declared-but-unfired   events declared in taxonomy with no production
+                              fires within --decay-days
+    2. fired-but-undeclared   events present in production stream not in
+                              taxonomy
+    3. near-duplicate-names   events whose names share >0.7 1-gram token overlap
+                              (drift signal: rename-without-deprecation)
+    4. missing-properties     declared events whose property list is incomplete
+                              vs the production property column set
+    5. naming-convention      events not in object_action snake_case form
+
+Outputs three artifacts under clients/<client>/analytics/audits/:
+    events-taxonomy-audit-<YYYY-MM-DD>.md            human audit
+    events-taxonomy-audit-<YYYY-MM-DD>.json          structured findings
+    events-taxonomy-audit-<YYYY-MM-DD>-remediation.csv  row-per-finding for
+                                                     issue-tracker import
+
+Usage:
+    event-taxonomy-audit --client <client>
+    event-taxonomy-audit --client <client> --source amplitude --month 2026-04
+    event-taxonomy-audit --client <client> --strict-naming
+    event-taxonomy-audit --client <client> --decay-days 60
+
+Exit codes:
+    0, audit clean (overlap >=90%, no high-severity findings)
+    1, audit ran with findings (overlap <90% or high-severity present)
+    2, audit ran with strict-naming refusal (naming violations present)
+    3, refused (substrate gap, missing events.yaml, missing production CSVs)
+    4, invalid args
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+# Snake-case object_action regex per Mike Kitchen's naming-convention essay.
+# Acceptable forms:
+#     trial.started, trial_started, account.deleted, payment_failed
+# We accept either dot-separator or underscore between object and action,
+# but require lower-case only. Stripe-style customer.subscription.created is
+# also accepted (multi-segment object). Mixpanel "Sign Up" or "Page Viewed"
+# style fails because of capitalization + space.
+NAMING_RE = re.compile(r"^[a-z][a-z0-9]*([._][a-z][a-z0-9]*)+$")
+
+# Stop-words removed from token-overlap comparison. Tiny English glue plus
+# common analytics noise.
+TOKEN_STOPWORDS = {
+    "the", "a", "an", "of", "to", "for", "in", "on", "at",
+    "and", "or", "is", "was", "be", "by", "with",
+    "event", "events", "action", "actions",
+}
+
+# Per-source event-name field, mirrors analytics-pull's mapping.
+SOURCE_EVENT_FIELD = {
+    "amplitude": "event_name",
+    "posthog": "event_name",
+    "mixpanel": "event_name",
+    "segment": "event_name",
+    "ga4": "event_name",
+    "hubspot": "event_type",
+    "stripe": "event_type",
+}
+
+# Sources whose events are user-behavior (vs revenue / CRM). The taxonomy gate
+# is hard for these; for stripe / hubspot the gate is softened to a warning
+# because revenue and CRM events typically carry their own platform-defined
+# taxonomy.
+USER_BEHAVIOR_SOURCES = {"amplitude", "posthog", "mixpanel", "segment", "ga4"}
+
+# Default audit windows per pattern.
+DEFAULT_DECAY_DAYS = 30
+DEFAULT_NEAR_DUP_THRESHOLD = 0.7
+DEFAULT_OVERLAP_HEALTHY = 90.0  # percent
+
+
+# --- minimal yaml loader (zero-dep, mirrors analytics-pull's parser) -------
+
+def load_yaml(path: Path) -> dict | None:
+    try:
+        import yaml  # type: ignore[import-not-found]
+        return yaml.safe_load(path.read_text())
+    except ImportError:
+        pass
+    return _parse_minimal_yaml(path.read_text())
+
+
+def _parse_minimal_yaml(text: str) -> dict:
+    root: dict = {}
+    stack: list[tuple[int, dict | list]] = [(-1, root)]
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = re.sub(r"(\s)#.*$", r"\1", raw).rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            value_part = stripped[2:].strip()
+            if isinstance(parent, list):
+                if ":" in value_part and not value_part.endswith(":"):
+                    k, _, v = value_part.partition(":")
+                    new_map = {k.strip(): _scalar(v.strip())}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+                elif value_part:
+                    parent.append(_scalar(value_part))
+                else:
+                    new_map = {}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+            i += 1
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if not val:
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines):
+                    next_line = lines[j]
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent > indent and next_line.strip().startswith("- "):
+                        new_list: list = []
+                        if isinstance(parent, dict):
+                            parent[key] = new_list
+                        stack.append((indent, new_list))
+                    else:
+                        new_map: dict = {}
+                        if isinstance(parent, dict):
+                            parent[key] = new_map
+                        stack.append((indent, new_map))
+            else:
+                if isinstance(parent, dict):
+                    parent[key] = _scalar_or_inline(val)
+        i += 1
+    return root
+
+
+def _scalar(v: str):
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    if v.startswith("'") and v.endswith("'"):
+        return v[1:-1]
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    if v.lower() in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    if re.fullmatch(r"-?\d+\.\d+", v):
+        return float(v)
+    return v
+
+
+def _scalar_or_inline(v: str):
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        if not inner:
+            return []
+        return [_scalar(p.strip()) for p in inner.split(",")]
+    if v.startswith("{") and v.endswith("}"):
+        return {}  # not used
+    return _scalar(v)
+
+
+# --- helpers ---------------------------------------------------------------
+
+def refuse(reason: str, detail: str = "") -> int:
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    return 3
+
+
+def previous_month_label(today: datetime | None = None) -> str:
+    today = today or datetime.now(timezone.utc)
+    first_of_month = today.replace(day=1)
+    last_of_prev = first_of_month - timedelta(days=1)
+    return last_of_prev.strftime("%Y-%m")
+
+
+def parse_ts(value: str) -> datetime | None:
+    if not value:
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def tokenize(name: str) -> list[str]:
+    """Split an event name into 1-gram tokens, lowered, stop-words filtered."""
+    parts = re.split(r"[._\s\-/]+", name.strip().lower())
+    return [p for p in parts if p and p not in TOKEN_STOPWORDS]
+
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    if not a and not b:
+        return 0.0
+    union = a | b
+    if not union:
+        return 0.0
+    return len(a & b) / len(union)
+
+
+# --- preflight + loaders ----------------------------------------------------
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/")
+    if not (client_root / "positioning").is_dir() and not (client_root / "positioning.md").is_file():
+        fails.append(f"positioning layer missing: clients/{client}/positioning/")
+    if not (client_root / "events.yaml").is_file():
+        fails.append(f"events.yaml missing: clients/{client}/events.yaml")
+    return len(fails) == 0, fails
+
+
+def load_taxonomy(client: str) -> dict:
+    """Load events.yaml and normalize.
+
+    Returns:
+        {
+          "freshness_window_days": int,
+          "last_updated": str,
+          "source_system": str,
+          "events": [{"name": ..., "properties": [...], "icp_cells": [...],
+                      "last_observed": "YYYY-MM-DD", "surface": ...,
+                      "description": ...}],
+          "cohorts": [...],
+        }
+    """
+    p = SUBSTRATE_ROOT / "clients" / client / "events.yaml"
+    raw = load_yaml(p) or {}
+    events = raw.get("events", []) or []
+    norm_events: list[dict] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        norm_events.append({
+            "name": ev.get("name", ""),
+            "description": ev.get("description", ""),
+            "surface": ev.get("surface", ""),
+            "properties": ev.get("properties") or [],
+            "icp_cells": ev.get("icp_cells") or [],
+            "last_observed": str(ev.get("last_observed", "")),
+        })
+    return {
+        "freshness_window_days": raw.get("freshness_window_days", 30),
+        "last_updated": str(raw.get("last_updated", "")),
+        "source_system": raw.get("source_system", ""),
+        "events": norm_events,
+        "cohorts": raw.get("cohorts") or [],
+    }
+
+
+def list_production_csvs(client: str, requested_source: str, month: str) -> list[Path]:
+    base = SUBSTRATE_ROOT / "clients" / client / "analytics"
+    if not base.is_dir():
+        return []
+    found: list[Path] = []
+    if requested_source == "all":
+        for src_dir in sorted(base.iterdir()):
+            if not src_dir.is_dir():
+                continue
+            if src_dir.name in ("audits", "_log", "dashboards", "lift-tests", "incrementality", "reports"):
+                continue
+            csv_path = src_dir / f"{month}.csv"
+            if csv_path.is_file():
+                found.append(csv_path)
+    else:
+        csv_path = base / requested_source / f"{month}.csv"
+        if csv_path.is_file():
+            found.append(csv_path)
+    return found
+
+
+def load_production_stream(csv_paths: list[Path]) -> dict[str, dict]:
+    """Aggregate event firings across one or more source CSVs.
+
+    Returns:
+        {
+          event_name: {
+            "fire_count": int,
+            "last_fired_ts": datetime | None,
+            "first_fired_ts": datetime | None,
+            "sources": [str],
+            "properties_seen": set[str],
+          },
+          ...
+        }
+    """
+    out: dict[str, dict] = defaultdict(lambda: {
+        "fire_count": 0,
+        "last_fired_ts": None,
+        "first_fired_ts": None,
+        "sources": set(),
+        "properties_seen": set(),
+    })
+    for path in csv_paths:
+        # Source = parent directory name (clients/<c>/analytics/<source>/2026-04.csv)
+        source = path.parent.name
+        event_field = SOURCE_EVENT_FIELD.get(source, "event_name")
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                continue
+            prop_fields = [c for c in reader.fieldnames if c.startswith("property_")]
+            for row in reader:
+                ev = (row.get(event_field) or "").strip()
+                if not ev:
+                    continue
+                ts = parse_ts(row.get("ts", ""))
+                rec = out[ev]
+                rec["fire_count"] += 1
+                rec["sources"].add(source)
+                if ts:
+                    if not rec["first_fired_ts"] or ts < rec["first_fired_ts"]:
+                        rec["first_fired_ts"] = ts
+                    if not rec["last_fired_ts"] or ts > rec["last_fired_ts"]:
+                        rec["last_fired_ts"] = ts
+                # Track which property columns held a value for this event
+                for pf in prop_fields:
+                    if (row.get(pf) or "").strip():
+                        rec["properties_seen"].add(pf[len("property_"):])
+    return out
+
+
+# --- the 5 drift checks ----------------------------------------------------
+
+def check_declared_but_unfired(taxonomy: dict, prod: dict[str, dict],
+                                window_end: datetime, decay_days: int) -> list[dict]:
+    cutoff = window_end - timedelta(days=decay_days)
+    findings: list[dict] = []
+    for ev in taxonomy["events"]:
+        name = ev["name"]
+        rec = prod.get(name)
+        if not rec or rec["fire_count"] == 0:
+            findings.append({
+                "category": "declared-but-unfired",
+                "event_name": name,
+                "severity": "high",
+                "fire_count": 0,
+                "days_since_last_fire": "n/a",
+                "recommendation": (
+                    "decommission, investigate instrumentation, or re-instrument. "
+                    "An event in the taxonomy that never fires in production is folklore. "
+                    "Per event-taxonomy-as-product-knowledge: undeclared-state must be intentional."
+                ),
+                "icp_cells": ev.get("icp_cells", []),
+                "surface": ev.get("surface", ""),
+            })
+            continue
+        last_ts = rec["last_fired_ts"]
+        if last_ts and last_ts < cutoff:
+            days_since = (window_end - last_ts).days
+            sev = "medium" if days_since < (decay_days * 2) else "high"
+            findings.append({
+                "category": "declared-but-unfired",
+                "event_name": name,
+                "severity": sev,
+                "fire_count": rec["fire_count"],
+                "days_since_last_fire": days_since,
+                "recommendation": (
+                    f"event last fired {days_since}d ago, beyond the {decay_days}d decay "
+                    "window. Investigate: did the surface ship? was it removed silently? "
+                    "Decommission or re-instrument; do not leave decayed."
+                ),
+                "icp_cells": ev.get("icp_cells", []),
+                "surface": ev.get("surface", ""),
+            })
+    return findings
+
+
+def check_fired_but_undeclared(taxonomy: dict, prod: dict[str, dict],
+                                source_filter: set[str]) -> list[dict]:
+    declared_names = {ev["name"] for ev in taxonomy["events"]}
+    findings: list[dict] = []
+    for ev_name, rec in prod.items():
+        if ev_name in declared_names:
+            continue
+        sources = sorted(rec["sources"])
+        # Only flag for user-behavior sources unless explicitly auditing CRM/revenue
+        is_user_behavior = bool(set(sources) & USER_BEHAVIOR_SOURCES)
+        # Even for hubspot/stripe, flag as low-severity warning so the operator
+        # sees them and can decide.
+        sev = "high" if is_user_behavior else "low"
+        if rec["fire_count"] < 5:
+            sev = "low" if sev == "high" else sev  # rare events demoted
+        findings.append({
+            "category": "fired-but-undeclared",
+            "event_name": ev_name,
+            "severity": sev,
+            "fire_count": rec["fire_count"],
+            "sources": sources,
+            "properties_seen": sorted(rec["properties_seen"]),
+            "recommendation": (
+                "declare in events.yaml, rename-and-merge into an existing declared event, "
+                "or decommission at source. Per event-taxonomy-as-product-knowledge: "
+                "undeclared events in production are drift, not noise."
+            ),
+        })
+    findings.sort(key=lambda f: -f["fire_count"])
+    return findings
+
+
+def check_near_duplicate_names(taxonomy: dict, prod: dict[str, dict],
+                                 threshold: float) -> list[dict]:
+    """Cross-check declared events + frequently-fired production events for
+    1-gram token overlap above threshold. Pairs with overlap > threshold are
+    drift signal: rename-without-deprecation."""
+    declared_names = [ev["name"] for ev in taxonomy["events"]]
+    # also include high-fire undeclared events for cross-comparison
+    top_undeclared = [
+        n for n, r in sorted(prod.items(), key=lambda kv: -kv[1]["fire_count"])[:30]
+        if n not in set(declared_names)
+    ]
+    candidates = list(declared_names) + top_undeclared
+    findings: list[dict] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for i, a in enumerate(candidates):
+        ta = set(tokenize(a))
+        if not ta:
+            continue
+        for b in candidates[i + 1:]:
+            tb = set(tokenize(b))
+            if not tb:
+                continue
+            score = jaccard(ta, tb)
+            if score >= threshold and a != b:
+                pair = tuple(sorted((a, b)))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                a_dec = a in declared_names
+                b_dec = b in declared_names
+                if a_dec and b_dec:
+                    rec = (
+                        "two declared events share >0.7 token overlap; merge into "
+                        "one canonical name + deprecate the other; update downstream "
+                        "skills that read either."
+                    )
+                    sev = "medium"
+                elif a_dec ^ b_dec:
+                    rec = (
+                        "one declared event and one undeclared production event share "
+                        ">0.7 token overlap. Treat the undeclared as a rename-drift; "
+                        "either rename the production firer to the declared name, or "
+                        "declare the new name and deprecate the old."
+                    )
+                    sev = "high"
+                else:
+                    rec = (
+                        "two undeclared production events share >0.7 token overlap; "
+                        "drift in two places at once. Name a canonical, declare it, "
+                        "rename the other firer."
+                    )
+                    sev = "low"
+                findings.append({
+                    "category": "near-duplicate-names",
+                    "event_name": f"{a} <> {b}",
+                    "severity": sev,
+                    "overlap_score": round(score, 2),
+                    "events": [a, b],
+                    "declared_status": [a_dec, b_dec],
+                    "recommendation": rec,
+                })
+    findings.sort(key=lambda f: -f["overlap_score"])
+    return findings
+
+
+def check_missing_properties(taxonomy: dict, prod: dict[str, dict]) -> list[dict]:
+    findings: list[dict] = []
+    for ev in taxonomy["events"]:
+        name = ev["name"]
+        rec = prod.get(name)
+        if not rec or rec["fire_count"] == 0:
+            continue  # declared-but-unfired covered elsewhere
+        declared_props = set(ev.get("properties") or [])
+        seen_props = rec["properties_seen"]
+        # missing = declared but never observed in production
+        missing = sorted(declared_props - seen_props)
+        # extra = observed in production but not declared
+        extra = sorted(seen_props - declared_props)
+        if not missing and not extra:
+            continue
+        sev = "high" if missing else "medium"
+        findings.append({
+            "category": "missing-properties",
+            "event_name": name,
+            "severity": sev,
+            "fire_count": rec["fire_count"],
+            "declared_properties": sorted(declared_props),
+            "seen_properties": sorted(seen_props),
+            "missing_in_production": missing,
+            "extra_in_production": extra,
+            "recommendation": (
+                "declared properties are not landing in production: instrumentation gap. "
+                if missing else
+                "production carries properties not declared in taxonomy: schema-drift. "
+            ) + (
+                "extra production properties may be legitimate; declare them or stop emitting them."
+                if extra else "fix instrumentation."
+            ),
+        })
+    return findings
+
+
+def check_naming_convention(taxonomy: dict, prod: dict[str, dict]) -> list[dict]:
+    """Check both declared names and frequently-firing production names
+    against object_action snake_case rule."""
+    findings: list[dict] = []
+    declared_names = {ev["name"] for ev in taxonomy["events"]}
+
+    def categorize(name: str) -> str | None:
+        if not name:
+            return None
+        if NAMING_RE.match(name):
+            return None
+        # Specific failure modes
+        if name != name.lower():
+            return "mixed-case"
+        if " " in name:
+            return "contains-space"
+        if "-" in name:
+            return "uses-hyphen"
+        if not (("." in name) or ("_" in name)):
+            return "no-object-action-separator"
+        return "non-snake-case"
+
+    for ev in taxonomy["events"]:
+        cat = categorize(ev["name"])
+        if cat:
+            findings.append({
+                "category": "naming-convention",
+                "event_name": ev["name"],
+                "severity": "medium",
+                "violation_type": cat,
+                "declared": True,
+                "fire_count": prod.get(ev["name"], {}).get("fire_count", 0),
+                "recommendation": f"rename to object_action snake_case (e.g., trial.started, account_created); current violates {cat}.",
+            })
+    # Also flag fired-but-undeclared names that violate the convention; this is
+    # double-signal but high value, since the operator may be tempted to
+    # declare drift events as-is. Limit to top 15 by fire count.
+    undeclared_top = sorted(
+        ((n, r) for n, r in prod.items() if n not in declared_names),
+        key=lambda kv: -kv[1]["fire_count"],
+    )[:15]
+    for name, rec in undeclared_top:
+        cat = categorize(name)
+        if cat:
+            findings.append({
+                "category": "naming-convention",
+                "event_name": name,
+                "severity": "low",
+                "violation_type": cat,
+                "declared": False,
+                "fire_count": rec["fire_count"],
+                "recommendation": (
+                    f"undeclared event with naming violation; before declaring, rename to "
+                    f"object_action snake_case (current violates {cat})."
+                ),
+            })
+    findings.sort(key=lambda f: (0 if f["declared"] else 1, -f["fire_count"]))
+    return findings
+
+
+def check_icp_cell_drift(taxonomy: dict, prod: dict[str, dict]) -> list[dict]:
+    """Soft check: events declared with icp_cells that never fired in
+    production are at risk of drifting out of the ICP narrative.
+    Lower-severity than declared-but-unfired."""
+    findings: list[dict] = []
+    for ev in taxonomy["events"]:
+        cells = ev.get("icp_cells") or []
+        if not cells:
+            findings.append({
+                "category": "icp-cell-drift",
+                "event_name": ev["name"],
+                "severity": "low",
+                "icp_cells": [],
+                "recommendation": (
+                    "event has no icp_cells annotation; per event-taxonomy-as-product-knowledge "
+                    "every event should declare which ICP cells it serves."
+                ),
+            })
+    return findings
+
+
+# --- coverage summary ------------------------------------------------------
+
+def coverage_summary(taxonomy: dict, prod: dict[str, dict],
+                     findings_by_cat: dict[str, list]) -> dict:
+    declared = {ev["name"] for ev in taxonomy["events"]}
+    fired = set(prod.keys())
+    overlap = declared & fired
+    if not declared and not fired:
+        overlap_pct = 0.0
+    elif not (declared | fired):
+        overlap_pct = 0.0
+    else:
+        overlap_pct = round(100.0 * len(overlap) / len(declared | fired), 1)
+    return {
+        "declared_n": len(declared),
+        "fired_n": len(fired),
+        "overlap_n": len(overlap),
+        "overlap_pct": overlap_pct,
+        "drift_count_by_category": {
+            cat: len(items) for cat, items in findings_by_cat.items()
+        },
+        "high_severity_count": sum(
+            1 for items in findings_by_cat.values()
+            for f in items if f.get("severity") == "high"
+        ),
+    }
+
+
+# --- writers ---------------------------------------------------------------
+
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # set/datetime serialization
+    def default(o):
+        if isinstance(o, set):
+            return sorted(o)
+        if isinstance(o, datetime):
+            return o.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return str(o)
+    path.write_text(json.dumps(data, indent=2, default=default), encoding="utf-8")
+
+
+def write_csv_remediation(path: Path, findings_by_cat: dict[str, list]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cols = ["category", "severity", "event_name", "fire_count", "violation_type",
+            "overlap_score", "days_since_last_fire", "missing_properties",
+            "extra_properties", "sources", "recommendation"]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        writer.writeheader()
+        for cat, items in findings_by_cat.items():
+            for finding in items:
+                row = {c: "" for c in cols}
+                row["category"] = cat
+                row["severity"] = finding.get("severity", "")
+                row["event_name"] = finding.get("event_name", "")
+                row["fire_count"] = finding.get("fire_count", "")
+                row["violation_type"] = finding.get("violation_type", "")
+                row["overlap_score"] = finding.get("overlap_score", "")
+                row["days_since_last_fire"] = finding.get("days_since_last_fire", "")
+                row["missing_properties"] = "|".join(finding.get("missing_in_production") or [])
+                row["extra_properties"] = "|".join(finding.get("extra_in_production") or [])
+                srcs = finding.get("sources") or []
+                row["sources"] = "|".join(srcs) if isinstance(srcs, list) else ""
+                row["recommendation"] = finding.get("recommendation", "").replace("\n", " ")
+                writer.writerow(row)
+
+
+def render_markdown(client: str, today: str, month: str, sources: list[str],
+                     taxonomy: dict, summary: dict,
+                     findings_by_cat: dict[str, list],
+                     decay_days: int, threshold: float) -> str:
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: events taxonomy audit, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append(f"client: {client}")
+    lines.append(f"audit_month: {month}")
+    lines.append(f"sources_audited: [{', '.join(sources)}]")
+    lines.append("patterns_grounded: [event-taxonomy-as-product-knowledge, goalpost-discipline-vs-metric-drift]")
+    lines.append("produced_by: event-taxonomy-audit")
+    lines.append(f"declared_n: {summary['declared_n']}")
+    lines.append(f"fired_n: {summary['fired_n']}")
+    lines.append(f"overlap_pct: {summary['overlap_pct']}")
+    lines.append(f"high_severity_count: {summary['high_severity_count']}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Events taxonomy audit, {client}, {today}")
+    lines.append("")
+    lines.append(
+        f"Audit window: production CSVs from `{month}`, sources audited: "
+        f"`{', '.join(sources) if sources else 'none'}`. Per the "
+        "`event-taxonomy-as-product-knowledge` pattern, this audit checks the contract: "
+        "the events.yaml taxonomy versus what actually fired. Per "
+        "`goalpost-discipline-vs-metric-drift`, drift surfaces only when the audit runs."
+    )
+    lines.append("")
+    lines.append("## Coverage summary")
+    lines.append("")
+    lines.append(f"- Declared events: **{summary['declared_n']}**")
+    lines.append(f"- Fired events: **{summary['fired_n']}**")
+    lines.append(f"- Overlap: **{summary['overlap_n']}** events ({summary['overlap_pct']:.1f}%)")
+    lines.append(f"- High-severity findings: **{summary['high_severity_count']}**")
+    lines.append("")
+    lines.append("Drift count by category:")
+    lines.append("")
+    lines.append("| Category | Count |")
+    lines.append("|---|---|")
+    for cat, n in summary["drift_count_by_category"].items():
+        lines.append(f"| `{cat}` | {n} |")
+    lines.append("")
+    overlap_health = (
+        "healthy taxonomy" if summary["overlap_pct"] >= DEFAULT_OVERLAP_HEALTHY
+        else "drift accelerating, remediate this month"
+    )
+    lines.append(
+        f"Overlap interpretation: **{overlap_health}** (healthy threshold: "
+        f"{DEFAULT_OVERLAP_HEALTHY:.0f}%)."
+    )
+    lines.append("")
+
+    def render_finding_table(cat: str, items: list[dict]) -> None:
+        if not items:
+            lines.append(f"_No findings for `{cat}`._\n")
+            return
+        if cat == "declared-but-unfired":
+            lines.append("| Severity | Event | Fire count | Days since last fire | Surface | Recommendation |")
+            lines.append("|---|---|---|---|---|---|")
+            for f in items:
+                lines.append(
+                    f"| {f['severity']} | `{f['event_name']}` | {f['fire_count']} | "
+                    f"{f['days_since_last_fire']} | {f.get('surface', '')} | "
+                    f"{f['recommendation']} |"
+                )
+        elif cat == "fired-but-undeclared":
+            lines.append("| Severity | Event | Fire count | Sources | Properties seen | Recommendation |")
+            lines.append("|---|---|---|---|---|---|")
+            for f in items:
+                lines.append(
+                    f"| {f['severity']} | `{f['event_name']}` | {f['fire_count']} | "
+                    f"{', '.join(f.get('sources') or [])} | "
+                    f"{', '.join(f.get('properties_seen') or [])[:120]} | "
+                    f"{f['recommendation']} |"
+                )
+        elif cat == "near-duplicate-names":
+            lines.append("| Severity | Pair | Overlap | Declared status | Recommendation |")
+            lines.append("|---|---|---|---|---|")
+            for f in items:
+                lines.append(
+                    f"| {f['severity']} | `{f['event_name']}` | {f['overlap_score']:.2f} | "
+                    f"{f['declared_status']} | {f['recommendation']} |"
+                )
+        elif cat == "missing-properties":
+            lines.append("| Severity | Event | Declared (count) | Missing | Extra | Recommendation |")
+            lines.append("|---|---|---|---|---|---|")
+            for f in items:
+                lines.append(
+                    f"| {f['severity']} | `{f['event_name']}` | "
+                    f"{len(f.get('declared_properties') or [])} | "
+                    f"{', '.join(f.get('missing_in_production') or [])} | "
+                    f"{', '.join(f.get('extra_in_production') or [])} | "
+                    f"{f['recommendation']} |"
+                )
+        elif cat == "naming-convention":
+            lines.append("| Severity | Event | Violation | Declared? | Fire count | Recommendation |")
+            lines.append("|---|---|---|---|---|---|")
+            for f in items:
+                lines.append(
+                    f"| {f['severity']} | `{f['event_name']}` | {f['violation_type']} | "
+                    f"{f['declared']} | {f['fire_count']} | {f['recommendation']} |"
+                )
+        else:
+            lines.append("| Severity | Event | Recommendation |")
+            lines.append("|---|---|---|")
+            for f in items:
+                lines.append(
+                    f"| {f.get('severity', '')} | `{f.get('event_name', '')}` | {f.get('recommendation', '')} |"
+                )
+        lines.append("")
+
+    lines.append("## 1. Declared but unfired")
+    lines.append("")
+    lines.append(
+        f"Events present in events.yaml that have not fired in the last {decay_days} "
+        "days. Either the surface was decommissioned and the event was not removed, "
+        "or the instrumentation broke. Both are drift."
+    )
+    lines.append("")
+    render_finding_table("declared-but-unfired", findings_by_cat["declared-but-unfired"])
+
+    lines.append("## 2. Fired but undeclared")
+    lines.append("")
+    lines.append(
+        "Events firing in production that are not in events.yaml. Per "
+        "`event-taxonomy-as-product-knowledge`: undeclared events are unreviewed "
+        "API additions; declare, rename, or decommission."
+    )
+    lines.append("")
+    render_finding_table("fired-but-undeclared", findings_by_cat["fired-but-undeclared"])
+
+    lines.append("## 3. Near-duplicate names")
+    lines.append("")
+    lines.append(
+        f"Event-name pairs with 1-gram token overlap above {threshold:.2f}. Drift "
+        "signal: rename-without-deprecation, or two teams instrumenting the same "
+        "intent under different names."
+    )
+    lines.append("")
+    render_finding_table("near-duplicate-names", findings_by_cat["near-duplicate-names"])
+
+    lines.append("## 4. Missing properties")
+    lines.append("")
+    lines.append(
+        "Declared events whose property list does not match production. Either the "
+        "instrumentation lost a property (declared > seen) or production added one "
+        "without updating the taxonomy (seen > declared). Both are contract violations."
+    )
+    lines.append("")
+    render_finding_table("missing-properties", findings_by_cat["missing-properties"])
+
+    lines.append("## 5. Naming-convention violations")
+    lines.append("")
+    lines.append(
+        "Events not in `object_action` snake_case form (per Mike Kitchen's tracking-plan "
+        "essays). Mixed-case, spaced, or hyphenated names are downstream tooling friction."
+    )
+    lines.append("")
+    render_finding_table("naming-convention", findings_by_cat["naming-convention"])
+
+    if findings_by_cat.get("icp-cell-drift"):
+        lines.append("## 6. ICP-cell drift")
+        lines.append("")
+        lines.append(
+            "Declared events missing icp_cells annotations. Without them, downstream "
+            "cohort-routing skills cannot tell which ICP cell the event serves."
+        )
+        lines.append("")
+        render_finding_table("icp-cell-drift", findings_by_cat["icp-cell-drift"])
+
+    # Ranked remediation list (top 15 high-severity)
+    lines.append("## Remediation list, ranked")
+    lines.append("")
+    flat: list[tuple[str, dict]] = []
+    sev_rank = {"high": 0, "medium": 1, "low": 2}
+    for cat, items in findings_by_cat.items():
+        for f in items:
+            flat.append((cat, f))
+    flat.sort(key=lambda pair: (sev_rank.get(pair[1].get("severity", "low"), 3),
+                                 -pair[1].get("fire_count", 0) if isinstance(pair[1].get("fire_count"), int) else 0))
+    if not flat:
+        lines.append("_No findings. Taxonomy and production stream are in sync._")
+        lines.append("")
+    else:
+        lines.append("| Rank | Severity | Category | Event | Action |")
+        lines.append("|---|---|---|---|---|")
+        for i, (cat, f) in enumerate(flat[:25], start=1):
+            rec = f.get("recommendation", "").split(".")[0]
+            if len(rec) > 100:
+                rec = rec[:97] + "..."
+            lines.append(
+                f"| {i} | {f.get('severity', '')} | `{cat}` | "
+                f"`{f.get('event_name', '')}` | {rec} |"
+            )
+        lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- Taxonomy: `clients/{client}/events.yaml`")
+    lines.append(f"- Production stream: `clients/{client}/analytics/<source>/{month}.csv`")
+    lines.append(f"- ICP: `clients/{client}/icp/icp.md`")
+    lines.append(f"- Positioning: `clients/{client}/positioning/positioning.md`")
+    lines.append("- Pattern: `knowledge/patterns/event-taxonomy-as-product-knowledge.md`")
+    lines.append("- Pattern: `knowledge/patterns/goalpost-discipline-vs-metric-drift.md`")
+    lines.append("")
+
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append("- `routines/analytics-monthly-refresh.md` for the cadence this audit lives in.")
+    lines.append(f"- `skills/analytics-pull` to refresh the production stream: `analytics-pull --client {client} --month {month}`.")
+    lines.append(f"- `skills/metric-tree-design` to validate metric leaves still bind to declared events.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# --- main pipeline ---------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="event-taxonomy-audit")
+    p.add_argument("--client", required=True)
+    p.add_argument("--source", default="all",
+                   help="amplitude|posthog|mixpanel|hubspot|stripe|segment|ga4|all (default: all)")
+    p.add_argument("--month", default=None, help="YYYY-MM (default: previous calendar month)")
+    p.add_argument("--decay-days", type=int, default=DEFAULT_DECAY_DAYS,
+                   help=f"flag declared events unfired for >N days (default: {DEFAULT_DECAY_DAYS})")
+    p.add_argument("--near-dup-threshold", type=float, default=DEFAULT_NEAR_DUP_THRESHOLD,
+                   help=f"jaccard threshold for near-duplicate detection (default: {DEFAULT_NEAR_DUP_THRESHOLD})")
+    p.add_argument("--strict-naming", action="store_true",
+                   help="treat naming-convention violations as refusals (exit 2)")
+    p.add_argument("--strict-substrate", action="store_true",
+                   help="hard-refuse on substrate gap (default: soft warn for icp/positioning)")
+    args = p.parse_args()
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        return 3
+
+    month = args.month or previous_month_label()
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
+        print(f"REFUSED: invalid-month {month}", file=sys.stderr)
+        return 4
+
+    taxonomy = load_taxonomy(args.client)
+    if not taxonomy["events"]:
+        return refuse(
+            "missing-events-yaml",
+            f"clients/{args.client}/events.yaml has no `events:` block.",
+        )
+
+    csv_paths = list_production_csvs(args.client, args.source, month)
+    if not csv_paths:
+        return refuse(
+            "missing-production-stream",
+            f"no CSVs found under clients/{args.client}/analytics/<source>/{month}.csv. "
+            f"Run analytics-pull --client {args.client} --month {month} first.",
+        )
+
+    sources_resolved = sorted({p.parent.name for p in csv_paths})
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Window-end is end of the audit month (or today if month is current).
+    audit_year, audit_month = (int(x) for x in month.split("-"))
+    if audit_month == 12:
+        window_end = datetime(audit_year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        window_end = datetime(audit_year, audit_month + 1, 1, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if window_end > now:
+        window_end = now
+
+    print(
+        f"[event-taxonomy-audit] client={args.client} month={month} sources={','.join(sources_resolved)} "
+        f"declared={len(taxonomy['events'])} decay-days={args.decay_days}",
+        file=sys.stderr,
+    )
+
+    prod = load_production_stream(csv_paths)
+    print(f"  loaded {sum(r['fire_count'] for r in prod.values())} events across {len(prod)} distinct names",
+          file=sys.stderr)
+
+    findings_by_cat: dict[str, list[dict]] = {
+        "declared-but-unfired": check_declared_but_unfired(
+            taxonomy, prod, window_end, args.decay_days
+        ),
+        "fired-but-undeclared": check_fired_but_undeclared(
+            taxonomy, prod, set(sources_resolved)
+        ),
+        "near-duplicate-names": check_near_duplicate_names(
+            taxonomy, prod, args.near_dup_threshold
+        ),
+        "missing-properties": check_missing_properties(taxonomy, prod),
+        "naming-convention": check_naming_convention(taxonomy, prod),
+        "icp-cell-drift": check_icp_cell_drift(taxonomy, prod),
+    }
+
+    summary = coverage_summary(taxonomy, prod, findings_by_cat)
+    for cat, items in findings_by_cat.items():
+        print(f"  {cat}: {len(items)}", file=sys.stderr)
+    print(
+        f"  overlap_pct={summary['overlap_pct']:.1f}% high_severity={summary['high_severity_count']}",
+        file=sys.stderr,
+    )
+
+    out_dir = SUBSTRATE_ROOT / "clients" / args.client / "analytics" / "audits"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    md_path = out_dir / f"events-taxonomy-audit-{today}.md"
+    json_path = out_dir / f"events-taxonomy-audit-{today}.json"
+    csv_path = out_dir / f"events-taxonomy-audit-{today}-remediation.csv"
+
+    md = render_markdown(
+        client=args.client, today=today, month=month, sources=sources_resolved,
+        taxonomy=taxonomy, summary=summary,
+        findings_by_cat=findings_by_cat,
+        decay_days=args.decay_days, threshold=args.near_dup_threshold,
+    )
+    md_path.write_text(md, encoding="utf-8")
+
+    write_json(json_path, {
+        "client": args.client,
+        "audited_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "audit_month": month,
+        "sources_audited": sources_resolved,
+        "decay_days": args.decay_days,
+        "near_dup_threshold": args.near_dup_threshold,
+        "coverage_summary": summary,
+        "findings": findings_by_cat,
+    })
+    write_csv_remediation(csv_path, findings_by_cat)
+
+    print(f"[event-taxonomy-audit] md:   {md_path.relative_to(SUBSTRATE_ROOT)}", file=sys.stderr)
+    print(f"[event-taxonomy-audit] json: {json_path.relative_to(SUBSTRATE_ROOT)}", file=sys.stderr)
+    print(f"[event-taxonomy-audit] csv:  {csv_path.relative_to(SUBSTRATE_ROOT)}", file=sys.stderr)
+    print(str(md_path))
+
+    naming_violations = [
+        f for f in findings_by_cat["naming-convention"] if f.get("declared")
+    ]
+    if args.strict_naming and naming_violations:
+        print(
+            f"REFUSED: strict-naming-violation, {len(naming_violations)} declared "
+            "events violate object_action snake_case. Fix or drop --strict-naming.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if summary["overlap_pct"] < DEFAULT_OVERLAP_HEALTHY or summary["high_severity_count"] > 0:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

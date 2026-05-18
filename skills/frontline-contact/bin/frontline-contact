@@ -1,0 +1,718 @@
+#!/usr/bin/env bash
+# frontline-contact — substrate skill runtime (v2.0)
+#
+# Parses transcripts in clients/<client>/voc/inbox/, extracts themes via
+# TF-IDF over noun-phrases plus a taxonomy classifier, scores call quality,
+# writes structured findings to clients/<client>/voc/findings/<date>.md +
+# .json. Refuses with fewer than three logs per quarter.
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+MODE="both"
+CALL_TYPE="all"
+MIN_QUARTER_LOGS=3
+TOP_THEMES=12
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)            CLIENT="$2"; shift 2 ;;
+    --mode)              MODE="$2"; shift 2 ;;
+    --call-type)         CALL_TYPE="$2"; shift 2 ;;
+    --min-quarter-logs)  MIN_QUARTER_LOGS="$2"; shift 2 ;;
+    --top-themes)        TOP_THEMES="$2"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+frontline-contact — parse transcripts, extract themes, score quality
+
+Usage:
+  frontline-contact --client <client> [--mode <harvest|score|both>]
+                    [--call-type <type>] [--min-quarter-logs N]
+                    [--top-themes N]
+
+Reads: clients/<client>/voc/inbox/<YYYY-MM-DD>-*.md
+Writes: clients/<client>/voc/findings/<run-date>.{md,json}
+
+Refuses on:
+  - fewer than --min-quarter-logs logged calls in trailing 90 days
+  - missing cadence-contract.md
+  - transcripts without timestamps or speaker labels
+
+See skills/frontline-contact/SKILL.md for full spec.
+EOF
+      exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+if [ -z "$CLIENT" ]; then
+  echo "ERR: --client required" >&2
+  echo "  try: frontline-contact --help" >&2
+  exit 4
+fi
+
+skill_preflight "frontline-contact" "$CLIENT" || exit 3
+
+CLIENT_ROOT="$SUBSTRATE_ROOT/clients/$CLIENT"
+INBOX="$CLIENT_ROOT/voc/inbox"
+FINDINGS="$CLIENT_ROOT/voc/findings"
+
+if [ ! -d "$INBOX" ]; then
+  echo "REFUSED: missing-voc-inbox" >&2
+  echo "  $INBOX does not exist; create it and drop transcripts there." >&2
+  echo "  see knowledge/patterns/frontline-as-pmm-substrate.md" >&2
+  exit 3
+fi
+
+mkdir -p "$FINDINGS"
+
+# Hand the heavy lifting to a python helper. The runtime is too text-heavy
+# for pure shell. Inline the python so the skill is one file.
+exec /usr/bin/env python3 - "$SUBSTRATE_ROOT" "$CLIENT" "$MODE" "$CALL_TYPE" "$MIN_QUARTER_LOGS" "$TOP_THEMES" <<'PYEOF'
+import json
+import math
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(sys.argv[1])
+CLIENT = sys.argv[2]
+MODE = sys.argv[3]
+CALL_TYPE = sys.argv[4]
+MIN_QUARTER_LOGS = int(sys.argv[5])
+TOP_THEMES = int(sys.argv[6])
+
+CLIENT_ROOT = SUBSTRATE_ROOT / "clients" / CLIENT
+INBOX = CLIENT_ROOT / "voc" / "inbox"
+FINDINGS = CLIENT_ROOT / "voc" / "findings"
+TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+# --- Pattern: tf-idf-themes-from-customer-language ---
+# Stop-words: extracted from common English + b2b register noise. Kept in-line
+# so the skill is dependency-free.
+STOP_WORDS = set("""
+a about above after again against all also am an and any are aren't as at be because been before being below
+between both but by can can't cannot could couldn't did didn't do does doesn't doing don't down during each
+few for from further had hadn't has hasn't have haven't having he he'd he'll he's her here here's hers herself
+him himself his how how's i i'd i'll i'm i've if in into is isn't it it's its itself just let's like make made
+may me might more most mustn't my myself need needs new no nor not of off on once only or other ought our ours
+ourselves out over own same shall shan't she she'd she'll she's should shouldn't so some such than that that's
+the their theirs them themselves then there there's these they they'd they'll they're they've this those
+through to too under until up us use used uses very want wanted wants was wasn't we we'd we'll we're we've
+were weren't what what's when when's where where's which while who who's whom why why's will with won't would
+wouldn't you you'd you'll you're you've your yours yourself yourselves yeah yes ok okay um uh kind sort thing
+something things stuff really actually basically right got get gets getting going go going-to gonna little bit
+sure thanks thank yep nope alright fine
+guys folks team teams company business work working
+say said tell told ask asked answer answers
+""".split())
+
+# Lightweight noun-phrase extractor: 1-3 word lowercase token sequences that
+# pass a heuristic (skip pure stop-word, must contain at least one content
+# word ≥4 chars, may include hyphenated forms).
+NP_RE = re.compile(r"\b[a-z][a-z-]{2,}(?:\s+[a-z][a-z-]{2,}){0,2}\b")
+
+# Manual taxonomy regex pools, derived from Moesta + Dunford + Christensen +
+# Wiebe + Crestodina lineage. Phrase pool per category. See pattern files for
+# justification: jtbd-as-buyer-mental-model.md, tf-idf-themes.
+
+JTBD_HOOKS = [
+    r"\b(?:i was trying to|i needed to|i needed a way to|i wanted to|trying to figure out)\b",
+    r"\b(?:so that i could|so i could|in order to|to be able to)\b",
+    r"\b(?:our team needed|the job we hired|hire(?:d)? this for|hire(?:d)? it for)\b",
+    r"\b(?:my goal was|the goal was|we wanted to|trying to get)\b",
+]
+
+OBJECTION_HOOKS = [
+    r"\b(?:price|expensive|too much|cost|costly|budget|pricing)\b",
+    r"\b(?:complicated|complex|confusing|hard to use|figured out)\b",
+    r"\b(?:integration|integrat\w+|api|connect to)\b",
+    r"\b(?:security|compliance|soc 2|hipaa|gdpr|sso)\b",
+    r"\b(?:scale|scalab\w+|enterprise|small team|team of \d+)\b",
+    r"\b(?:concern|worry|worried|hesitant|risk|risky)\b",
+    r"\b(?:fit|workflow fit|expect\w+|not what we|disappoint\w+)\b",
+]
+
+ALT_HOOKS = [
+    r"\b(?:we (?:were |are )?(?:using|considering|looking at|evaluating)|switched from|came from|using before)\b",
+    r"\b(?:we considered|alternative|or we could (?:have )?used|or use)\b",
+    r"\b(?:in[- ]house|build(?:ing)? our own|spreadsheet|excel|google sheets)\b",
+    r"\b(?:no decision|do nothing|just stay with|keep what we have)\b",
+    r"\b(?:status quo|current process|current tool|legacy)\b",
+]
+
+WORDS_OF_VALUE_HOOKS = [
+    r"\b(?:saved (?:us|me)|cut (?:our|my) time|faster|easier|less effort|fewer steps)\b",
+    r"\b(?:we love|the best part|what i like most|favourite|favorite)\b",
+    r"\b(?:didn't have to|don't have to|no longer have to|finally able to)\b",
+    r"\b(?:peace of mind|sleep at night|stopped worrying)\b",
+]
+
+CATEGORY_HOOKS = {
+    "jtbd": JTBD_HOOKS,
+    "objections": OBJECTION_HOOKS,
+    "alternatives": ALT_HOOKS,
+    "value-words": WORDS_OF_VALUE_HOOKS,
+}
+
+QUARTER_DAYS = 90
+
+
+def parse_filename_date(p: Path):
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})", p.name)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def collect_inbox_files():
+    files = []
+    if not INBOX.exists():
+        return files
+    for p in sorted(INBOX.glob("*.md")):
+        d = parse_filename_date(p)
+        if d is None:
+            continue
+        # Filter by call type if requested. Convention: filename
+        # <date>-<call-type>-<participant>.md
+        if CALL_TYPE != "all":
+            parts = p.stem.split("-", 4)
+            ftype = parts[3] if len(parts) >= 4 else ""
+            if CALL_TYPE not in ftype:
+                continue
+        files.append((d, p))
+    return files
+
+
+def in_trailing_quarter(d: datetime) -> bool:
+    horizon = datetime.now(timezone.utc) - timedelta(days=QUARTER_DAYS)
+    return d >= horizon
+
+
+def extract_speaker_lines(text: str):
+    """Best-effort speaker extraction.
+
+    Accepts these formats:
+      [00:01:23] SPEAKER: line of text
+      SPEAKER (00:01:23): line of text
+      Kesava: line of text
+      00:01:23 SPEAKER: line of text
+    Returns list of (timestamp_seconds_or_None, speaker_or_None, line).
+    """
+    out = []
+    cur_speaker = None
+    cur_ts = None
+    speaker_re = re.compile(
+        r"^(?:\[?(?P<ts>\d{1,2}:\d{2}(?::\d{2})?)\]?\s+)?"
+        r"(?P<spk>[A-Z][A-Za-z][A-Za-z .'\-]{0,40})\s*"
+        r"(?:\((?P<ts2>\d{1,2}:\d{2}(?::\d{2})?)\))?:\s*(?P<line>.*)$"
+    )
+    bare_ts_re = re.compile(r"^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?$")
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        m = speaker_re.match(line)
+        if m:
+            ts = m.group("ts") or m.group("ts2")
+            cur_speaker = m.group("spk").strip()
+            cur_ts = ts_to_seconds(ts) if ts else cur_ts
+            text_part = m.group("line").strip()
+            if text_part:
+                out.append((cur_ts, cur_speaker, text_part))
+            continue
+        m2 = bare_ts_re.match(line.strip())
+        if m2:
+            cur_ts = ts_to_seconds(m2.group(1))
+            continue
+        # Continuation line attached to current speaker
+        if cur_speaker and line.strip() and not line.startswith("#"):
+            out.append((cur_ts, cur_speaker, line.strip()))
+    return out
+
+
+def ts_to_seconds(ts: str):
+    parts = ts.split(":")
+    parts = [int(p) for p in parts]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    return None
+
+
+def detect_speakers(spk_lines):
+    """Return ordered list of distinct speakers."""
+    seen = []
+    for _, spk, _ in spk_lines:
+        if spk and spk not in seen:
+            seen.append(spk)
+    return seen
+
+
+def is_open_question(line: str) -> bool:
+    """A question is "open" if it starts with an interrogative + can't be
+    answered yes/no, or contains "tell me about" / "walk me through" / "what
+    happened when" / "describe" forms.
+    """
+    s = line.strip().rstrip(".!").lower()
+    if not s.endswith("?"):
+        # Voice patterns sometimes leave the question mark off in transcripts;
+        # the heuristic still applies for openers.
+        if not any(s.startswith(p) for p in ("tell me about", "walk me through", "describe", "talk me through")):
+            return False
+    # closed-question prefixes
+    if any(s.startswith(p) for p in ("did", "do", "does", "is", "are", "was", "were", "have", "has", "can", "could", "would", "should", "will")):
+        return False
+    return True
+
+
+def line_is_question(line: str) -> bool:
+    return line.strip().endswith("?") or any(line.strip().lower().startswith(p) for p in ("tell me about", "walk me through", "describe", "talk me through"))
+
+
+def speaker_role(speakers, idx):
+    """Assume the first or shortest-named speaker is the interviewer (host).
+    Heuristic: pick the one whose lines contain more questions per line.
+    """
+    if len(speakers) <= 1:
+        return {speakers[0] if speakers else "?": "interviewer"}
+    return {}
+
+
+def score_transcript(file_path: Path, text: str):
+    """Run quality scoring. Returns dict with metrics + reasons."""
+    spk_lines = extract_speaker_lines(text)
+    speakers = detect_speakers(spk_lines)
+    flags = []
+    if not speakers:
+        flags.append("no-speaker-labels")
+    timestamps_seen = [t for t, _, _ in spk_lines if t is not None]
+    if not timestamps_seen:
+        flags.append("no-timestamps")
+    duration_s = (max(timestamps_seen) - min(timestamps_seen)) if timestamps_seen else 0
+
+    # Pick the speaker who asks more questions per line as interviewer
+    speaker_lines = defaultdict(list)
+    for _, s, line in spk_lines:
+        if s:
+            speaker_lines[s].append(line)
+
+    interviewer = None
+    interviewer_q_ratio = 0.0
+    for s, lines in speaker_lines.items():
+        qcount = sum(1 for l in lines if line_is_question(l))
+        ratio = qcount / max(1, len(lines))
+        if ratio > interviewer_q_ratio:
+            interviewer_q_ratio = ratio
+            interviewer = s
+
+    # Open-question ratio across interviewer's questions
+    open_ratio = 0.0
+    interviewer_qcount = 0
+    interviewer_open_count = 0
+    if interviewer:
+        for line in speaker_lines[interviewer]:
+            if line_is_question(line):
+                interviewer_qcount += 1
+                if is_open_question(line):
+                    interviewer_open_count += 1
+        open_ratio = interviewer_open_count / max(1, interviewer_qcount)
+
+    # Customer-language presence: ratio of non-interviewer lines (the
+    # customer's contribution) to total lines.
+    total_lines = sum(len(v) for v in speaker_lines.values())
+    customer_lines = total_lines - len(speaker_lines.get(interviewer, []))
+    customer_share = customer_lines / max(1, total_lines)
+
+    # Quality score: weighted average. Weights chosen to penalize too-short
+    # calls and too-much-interviewer-talk.
+    # 0.30 open-ratio  + 0.30 customer-share  + 0.20 duration_score  + 0.20 length_score
+    duration_score = min(1.0, duration_s / (45 * 60))   # 45 min target
+    length_score = min(1.0, total_lines / 80)            # 80-line target
+    quality = round(
+        0.30 * open_ratio
+        + 0.30 * customer_share
+        + 0.20 * duration_score
+        + 0.20 * length_score,
+        3,
+    )
+
+    if duration_s < 15 * 60 and timestamps_seen:
+        flags.append("call-shorter-than-15min")
+    if interviewer_qcount and open_ratio < 0.40:
+        flags.append("open-question-ratio-below-40pct")
+    if customer_share < 0.50:
+        flags.append("interviewer-dominant-conversation")
+
+    return {
+        "file": str(file_path.relative_to(SUBSTRATE_ROOT)),
+        "speakers": speakers,
+        "interviewer_guess": interviewer,
+        "duration_s": duration_s,
+        "duration_min": round(duration_s / 60.0, 1),
+        "total_lines": total_lines,
+        "interviewer_lines": len(speaker_lines.get(interviewer, [])),
+        "customer_lines": customer_lines,
+        "interviewer_question_count": interviewer_qcount,
+        "interviewer_open_question_count": interviewer_open_count,
+        "open_question_ratio": round(open_ratio, 3),
+        "customer_share_of_lines": round(customer_share, 3),
+        "quality_score": quality,
+        "quality_flags": flags,
+    }
+
+
+def extract_noun_phrases(text: str):
+    """Extract candidate noun-phrases (1-3 token lowercase, content-word
+    requirement, hyphenated allowed). Drop pure-stop-word phrases."""
+    text = text.lower()
+    candidates = []
+    for m in NP_RE.findall(text):
+        toks = m.split()
+        # Drop if all tokens are stop-words
+        if all(t in STOP_WORDS for t in toks):
+            continue
+        # Require at least one content token of length >= 4
+        if not any(len(t) >= 4 and t not in STOP_WORDS for t in toks):
+            continue
+        candidates.append(m)
+    return candidates
+
+
+def tf_idf(per_doc_phrases):
+    """Compute TF-IDF over per-document noun-phrases.
+
+    Returns: phrase -> (tfidf_score, total_freq, doc_freq, sample_docs)
+    """
+    if not per_doc_phrases:
+        return {}
+    n_docs = len(per_doc_phrases)
+    df = Counter()
+    tf = Counter()
+    docs_for_phrase = defaultdict(list)
+    for doc_path, phrases in per_doc_phrases:
+        seen = set()
+        for ph in phrases:
+            tf[ph] += 1
+            if ph not in seen:
+                df[ph] += 1
+                docs_for_phrase[ph].append(doc_path)
+                seen.add(ph)
+
+    out = {}
+    for phrase, freq in tf.items():
+        if df[phrase] < 2 and n_docs >= 3:
+            # require a phrase to appear in at least 2 docs once we have a
+            # corpus of 3+; this filters one-call idiosyncrasies.
+            continue
+        idf = math.log(n_docs / df[phrase])
+        # boost by term frequency across the corpus
+        score = freq * (idf + 1.0)
+        out[phrase] = {
+            "tfidf": round(score, 3),
+            "total_freq": freq,
+            "doc_freq": df[phrase],
+            "sample_docs": docs_for_phrase[phrase][:3],
+        }
+    return out
+
+
+def classify_themes(per_doc_text):
+    """Run regex pools per category. Returns:
+        {category: {phrase_or_match: {count, source_files}}}
+    """
+    out = {cat: defaultdict(lambda: {"count": 0, "source_files": [], "samples": []}) for cat in CATEGORY_HOOKS}
+    for doc_path, text in per_doc_text:
+        text_lower = text.lower()
+        for cat, hooks in CATEGORY_HOOKS.items():
+            for hook_re in hooks:
+                for m in re.finditer(hook_re, text_lower):
+                    # Capture the surrounding sentence (rough — split on .!? or newline)
+                    start = max(0, m.start() - 80)
+                    end = min(len(text_lower), m.end() + 80)
+                    context = text_lower[start:end].strip()
+                    # canonical-phrase = the matched substring
+                    key = m.group(0)
+                    rec = out[cat][key]
+                    rec["count"] += 1
+                    if doc_path not in rec["source_files"]:
+                        rec["source_files"].append(doc_path)
+                    if len(rec["samples"]) < 3:
+                        rec["samples"].append(context)
+    # Convert defaultdicts → dicts with counts
+    return {cat: {k: dict(v) for k, v in items.items() if v["count"] > 0} for cat, items in out.items()}
+
+
+def cadence_check(files, min_logs):
+    """Return (ok, reasons, summary)."""
+    reasons = []
+    quarter_files = [(d, p) for d, p in files if in_trailing_quarter(d)]
+    if len(quarter_files) < min_logs:
+        reasons.append(
+            f"too-few-logs (have {len(quarter_files)} in trailing 90d, "
+            f"need {min_logs})"
+        )
+    # Per-week distribution
+    by_week = Counter()
+    for d, _ in quarter_files:
+        wk = d.isocalendar()
+        by_week[(wk[0], wk[1])] += 1
+    weeks_active = len(by_week)
+    summary = {
+        "logs_total": len(files),
+        "logs_in_trailing_quarter": len(quarter_files),
+        "active_weeks_in_quarter": weeks_active,
+        "longest_gap_days": _longest_gap(quarter_files),
+        "min_required": min_logs,
+    }
+    return (len(reasons) == 0, reasons, summary)
+
+
+def _longest_gap(quarter_files):
+    if len(quarter_files) < 2:
+        return None
+    sorted_dates = sorted(d for d, _ in quarter_files)
+    gaps = [(sorted_dates[i + 1] - sorted_dates[i]).days for i in range(len(sorted_dates) - 1)]
+    return max(gaps) if gaps else None
+
+
+def render_md(*, files, scores, themes, tfidf_top, cadence_summary, top_n):
+    parts = []
+    parts.append("---")
+    parts.append(f"title: frontline-contact findings, {CLIENT}, {TODAY}")
+    parts.append("status: active")
+    parts.append(f"last_updated: {TODAY}")
+    parts.append("produced_by: frontline-contact")
+    parts.append("patterns_grounded: [frontline-as-pmm-substrate, rapport-surfaces-what-research-cannot, diagnose-before-execute, jtbd-as-buyer-mental-model, tf-idf-themes-from-customer-language]")
+    parts.append(f"client: {CLIENT}")
+    parts.append(f"logs_in_trailing_quarter: {cadence_summary['logs_in_trailing_quarter']}")
+    parts.append(f"longest_gap_days: {cadence_summary['longest_gap_days']}")
+    parts.append("---")
+    parts.append("")
+    parts.append(f"# Frontline-contact findings, {CLIENT}, {TODAY}")
+    parts.append("")
+
+    # Cadence section
+    parts.append("## 1. Cadence")
+    parts.append("")
+    parts.append(
+        f"- Total logs in inbox: {cadence_summary['logs_total']}"
+    )
+    parts.append(
+        f"- Logs in trailing 90 days: {cadence_summary['logs_in_trailing_quarter']} "
+        f"(threshold: {cadence_summary['min_required']})"
+    )
+    parts.append(f"- Active weeks in quarter: {cadence_summary['active_weeks_in_quarter']}")
+    if cadence_summary["longest_gap_days"] is not None:
+        gap = cadence_summary["longest_gap_days"]
+        parts.append(f"- Longest gap between logged calls: {gap} days")
+        if gap > 14:
+            parts.append(
+                f"- WARN: longest gap exceeds 14 days; cadence is breaking. "
+                f"See `voc/cadence-contract.md`."
+            )
+    parts.append("")
+
+    # Quality scores
+    parts.append("## 2. Per-call quality scores")
+    parts.append("")
+    parts.append(
+        "Quality score weights: 30% open-question ratio, 30% customer share of lines, "
+        "20% duration score (cap at 45 min), 20% length score (cap at 80 lines). "
+        "See `knowledge/patterns/rapport-surfaces-what-research-cannot.md`."
+    )
+    parts.append("")
+    parts.append("| File | Speakers | Duration (min) | Open-Q ratio | Customer share | Quality | Flags |")
+    parts.append("|---|---|---:|---:|---:|---:|---|")
+    for s in sorted(scores, key=lambda x: -x["quality_score"]):
+        flags = ", ".join(s["quality_flags"]) or "-"
+        parts.append(
+            f"| `{s['file']}` | {len(s['speakers'])} | {s['duration_min']} | "
+            f"{s['open_question_ratio']} | {s['customer_share_of_lines']} | "
+            f"{s['quality_score']} | {flags} |"
+        )
+    parts.append("")
+
+    # Themes per category
+    parts.append("## 3. Themes by category")
+    parts.append("")
+    parts.append(
+        "Categories per `knowledge/patterns/jtbd-as-buyer-mental-model.md`: "
+        "jobs-to-be-done, objections, alternatives-considered, value-words. "
+        "Each entry cites the source file(s) and a sample utterance."
+    )
+    parts.append("")
+    for cat, label in [
+        ("jtbd", "Jobs-to-be-done (verbatim hooks)"),
+        ("objections", "Objections (verbatim hooks)"),
+        ("alternatives", "Alternatives-considered (verbatim hooks)"),
+        ("value-words", "Value-words (verbatim hooks)"),
+    ]:
+        parts.append(f"### {label}")
+        parts.append("")
+        items = themes.get(cat, {})
+        if not items:
+            parts.append("_No matches in trailing-quarter inbox._")
+            parts.append("")
+            continue
+        parts.append("| Hook | Mentions | Source files | Sample utterance |")
+        parts.append("|---|---:|---|---|")
+        ranked = sorted(items.items(), key=lambda x: -x[1]["count"])[:top_n]
+        for hook, rec in ranked:
+            srcs = ", ".join(f"`{Path(p).name}`" for p in rec["source_files"][:3])
+            sample = (rec["samples"][0] if rec["samples"] else "")[:120].replace("|", "/")
+            parts.append(f"| {hook} | {rec['count']} | {srcs} | {sample} |")
+        parts.append("")
+
+    # TF-IDF top phrases
+    parts.append("## 4. Top noun-phrases by TF-IDF (customer corpus)")
+    parts.append("")
+    parts.append(
+        "Per `knowledge/patterns/tf-idf-themes-from-customer-language.md`: top noun-phrases "
+        "ranked by TF-IDF (frequency × inverse-document-frequency, +1 smoothing). Phrases "
+        "appearing in fewer than 2 documents are filtered to suppress one-call idiosyncrasies."
+    )
+    parts.append("")
+    parts.append("| Phrase | TF-IDF | Total freq | Doc freq | Sample docs |")
+    parts.append("|---|---:|---:|---:|---|")
+    ranked = sorted(tfidf_top.items(), key=lambda x: -x[1]["tfidf"])[:top_n * 2]
+    for phrase, rec in ranked:
+        sample_docs = ", ".join(f"`{Path(p).name}`" for p in rec["sample_docs"])
+        parts.append(
+            f"| {phrase} | {rec['tfidf']} | {rec['total_freq']} | {rec['doc_freq']} | {sample_docs} |"
+        )
+    parts.append("")
+
+    # New-signal proposals
+    parts.append("## 5. New-signal candidates (frequency >= 3 across 3+ files)")
+    parts.append("")
+    new_signals = []
+    for cat, items in themes.items():
+        for hook, rec in items.items():
+            if rec["count"] >= 3 and len(rec["source_files"]) >= 3:
+                new_signals.append((cat, hook, rec))
+    if not new_signals:
+        parts.append("_No new signals above threshold this run._")
+    else:
+        parts.append("| Category | Hook | Mentions | Files | Action |")
+        parts.append("|---|---|---:|---:|---|")
+        for cat, hook, rec in sorted(new_signals, key=lambda x: -x[2]["count"]):
+            parts.append(
+                f"| {cat} | {hook} | {rec['count']} | {len(rec['source_files'])} | "
+                f"queue for `signal-routine` |"
+            )
+    parts.append("")
+
+    # Substrate citations
+    parts.append("## 6. Substrate citations")
+    parts.append("")
+    parts.append(f"- Inbox: `clients/{CLIENT}/voc/inbox/` ({cadence_summary['logs_total']} files)")
+    parts.append(f"- VoC layer: `clients/{CLIENT}/voc/`")
+    parts.append(f"- Cadence contract: `clients/{CLIENT}/voc/cadence-contract.md`")
+    parts.append("- Patterns:")
+    parts.append("  - `knowledge/patterns/frontline-as-pmm-substrate.md`")
+    parts.append("  - `knowledge/patterns/rapport-surfaces-what-research-cannot.md`")
+    parts.append("  - `knowledge/patterns/diagnose-before-execute.md`")
+    parts.append("  - `knowledge/patterns/jtbd-as-buyer-mental-model.md`")
+    parts.append("  - `knowledge/patterns/tf-idf-themes-from-customer-language.md`")
+    parts.append("")
+    parts.append("## Next reads")
+    parts.append("")
+    parts.append(
+        f"- Run `substrate win-loss-interview --client {CLIENT}` for any deal-attached calls."
+    )
+    parts.append(
+        f"- Run `substrate messaging-matrix --client {CLIENT}` to compose the matrix from these themes."
+    )
+    parts.append(
+        f"- Run `substrate icp-cut --client {CLIENT}` if alternatives or JTBD distribution suggests segment drift."
+    )
+    return "\n".join(parts)
+
+
+def main():
+    files = collect_inbox_files()
+    ok, reasons, cadence_summary = cadence_check(files, MIN_QUARTER_LOGS)
+    if not ok:
+        print("REFUSED: too-few-logs", file=sys.stderr)
+        for r in reasons:
+            print(f"  - {r}", file=sys.stderr)
+        print(
+            "  cite frontline-as-pmm-substrate: without the cadence, "
+            "every downstream decision is a guess.",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+
+    quarter_files = [(d, p) for d, p in files if in_trailing_quarter(d)]
+
+    per_doc_text = []
+    per_doc_phrases = []
+    scores = []
+    for d, p in quarter_files:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"  warn: cannot read {p}: {e}", file=sys.stderr)
+            continue
+        rel = str(p.relative_to(SUBSTRATE_ROOT))
+        per_doc_text.append((rel, text))
+        per_doc_phrases.append((rel, extract_noun_phrases(text)))
+        if MODE in ("score", "both"):
+            scores.append(score_transcript(p, text))
+
+    themes = classify_themes(per_doc_text) if MODE in ("harvest", "both") else {}
+    tfidf_top = tf_idf(per_doc_phrases) if MODE in ("harvest", "both") else {}
+
+    md_path = FINDINGS / f"{TODAY}.md"
+    json_path = FINDINGS / f"{TODAY}.json"
+
+    md = render_md(
+        files=files,
+        scores=scores,
+        themes=themes,
+        tfidf_top=tfidf_top,
+        cadence_summary=cadence_summary,
+        top_n=TOP_THEMES,
+    )
+    md_path.write_text(md, encoding="utf-8")
+
+    json_payload = {
+        "client": CLIENT,
+        "generated_at": TODAY,
+        "mode": MODE,
+        "call_type_filter": CALL_TYPE,
+        "cadence_summary": cadence_summary,
+        "scores": scores,
+        "themes": themes,
+        "tfidf_top": dict(sorted(tfidf_top.items(), key=lambda x: -x[1]["tfidf"])[:TOP_THEMES * 4]),
+    }
+    json_path.write_text(json.dumps(json_payload, indent=2, default=str), encoding="utf-8")
+
+    print(f"[frontline-contact] markdown: {md_path}")
+    print(f"[frontline-contact] json:     {json_path}")
+
+    # Soft-fail: if many calls have low quality, exit 1 (operator review)
+    low_quality = [s for s in scores if s["quality_score"] < 0.40]
+    if low_quality and len(low_quality) >= len(scores) / 2:
+        print(
+            f"[frontline-contact] WARN: {len(low_quality)}/{len(scores)} calls below 0.40 quality.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    sys.exit(0)
+
+
+main()
+PYEOF

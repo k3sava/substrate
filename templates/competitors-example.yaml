@@ -1,0 +1,66 @@
+# competitors.yaml — per-client competitive registry
+#
+# Used by:
+#   - skills/competitive-scout       (decides who to scout, on what cadence)
+#   - skills/pre-publish-check       (auto-detects displacement LP variants)
+#
+# Drop this file at: clients/<client>/competitors.yaml
+# The schema is intentionally small — every operator knows their named rivals.
+# Tiers are decay buckets, not strategic rankings. Use them to control how
+# often the scout fires per competitor.
+#
+# Field reference:
+#   tier               required   T1 | T2 | T3 | T4 (or any operator-defined bucket)
+#   pricing_decay_days required   how stale the pricing snapshot is allowed to be
+#   features_decay_days required  same, for features / changelog
+#   display_name       optional   pretty name (default: humanized slug)
+#   aliases            optional   slug fragments that should also count as a hit
+#                                 in pre-publish-check filename detection
+#   url                optional   primary site (the scout uses it as a search anchor)
+#
+# Tier defaults if a competitor block omits the decay fields:
+#   T1: pricing 30d, features 60d
+#   T2: pricing 30d, features 90d
+#   T3: pricing 60d, features 90d
+#   T4: pricing 30d, features 90d
+
+defaults:
+  T1: { pricing_decay_days: 30, features_decay_days: 60 }
+  T2: { pricing_decay_days: 30, features_decay_days: 90 }
+  T3: { pricing_decay_days: 60, features_decay_days: 90 }
+  T4: { pricing_decay_days: 30, features_decay_days: 90 }
+
+competitors:
+  # T1 — direct displacement targets the team writes battle cards against
+  acme-rival:
+    tier: T1
+    display_name: Acme Rival
+    aliases: [acme, acme-rival]
+    url: https://acme-rival.example.com
+
+  beta-co:
+    tier: T1
+    display_name: Beta Co
+    aliases: [beta, betaco]
+    url: https://betaco.example.com
+
+  # T2 — adjacent / tangential category players
+  tangential-tool:
+    tier: T2
+    display_name: Tangential Tool
+    aliases: [tangential]
+    url: https://tangential.example.com
+
+  # T3 — niche specialists
+  niche-specialist:
+    tier: T3
+    display_name: Niche Specialist
+    aliases: [niche]
+    url: https://niche.example.com
+
+  # T4 — point-solution AI / edge competitors
+  edge-vendor:
+    tier: T4
+    display_name: Edge Vendor
+    aliases: [edge]
+    url: https://edge.example.com

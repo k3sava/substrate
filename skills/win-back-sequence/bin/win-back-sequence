@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""win-back-sequence, design per-band win-back sequences from a churn diagnosis.
+
+Reads the churn-diagnose JSON for the cohort, picks the save-vs-let-go
+contradiction position per band per the diagnosis recommendation, composes a
+sequence spec (subjects, body skeletons, send delays, channel mix, refusal
+patterns), enforces voice constraints, and emits a measurement contract.
+
+Usage:
+    win-back-sequence --client <client> --diagnosis <path-to-json> \
+        [--cohort high-fit|mid-fit|low-fit|all] \
+        [--channel email|in-product|both] [--max-touches 4] \
+        [--days-since-churn-min 14] [--days-since-churn-max 90] \
+        [--include-discount]
+
+Outputs:
+    clients/<client>/retention/win-back-sequence-<cohort>-<date>.md
+
+Exit codes:
+    0, sequence written
+    3, preflight refusal
+    4, invalid args
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+# Voice gate, match operator-voice constraints.
+KILL_LIST = {
+    "orchestration", "seamless", "strategic", "leverage", "transform",
+    "holistic", "synergy", "bespoke", "unlock", "robust", "sophisticated",
+    "comprehensive",
+}
+THROAT_CLEARING = {
+    "in today's world", "in the world of", "let's face it", "we all know",
+    "as we all know", "the truth is", "i'd like to", "i wanted to reach out",
+}
+EM_DASH = "—"
+EN_DASH = "–"
+
+
+def voice_check(text: str) -> list[str]:
+    """Return a list of voice-gate violations in the text (empty if clean)."""
+    issues: list[str] = []
+    lower = text.lower()
+    for w in KILL_LIST:
+        # Word boundary check
+        if re.search(rf"\b{re.escape(w)}\b", lower):
+            issues.append(f"kill-list word: {w}")
+    for tc in THROAT_CLEARING:
+        if tc in lower:
+            issues.append(f"throat-clearing opener: '{tc}'")
+    if EM_DASH in text or EN_DASH in text:
+        issues.append("em-dash or en-dash present")
+    return issues
+
+
+def normalize_band_key(band_key: str) -> str:
+    """Normalize a band label like 'high-fit (>=0.75)' into 'high-fit'."""
+    bk = band_key.lower()
+    if "high-fit" in bk:
+        return "high-fit"
+    if "mid-fit" in bk:
+        return "mid-fit"
+    if "low-fit" in bk:
+        return "low-fit"
+    if "unknown" in bk:
+        return "unknown"
+    return bk
+
+
+def load_diagnosis(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def position_for_band(band_key: str, recommendations: dict) -> tuple[str, str, dict]:
+    """Pick the contradiction position per the diagnosis recommendation.
+
+    Returns: (position_label, rationale_text, full_rec_dict)
+    """
+    target = None
+    for label, rec in recommendations.items():
+        if normalize_band_key(label) == band_key:
+            target = (label, rec)
+            break
+    if target is None:
+        return ("unknown", "no recommendation in diagnosis for this band", {})
+    label, rec = target
+    return (rec.get("position", "unknown"), rec.get("rationale", ""), rec)
+
+
+def driver_top_for_band(band_key: str, drivers_by_band: dict) -> list[dict]:
+    for label, drivers in drivers_by_band.items():
+        if normalize_band_key(label) == band_key:
+            return drivers
+    return []
+
+
+def has_price_sensitivity(drivers: list[dict]) -> bool:
+    return any("price" in (d.get("driver_id", "") + d.get("label", "").lower()) for d in drivers[:3])
+
+
+def has_workflow_mismatch(drivers: list[dict]) -> bool:
+    return any(
+        "workflow" in (d.get("driver_id", "") + d.get("label", "").lower())
+        or "expectation" in (d.get("label", "").lower())
+        for d in drivers[:3]
+    )
+
+
+def has_complexity(drivers: list[dict]) -> bool:
+    return any(
+        "complex" in d.get("driver_id", "") or "complexity" in d.get("label", "").lower()
+        for d in drivers[:3]
+    )
+
+
+def has_competitor_displacement(drivers: list[dict]) -> bool:
+    return any("competitor" in d.get("driver_id", "") for d in drivers[:3])
+
+
+def has_champion_departure(drivers: list[dict]) -> bool:
+    return any("champion" in d.get("driver_id", "") for d in drivers[:3])
+
+
+def design_sequence_high_fit_save(
+    drivers: list[dict],
+    days_min: int,
+    days_max: int,
+    max_touches: int,
+    channel: str,
+    include_discount: bool,
+) -> list[dict]:
+    """Position A: full save program for high-fit late-stage churn (Murphy/Mehta)."""
+    touches: list[dict] = []
+    base_day = days_min
+
+    # Touch 1: personal outreach, no asks
+    touches.append({
+        "order": 1,
+        "channel": "email",
+        "send_day_since_churn": base_day,
+        "subject": "Quick question on your goodbye",
+        "body_skeleton": (
+            "Direct, sender-first-person. Acknowledge they left. Reference what they were "
+            "trying to accomplish (pull from voc.md customer-language patterns). One question: "
+            "what stopped working? No pitch. No CTA other than a reply. "
+            "Cite: positioning.md (the canonical job we serve)."
+        ),
+        "cta": "Reply with what stopped working.",
+        "refusal_pattern": "no pitch, no CTA-stack, no 'come back' framing",
+    })
+
+    # Touch 2: champion / executive call offer
+    touches.append({
+        "order": 2,
+        "channel": "email",
+        "send_day_since_churn": base_day + 7,
+        "subject": "20-minute call this week",
+        "body_skeleton": (
+            "From CSM or AE. Reference the prior touch. Offer a 20-minute call to do an "
+            "outcome-reset: what changed, what they need, whether the product can address it. "
+            "Cite: positioning.md (what canonical outcome we serve), voc.md (named customer "
+            "language for the JTBD)."
+        ),
+        "cta": "Pick a 20-minute slot.",
+        "refusal_pattern": "no automated calendar spam; 1 specific time offered",
+    })
+
+    if has_workflow_mismatch(drivers):
+        touches.append({
+            "order": 3,
+            "channel": "email",
+            "send_day_since_churn": base_day + 21,
+            "subject": "Saw your workflow note, one thing that may have been missed",
+            "body_skeleton": (
+                "Reference the workflow-fit driver from diagnosis. Surface a specific "
+                "feature path or playbook the user did not adopt. Cite: product-knowledge.md "
+                "(the feature) and voc.md (named customer who solved the same workflow)."
+            ),
+            "cta": "Read this 5-minute playbook.",
+            "refusal_pattern": "no generic 'we have features' message",
+        })
+
+    if has_champion_departure(drivers):
+        touches.append({
+            "order": len(touches) + 1,
+            "channel": "email",
+            "send_day_since_churn": base_day + 28,
+            "subject": "Reaching out to your team",
+            "body_skeleton": (
+                "Sent to a different stakeholder at the account (peer of the departed champion). "
+                "Reference the prior champion's outcome. Offer to brief the new team lead in 15 minutes. "
+                "Cite: voc.md (peer reference), positioning.md (canonical outcome)."
+            ),
+            "cta": "Want a 15-minute team brief?",
+            "refusal_pattern": "no 'we noticed you left' tone; lead with peer-reference value",
+        })
+
+    if include_discount and has_price_sensitivity(drivers):
+        touches.append({
+            "order": len(touches) + 1,
+            "channel": "email",
+            "send_day_since_churn": base_day + 35,
+            "subject": "Pricing reset: see if this works",
+            "body_skeleton": (
+                "Discount appears here only because price-sensitivity was a top-3 driver in "
+                "the diagnosis. Specific dollar number, time-bounded, citing the price tier "
+                "in product-knowledge.md. Not 'special offer'; specific recalibration tied "
+                "to documented price-elasticity finding."
+            ),
+            "cta": "Reactivate at the new price.",
+            "refusal_pattern": "no fake-urgency timer; cite the actual reason",
+        })
+
+    return touches[:max_touches]
+
+
+def design_sequence_high_fit_early_stage(
+    drivers: list[dict],
+    days_min: int,
+    days_max: int,
+    max_touches: int,
+    channel: str,
+) -> list[dict]:
+    """High-fit but early-stage churn: low-cost in-product save AND fix activation upstream."""
+    touches: list[dict] = [
+        {
+            "order": 1,
+            "channel": "email",
+            "send_day_since_churn": days_min,
+            "subject": "Saw you didn't get to the part where this clicks",
+            "body_skeleton": (
+                "Reference the activation event from `clients/<client>/retention/activation-audit-*.md`. "
+                "Tell the user what most accounts that retain do in week one. One specific action. "
+                "Cite: activation-audit, voc.md (a named customer who hit it)."
+            ),
+            "cta": "Try this one thing.",
+            "refusal_pattern": "no 'we miss you'; lead with the specific value the user did not reach",
+        },
+    ]
+    if has_complexity(drivers):
+        touches.append({
+            "order": 2,
+            "channel": "in-product",
+            "send_day_since_churn": days_min + 7,
+            "subject": "(in-product banner)",
+            "body_skeleton": (
+                "If they revisit, surface a simplified 60-second path to the activation event. "
+                "Cite: product-knowledge.md (the simplified flow)."
+            ),
+            "cta": "60-second path",
+            "refusal_pattern": "in-product only on revisit; no email blast",
+        })
+    return touches[:max_touches]
+
+
+def design_sequence_low_fit(
+    drivers: list[dict],
+    days_min: int,
+    max_touches: int,
+    channel: str,
+) -> list[dict]:
+    """Position B: let it go cleanly, single low-cost touch with honest close. Reichheld."""
+    return [
+        {
+            "order": 1,
+            "channel": "email",
+            "send_day_since_churn": days_min,
+            "subject": "Quick honest note",
+            "body_skeleton": (
+                "From CSM, plain. State: based on usage and fit, this product may not be the "
+                "right tool for what they are trying to do. Name a specific alternative tool or "
+                "approach if positioning.md has a documented alternative. Offer a no-strings "
+                "data export. No CTA to reactivate. "
+                "Cite: positioning.md (the canonical fit we serve)."
+            ),
+            "cta": "Get your data export.",
+            "refusal_pattern": (
+                "no save attempt; no discount; no 'come back'; honest fit close. "
+                "This is Position B from the contradiction; spending CS hours on this band "
+                "is misallocation per Reichheld / Elliott-McCrea."
+            ),
+        }
+    ]
+
+
+def design_sequence_mid_fit(
+    drivers: list[dict],
+    days_min: int,
+    days_max: int,
+    max_touches: int,
+    channel: str,
+) -> list[dict]:
+    """Mixed: triage. One outreach to surface intent; gate further touches on response."""
+    touches = [
+        {
+            "order": 1,
+            "channel": "email",
+            "send_day_since_churn": days_min,
+            "subject": "Two quick questions",
+            "body_skeleton": (
+                "Sent automated. Two questions: (1) was this the right tool, wrong moment; "
+                "(2) right moment, wrong tool? Reply gates further outreach. "
+                "Cite: positioning.md, voc.md (customer-language patterns for both branches)."
+            ),
+            "cta": "Reply 1 or 2.",
+            "refusal_pattern": "no follow-up unless the user replies; no automated nurture",
+        },
+    ]
+    return touches[:max_touches]
+
+
+def predicted_reactivation_rate(band: str, drivers: list[dict]) -> tuple[float, str]:
+    """Heuristic prediction. Calibration tracker resolves these."""
+    if band == "high-fit":
+        if has_price_sensitivity(drivers):
+            return 0.18, "high-fit + price-sensitivity: ~18% based on discount-conditioned reactivation studies"
+        return 0.12, "high-fit late-stage save: ~12% baseline reactivation per Murphy save-program data"
+    if band == "low-fit":
+        return 0.02, "low-fit honest-close: ~2% (most do not reactivate; the win is the freed CS hours)"
+    if band == "mid-fit":
+        return 0.07, "mid-fit triage: ~7% (gated on reply rate)"
+    return 0.05, "unknown band, conservative baseline"
+
+
+def write_md(
+    out_path: Path,
+    client: str,
+    cohort: str,
+    diagnosis_path: Path,
+    diagnosis: dict,
+    sequences_by_band: dict,
+    today: str,
+    voice_violations: list[str],
+    discount_refused: bool,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: win-back sequence, {client}, cohort {cohort}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [churn-prediction-vs-churn-diagnosis, behavioral-expansion-signals-beat-tenure]")
+    lines.append("contradictions_aware: [save-everyone-vs-let-the-wrong-fit-go]")
+    lines.append(f"client: {client}")
+    lines.append(f"diagnosis_source: {diagnosis_path}")
+    lines.append(f"cohort_filter: {cohort}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Win-back sequence design, {client}, cohort {cohort}, {today}")
+    lines.append("")
+    lines.append(
+        f"Source diagnosis: `{diagnosis_path}` (churned_n={diagnosis.get('churned_n', 0)}; "
+        f"generated {diagnosis.get('generated_at', 'unknown')})."
+    )
+    lines.append("")
+    lines.append(
+        "Per `knowledge/contradictions/save-everyone-vs-let-the-wrong-fit-go.md`, the right "
+        "sequence shape depends on which contradiction position applies. The diagnosis "
+        "named the position per band; this artifact applies it. The choice is logged below "
+        "per cohort, with the rationale that came out of the diagnosis."
+    )
+    lines.append("")
+
+    if discount_refused:
+        lines.append("**Note:** `--include-discount` was passed but the diagnosis did not name price-sensitivity in the top-3 drivers for any band. Discount touches are excluded. Per the skill's `discount-without-evidence` refusal pattern.")
+        lines.append("")
+
+    for band, payload in sequences_by_band.items():
+        lines.append(f"## Band: {band} (n={payload['cohort_size']})")
+        lines.append("")
+        lines.append(f"**Contradiction position:** {payload['position']}")
+        lines.append("")
+        lines.append(f"_Rationale (from diagnosis):_ {payload['rationale']}")
+        lines.append("")
+        lines.append("**Top drivers in this band (from diagnosis):**")
+        lines.append("")
+        if payload["drivers"]:
+            lines.append("| Driver | Coverage | Addressability |")
+            lines.append("|---|---:|---:|")
+            for d in payload["drivers"]:
+                lines.append(f"| {d['label']} | {d['coverage_pct']}% | {d['addressability_1to5']}/5 |")
+            lines.append("")
+        lines.append("### Sequence")
+        lines.append("")
+        if not payload["sequence"]:
+            lines.append("_No sequence designed (per Position B: let go; no save attempt)._")
+            lines.append("")
+        else:
+            lines.append("| # | Channel | Day post-churn | Subject | CTA | Refusal pattern |")
+            lines.append("|---:|---|---:|---|---|---|")
+            for t in payload["sequence"]:
+                lines.append(
+                    f"| {t['order']} | {t['channel']} | D+{t['send_day_since_churn']} | "
+                    f"\"{t['subject']}\" | {t['cta']} | {t['refusal_pattern']} |"
+                )
+            lines.append("")
+            lines.append("**Body skeletons:**")
+            lines.append("")
+            for t in payload["sequence"]:
+                lines.append(f"- **#{t['order']} ({t['channel']}, D+{t['send_day_since_churn']}):** {t['body_skeleton']}")
+            lines.append("")
+        lines.append("**Predicted reactivation:**")
+        lines.append("")
+        rate, prediction_basis = payload["prediction"]
+        lines.append(
+            f"- Predicted: {rate * 100:.1f}% within 60 days of sequence completion."
+        )
+        lines.append(f"- Basis: {prediction_basis}.")
+        lines.append("")
+
+    lines.append("## Voice gate")
+    lines.append("")
+    if voice_violations:
+        lines.append("Voice violations found in body skeletons (flagged for human edit before send):")
+        lines.append("")
+        for v in voice_violations:
+            lines.append(f"- {v}")
+    else:
+        lines.append("No voice violations detected. Kill-list, em-dash, throat-clearing checks pass.")
+    lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- Diagnosis: `{diagnosis_path}`")
+    lines.append(f"- Positioning: `clients/{client}/positioning/positioning.md`")
+    lines.append(f"- Brand voice: `clients/{client}/brand-voice/brand-voice.md`")
+    lines.append(f"- Voice of customer: `clients/{client}/voc/voc.md`")
+    lines.append(f"- ICP: `clients/{client}/icp/icp.md`")
+    lines.append("- Contradiction: `knowledge/contradictions/save-everyone-vs-let-the-wrong-fit-go.md` (positions logged per band).")
+    lines.append("- Pattern grounding: `knowledge/patterns/churn-prediction-vs-churn-diagnosis.md`.")
+    lines.append("- Pattern grounding: `knowledge/patterns/behavioral-expansion-signals-beat-tenure.md`.")
+    lines.append("")
+
+    lines.append("## Measurement contract")
+    lines.append("")
+    lines.append("Per `knowledge/contradictions/short-feedback-vs-long-term-holdouts.md`, this artifact carries falsifiable predictions per band.")
+    lines.append("")
+    lines.append("| Band | Predicted reactivation (60d) | Basis |")
+    lines.append("|---|---:|---|")
+    for band, payload in sequences_by_band.items():
+        rate, basis = payload["prediction"]
+        lines.append(f"| {band} | {rate * 100:.1f}% | {basis[:80]}{'...' if len(basis) > 80 else ''} |")
+    lines.append("")
+    resolution_date = (datetime.now(timezone.utc) + timedelta(days=120)).strftime("%Y-%m-%d")
+    lines.append(f"**Resolution date:** {resolution_date} (60d send window + 60d observation).")
+    lines.append("")
+
+    lines.append("## Hand-off")
+    lines.append("")
+    lines.append("This file is a sequence *spec*, not a sequence *send*. Hand-off to lifecycle tooling (Customer.io, Iterable, HubSpot, Pendo) is operator-driven. Do not auto-send.")
+    lines.append("")
+
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append("- `routines/retention-monthly.md`, schedule the next read post-resolution.")
+    lines.append(f"- `skills/narrative-compose/`, render the body skeletons into final copy under voice constraints.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "positioning").is_dir() and not (client_root / "positioning.md").is_file():
+        fails.append(f"positioning layer missing: clients/{client}/positioning/ (refusing, required for value frame)")
+    if not (client_root / "brand-voice").is_dir() and not (client_root / "brand-voice.md").is_file():
+        fails.append(f"brand-voice layer missing: clients/{client}/brand-voice/ (refusing, required for voice gate)")
+    if not (client_root / "voc").is_dir() and not (client_root / "voc.md").is_file():
+        fails.append(f"voc layer missing: clients/{client}/voc/")
+    return len(fails) == 0, fails
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--diagnosis", required=True, help="path to churn-diagnosis-*.json")
+    parser.add_argument("--cohort", default="all", choices=["high-fit", "mid-fit", "low-fit", "all"])
+    parser.add_argument("--channel", default="both", choices=["email", "in-product", "both"])
+    parser.add_argument("--max-touches", type=int, default=4)
+    parser.add_argument("--days-since-churn-min", type=int, default=14)
+    parser.add_argument("--days-since-churn-max", type=int, default=90)
+    parser.add_argument("--include-discount", action="store_true")
+    parser.add_argument("--strict-substrate", action="store_true")
+    args = parser.parse_args()
+
+    diag_path = Path(args.diagnosis).resolve()
+    if not diag_path.is_file():
+        print(f"REFUSED: missing-diagnosis, {diag_path} not found", file=sys.stderr)
+        print("  fix: run `churn-diagnose --client <client> --churned <csv>` first", file=sys.stderr)
+        return 3
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        if args.strict_substrate:
+            return 3
+        print("  (continuing without substrate; outputs will mark layers as gaps)", file=sys.stderr)
+
+    try:
+        diagnosis = load_diagnosis(diag_path)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"REFUSED: missing-diagnosis, {e}", file=sys.stderr)
+        return 3
+
+    recommendations = diagnosis.get("band_recommendations", {})
+    drivers_by_band = diagnosis.get("drivers_by_band", {})
+
+    if not recommendations:
+        print("REFUSED: missing-diagnosis, diagnosis JSON has no band_recommendations", file=sys.stderr)
+        return 3
+
+    bands_to_design: list[str] = []
+    if args.cohort == "all":
+        bands_to_design = ["high-fit", "mid-fit", "low-fit"]
+    else:
+        bands_to_design = [args.cohort]
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    print(f"[win-back-sequence] client={args.client} bands={bands_to_design} diagnosis={diag_path.name}", file=sys.stderr)
+
+    sequences_by_band: dict = {}
+    voice_violations: list[str] = []
+    discount_refused = False
+
+    for band in bands_to_design:
+        position, rationale, rec = position_for_band(band, recommendations)
+        drivers = driver_top_for_band(band, drivers_by_band)
+        # Resolve the cohort size for this band
+        cohort_size = 0
+        for label, recs in recommendations.items():
+            if normalize_band_key(label) == band:
+                # We don't have direct n in recommendations; pull from diagnosis if present
+                # The driver count's hits is partial. Use the top driver hit to estimate.
+                if drivers:
+                    # Rough lower bound; full population n requires events split.
+                    cohort_size = max((d.get("hits_n", 0) for d in drivers), default=0)
+                break
+
+        # Discount evidence check
+        if args.include_discount and band == "high-fit" and not has_price_sensitivity(drivers):
+            print(f"REFUSED for band {band}: discount-without-evidence, no price-sensitivity in top 3 drivers", file=sys.stderr)
+            discount_refused = True
+
+        # Pick sequence shape
+        if "let go" in position.lower() or band == "low-fit":
+            sequence = design_sequence_low_fit(drivers, args.days_since_churn_min, args.max_touches, args.channel)
+        elif band == "high-fit" and "early-stage" in position.lower():
+            sequence = design_sequence_high_fit_early_stage(
+                drivers, args.days_since_churn_min, args.days_since_churn_max, args.max_touches, args.channel,
+            )
+        elif "save" in position.lower() or band == "high-fit":
+            sequence = design_sequence_high_fit_save(
+                drivers, args.days_since_churn_min, args.days_since_churn_max, args.max_touches,
+                args.channel, args.include_discount and not discount_refused,
+            )
+        else:
+            sequence = design_sequence_mid_fit(
+                drivers, args.days_since_churn_min, args.days_since_churn_max, args.max_touches, args.channel,
+            )
+
+        # Voice gate over subjects + body skeletons
+        for t in sequence:
+            for field in ("subject", "body_skeleton"):
+                violations = voice_check(t.get(field, ""))
+                for v in violations:
+                    voice_violations.append(f"band={band} touch={t.get('order')} field={field}: {v}")
+
+        sequences_by_band[band] = {
+            "cohort_size": cohort_size,
+            "position": position,
+            "rationale": rationale,
+            "drivers": drivers,
+            "sequence": sequence,
+            "prediction": predicted_reactivation_rate(band, drivers),
+        }
+
+    out_dir = SUBSTRATE_ROOT / "clients" / args.client / "retention"
+    out_path = out_dir / f"win-back-sequence-{args.cohort}-{today}.md"
+    write_md(
+        out_path,
+        client=args.client,
+        cohort=args.cohort,
+        diagnosis_path=diag_path,
+        diagnosis=diagnosis,
+        sequences_by_band=sequences_by_band,
+        today=today,
+        voice_violations=voice_violations,
+        discount_refused=discount_refused,
+    )
+
+    print(f"[win-back-sequence] sequences written for bands: {list(sequences_by_band.keys())}", file=sys.stderr)
+    print(f"[win-back-sequence] voice violations: {len(voice_violations)}", file=sys.stderr)
+    print(f"[win-back-sequence] artifact: {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

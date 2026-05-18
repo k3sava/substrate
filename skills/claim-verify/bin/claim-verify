@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""
+claim-verify — for every claim with a nearby substrate cite, confirm the claimed
+value appears in the cited substrate file. Catches CITE-VALUE-MISMATCH.
+
+Pairs with substrate-cite-check (Gate 6): Gate 6 confirms a cite exists; Gate 7
+confirms the cite's substrate actually supports the claimed value.
+
+Usage:
+  claim-verify <asset> [--strict] [--threshold N] [--json]
+
+Exit:
+  0 — all cited claims verify
+  1 — cite-value mismatches
+  2 — file not found
+"""
+
+from __future__ import annotations
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+# Same claim patterns as substrate-cite-check
+CLAIM_PATTERNS = [
+    (r"\$[\d,]+(?:\.\d+)?(?:K|M|B)?", "dollar"),
+    (r"\b\d+\.?\d*%", "percent"),
+    (r"\b\d+(?:\.\d+)?(?:\s*[-–]\s*\d+)?\s*(?:reps?|seats?|users?|deals?|customers?|dials?(?:/day|/month)?|days?|points?|x|hr|hrs|hours?)\b", "qty-unit"),
+    (r"\$\d+\+?\s*/(?:seat|user|month|mo)", "per-seat-price"),
+    (r"\b(?:HubSpot|Amplitude|Asana|Jira)\s+(?:dashboard|project|chart|task|issue)\s*[\w-]+", "source-id"),
+    (r"\b\d{4}-\d{2}-\d{2}\b", "date"),
+    (r"\bQ[1-4]\s+\d{4}\b", "quarter"),
+]
+
+SUBSTRATE_PATH_RE = re.compile(
+    r"`?((?:clients|knowledge|shared|raw|substrate|skills|agents|routines|runs|metrics|signals|personas|goals|bets|evals|templates|docs|dashboard)[\w./-]+\.(?:md|yml|yaml|json|jsonl))`?"
+)
+BARE_BASENAME_RE = re.compile(r"\b([\w-]{4,}\.(?:md|yml|yaml))\b")
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}, text
+    return {}, text[end + 4:]
+
+
+def index_substrate(substrate_root: Path) -> dict[str, str]:
+    idx: dict[str, str] = {}
+    for d in ["clients", "knowledge", "shared", "raw", "substrate", "skills", "agents",
+              "routines", "personas", "goals", "bets", "runs", "templates", "metrics"]:
+        base = substrate_root / d
+        if base.exists():
+            for f in base.rglob("*.md"):
+                idx.setdefault(f.name, str(f.relative_to(substrate_root)))
+            for f in base.rglob("*.yml"):
+                idx.setdefault(f.name, str(f.relative_to(substrate_root)))
+            for f in base.rglob("*.yaml"):
+                idx.setdefault(f.name, str(f.relative_to(substrate_root)))
+    return idx
+
+
+def find_pairs(body: str) -> list[tuple[int, str, str, str]]:
+    """Return (line_no, claim, claim_type, nearest_path)."""
+    lines = body.split("\n")
+    line_paths: dict[int, list[str]] = {}
+    for i, line in enumerate(lines):
+        ps = list(SUBSTRATE_PATH_RE.findall(line))
+        bs = list(BARE_BASENAME_RE.findall(line))
+        if ps or bs:
+            line_paths[i] = list(set(ps + bs))
+
+    # Source-anchor blocks (Source: line within ±25 lines)
+    source_anchor_lines: dict[int, list[str]] = {}
+    for i, line in enumerate(lines):
+        if re.search(r"^\s*\*\*Source\b|^\s*Source[s]?[\.:]\s*", line):
+            ap = list(SUBSTRATE_PATH_RE.findall(line))
+            ap.extend(BARE_BASENAME_RE.findall(line))
+            for j in range(1, 3):
+                if i + j < len(lines):
+                    nxt = lines[i + j]
+                    ap.extend(SUBSTRATE_PATH_RE.findall(nxt))
+                    ap.extend(BARE_BASENAME_RE.findall(nxt))
+            if ap:
+                source_anchor_lines[i] = list(set(ap))
+
+    pairs: list[tuple[int, str, str, str]] = []
+    for i, line in enumerate(lines):
+        if line.strip().startswith("|---") or line.strip().startswith("#"):
+            continue
+        if not line.strip():
+            continue
+        for pat, label in CLAIM_PATTERNS:
+            for m in re.finditer(pat, line):
+                # Skip claims inside quotes (verbatim) or backtick spans (code)
+                if line.count('"', 0, m.start()) % 2 == 1 and line.count('"', 0, m.end()) % 2 == 0:
+                    continue
+                if line.count("`", 0, m.start()) % 2 == 1 and line.count("`", 0, m.end()) % 2 == 0:
+                    continue
+                # Collect ALL nearby paths (same line + ±10 lines + source-anchor +25)
+                # — claim verifies if value appears in ANY of them.
+                candidate_paths: list[str] = []
+                if i in line_paths:
+                    candidate_paths.extend(line_paths[i])
+                for delta in range(1, 11):
+                    for idx in (i - delta, i + delta):
+                        if idx in line_paths:
+                            candidate_paths.extend(line_paths[idx])
+                for src_line in range(i, min(i + 26, len(lines))):
+                    if src_line in source_anchor_lines:
+                        candidate_paths.extend(source_anchor_lines[src_line])
+                # Dedupe preserving order
+                seen = set()
+                deduped = [p for p in candidate_paths if not (p in seen or seen.add(p))]
+                if deduped:
+                    pairs.append((i + 1, m.group(0), label, deduped))
+    return pairs
+
+
+def load_substrate(path_hint: str, idx: dict[str, str], substrate_root: Path) -> str | None:
+    """Resolve cited path → file contents (or None)."""
+    if path_hint.startswith("(source-anchor:") or path_hint.startswith("(") or "/" not in path_hint and "." not in path_hint:
+        return None
+    # Strip section anchors (`§N`)
+    base = re.sub(r"\s*§.*$", "", path_hint).strip()
+    p = substrate_root / base
+    if p.exists():
+        return p.read_text()
+    bn = base.split("/")[-1]
+    if bn in idx:
+        full = substrate_root / idx[bn] if not idx[bn].startswith("/") else Path(idx[bn])
+        if full.exists():
+            return full.read_text()
+    return None
+
+
+def value_in_substrate(claim: str, claim_type: str, substrate: str) -> bool:
+    """Heuristic: does the claim's value appear in the cited substrate?"""
+    s = substrate.lower()
+    c = claim.lower()
+    if c in s:
+        return True
+    # Numeric tolerance for percent + qty-unit
+    if claim_type in {"percent", "qty-unit", "dollar"}:
+        nums = re.findall(r"\d+(?:[.,]\d+)?", claim)
+        if not nums:
+            return False
+        target = float(nums[0].replace(",", ""))
+        # Find candidate numbers in substrate
+        for m in re.findall(r"\d+(?:[.,]\d+)?", substrate):
+            try:
+                v = float(m.replace(",", ""))
+                if v == 0 and target == 0:
+                    return True
+                if target > 0 and abs(v - target) / target <= 0.05:
+                    return True
+            except ValueError:
+                continue
+        return False
+    if claim_type == "source-id":
+        # Exact-ID match
+        ident = re.search(r"[\w-]+$", claim)
+        return bool(ident and ident.group(0) in substrate)
+    if claim_type in {"date", "quarter"}:
+        return c in s
+    if claim_type == "per-seat-price":
+        nums = re.findall(r"\d+", claim)
+        if not nums:
+            return False
+        target = int(nums[0])
+        for m in re.findall(r"\$\d+", substrate):
+            v = int(m[1:])
+            if abs(v - target) / max(target, 1) <= 0.05:
+                return True
+        return False
+    return c in s
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("asset")
+    p.add_argument("--strict", action="store_true")
+    p.add_argument("--threshold", type=int, default=0)
+    p.add_argument("--json", action="store_true", dest="json_out")
+    args = p.parse_args()
+
+    asset_path = Path(args.asset).resolve()
+    if not asset_path.is_file():
+        print(f"asset not found: {args.asset}", file=sys.stderr)
+        return 2
+
+    # Walk up from the asset to find the substrate root. Falls back to env var
+    # or cwd. Keeps the variable name `substrate_root` consistent with the rest
+    # of substrate's runtime.
+    cur = asset_path.parent
+    substrate_root = None
+    for _ in range(10):
+        if (cur / "clients").is_dir() and (cur / "skills").is_dir():
+            substrate_root = cur
+            break
+        cur = cur.parent
+    if substrate_root is None:
+        env_root = os.environ.get("SUBSTRATE_ROOT") or os.environ.get("FLYWHEEL_ROOT")
+        substrate_root = Path(env_root) if env_root else Path.cwd()
+
+    rel = str(asset_path.relative_to(substrate_root)) if str(asset_path).startswith(str(substrate_root)) else str(asset_path)
+    bypass_dirs = ["knowledge/intel/", "intel/", "substrate/", "raw/", "shared/", "runs/",
+                   "routines/", "workflows/", "data/", "docs/", "handoff/", "metrics/",
+                   "runbooks/", "scripts/", "archive/", "evals/", "skills/", "agents/",
+                   "concepts/", "knowledge/", "personas/", "research/", "goals/", "bets/", "signals/"]
+    if any(b in rel for b in bypass_dirs):
+        print(f"PASS: {args.asset} (claim-verify BYPASSED — internal-spec path)")
+        return 0
+
+    text = asset_path.read_text()
+    _, body = parse_frontmatter(text)
+    idx = index_substrate(substrate_root)
+    pairs = find_pairs(body)
+
+    mismatches: list[tuple[int, str, str, str]] = []
+    verified = 0
+    no_substrate_loaded = 0
+
+    for line_no, claim, ctype, paths in pairs:
+        # Try each candidate path; verified if ANY substrate contains the value.
+        loaded_any = False
+        verified_any = False
+        for p in paths:
+            substrate = load_substrate(p, idx, substrate_root)
+            if substrate is None:
+                continue
+            loaded_any = True
+            if value_in_substrate(claim, ctype, substrate):
+                verified_any = True
+                break
+        if not loaded_any:
+            no_substrate_loaded += 1
+            continue
+        if verified_any:
+            verified += 1
+        else:
+            mismatches.append((line_no, claim, ctype, ", ".join(paths[:3])))
+
+    if args.json_out:
+        print(json.dumps({
+            "asset": str(asset_path),
+            "verified": verified,
+            "mismatches": [{"line": ln, "claim": cl, "type": ty, "cited": p} for ln, cl, ty, p in mismatches],
+            "uncited": no_substrate_loaded,
+        }, indent=2))
+        return 0 if len(mismatches) <= args.threshold else 1
+
+    print(f"=== claim-verify: {args.asset} ===", file=sys.stderr)
+    print(f"  pairs (claim,cite): {len(pairs)}  verified: {verified}  mismatches: {len(mismatches)}  uncited (skip): {no_substrate_loaded}", file=sys.stderr)
+
+    if mismatches:
+        print("\n  CITE-VALUE-MISMATCHES (claim cited but value not found in substrate):", file=sys.stderr)
+        for ln, cl, ty, path in mismatches[:12]:
+            print(f"    L{ln:>4d}  [{ty:>14s}]  \"{cl}\"  ← cited: {path[:60]}", file=sys.stderr)
+        if len(mismatches) > 12:
+            print(f"    ... +{len(mismatches) - 12} more", file=sys.stderr)
+
+    threshold = 0 if args.strict else args.threshold
+    if len(mismatches) > threshold:
+        print(f"\nFAIL: {args.asset} ({len(mismatches)} cite-value mismatches; threshold {threshold})")
+        return 1
+    print(f"\nPASS: {args.asset} ({len(mismatches)} cite-value mismatches; threshold {threshold})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

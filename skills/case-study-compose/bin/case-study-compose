@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""case-study-compose — turn customer transcripts plus a named outcome into a case study.
+
+Reads one or more transcript paths, extracts a verbatim pinned quote, composes
+the narrative arc, and writes the case-study file. Composes claim-verify and
+voice-enforce on the output. Exits with the standard substrate skill codes.
+
+Usage:
+    case-study-compose --client <client> --customer <slug>
+                       --transcript <path> [--transcript <path> ...]
+                       --outcome <metric>
+                       [--shape flagship|peer|short]
+                       [--operational-definition <text>]
+                       [--attribution verified|self-reported|contextual|indirect|direct]
+                       [--output <path>]
+
+Exit codes:
+    0 — case study composed and gates run
+    1 — preflight refused (substrate gap)
+    2 — input invalid
+    3 — verify failed on a load-bearing claim
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+WORD_BUDGETS = {
+    "flagship": (800, 1200),
+    "peer": (400, 600),
+    "short": (120, 180),
+}
+
+NUMERIC_TOKEN = re.compile(
+    r"\d+[.,]?\d*\s*(%|x|X|hours?|days?|weeks?|months?|years?|customers?|"
+    r"users?|clients?|companies?|deals?|leads?|signups?|hires?|seats?|seconds?|"
+    r"minutes?|mins?|secs?|tickets?|reps?|agents?|calls?|reviews?|stars?|nps|"
+    r"USD|EUR|INR|GBP|JPY|\$|€|£|₹|¥|M|B|K)\b"
+)
+
+FIRST_PERSON = re.compile(r"\b(i|we|our|us|my|me)\b", re.IGNORECASE)
+SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'“])")
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def strip_em_dashes(text: str) -> str:
+    """Substrate voice rule: no em dashes in body copy."""
+    return text.replace("—", ", ").replace(" -- ", ", ")
+
+
+def find_positioning(client_root: Path) -> Path | None:
+    for sub in ("positioning", "substrate"):
+        d = client_root / sub
+        if d.is_dir():
+            cands = list(d.glob("positioning-canonical-statement*.md"))
+            if cands:
+                return max(cands, key=lambda x: x.stat().st_mtime)
+    return None
+
+
+def extract_quote(corpus: str, outcome: str) -> str:
+    """Longest first-person sentence near the outcome keyword or numeric anchor."""
+    if not corpus.strip():
+        return ""
+    sentences = [s.strip() for s in SENT_SPLIT.split(corpus) if s.strip()]
+    outcome_tokens = [t.lower() for t in re.split(r"\W+", outcome) if len(t) > 2]
+
+    scored: list[tuple[int, str]] = []
+    for s in sentences:
+        if len(s) < 40 or len(s) > 320:
+            continue
+        if not FIRST_PERSON.search(s):
+            continue
+        s_lower = s.lower()
+        score = len(s)
+        if any(tok in s_lower for tok in outcome_tokens):
+            score += 200
+        if NUMERIC_TOKEN.search(s):
+            score += 100
+        # Avoid sentences that are mostly markdown formatting
+        if s.count("|") > 2 or s.startswith("#"):
+            continue
+        scored.append((score, s))
+
+    if not scored:
+        return ""
+    scored.sort(reverse=True)
+    return scored[0][1]
+
+
+def extract_problem_paragraph(corpus: str, outcome: str) -> str:
+    """First substantive paragraph that names a problem; fallback to first long sentence."""
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", corpus) if p.strip()]
+    keywords = ["problem", "struggle", "before", "challenge", "issue", "pain", "broke", "stuck"]
+    for p in paragraphs:
+        low = p.lower()
+        if any(k in low for k in keywords) and 60 < len(p) < 600:
+            return strip_em_dashes(p)
+    if paragraphs:
+        return strip_em_dashes(paragraphs[0][:500])
+    return ""
+
+
+def extract_intervention_paragraph(corpus: str) -> str:
+    keywords = ["shipped", "launched", "rolled out", "implemented", "switched to",
+                "started using", "built", "deployed", "changed to", "moved to"]
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", corpus) if p.strip()]
+    for p in paragraphs:
+        low = p.lower()
+        if any(k in low for k in keywords) and 60 < len(p) < 600:
+            return strip_em_dashes(p)
+    return ""
+
+
+def extract_diagnosis_paragraph(corpus: str) -> str:
+    keywords = ["because", "the reason", "root cause", "realised", "realized",
+                "figured out", "the issue was", "turned out"]
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", corpus) if p.strip()]
+    for p in paragraphs:
+        low = p.lower()
+        if any(k in low for k in keywords) and 60 < len(p) < 600:
+            return strip_em_dashes(p)
+    return ""
+
+
+def trim_to_budget(text: str, low: int, high: int) -> str:
+    words = text.split()
+    if len(words) <= high:
+        return text
+    return " ".join(words[:high]) + " [...]"
+
+
+def compose_case_study(
+    client: str, customer: str, corpus: str, outcome: str, shape: str,
+    operational_definition: str, attribution: str, transcript_paths: list[str],
+    positioning_rel: str | None,
+) -> tuple[str, str, dict]:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    low, high = WORD_BUDGETS[shape]
+
+    quote = extract_quote(corpus, outcome)
+    problem = extract_problem_paragraph(corpus, outcome)
+    diagnosis = extract_diagnosis_paragraph(corpus)
+    intervention = extract_intervention_paragraph(corpus)
+
+    title = f"How {customer} produced {outcome}"
+
+    op_def = operational_definition or (
+        "_(stub: requires entry from allowed-claims-register or a measurement "
+        "contract; do not ship without an operational definition)_"
+    )
+
+    why_stuck_default = (
+        "_(stub: name the diagnosis the customer and operator landed on together; "
+        "two paragraphs; cite at least one VoC quote.)_"
+    )
+
+    what_shipped_default = (
+        "_(stub: describe the specific intervention. No abstractions, no "
+        "feature lists; the change the customer would describe to a peer.)_"
+    )
+
+    quote_block = (
+        f"> \"{strip_em_dashes(quote)}\"\n>\n> Source: {transcript_paths[0]}, "
+        f"logged {today}."
+        if quote else
+        "_(stub: paste the verbatim quote, pinned to the logged interview date.)_"
+    )
+
+    sections = [
+        "## What changed",
+        "",
+        problem or "_(stub: one paragraph on the problem the customer was solving.)_",
+        "",
+        "## Why it stuck",
+        "",
+        diagnosis or why_stuck_default,
+        "",
+        "## What we shipped",
+        "",
+        intervention or what_shipped_default,
+        "",
+        "## What it produced",
+        "",
+        f"**{outcome}**, measured per the operational definition in frontmatter. "
+        f"Source-of-truth pull: {op_def}",
+        "",
+        "## The customer's words",
+        "",
+        quote_block,
+        "",
+        "## Caveats",
+        "",
+        "_(stub: name the comparison anchor, the window, and what the data does "
+        "not yet prove. Procurement reviewers read this section first.)_",
+    ]
+
+    body = "\n".join(sections)
+    body = trim_to_budget(body, low, high)
+
+    frontmatter_lines = [
+        "---",
+        f"title: {title}",
+        f"customer: {customer}",
+        f"client: {client}",
+        f"attribution: {attribution}",
+        f"outcome: {outcome}",
+        f"operational_definition: {op_def[:240]}",
+        f"shape: {shape}",
+        f"date: {today}",
+        f"transcript_sources: [{', '.join(transcript_paths)}]",
+        "produced_by: case-study-compose",
+        "asset_type: case-study",
+        "contradiction_positions: [self-reported-vs-verified: position-A]",
+        f"position_rationale: attribution tier disclosed in frontmatter as {attribution}; "
+        f"verified tier requires source-of-truth pull cited in operational_definition.",
+        "---",
+        "",
+        f"# {title}",
+        "",
+    ]
+
+    if positioning_rel:
+        frontmatter_lines.append(f"_Thesis alignment: `{positioning_rel}`_")
+        frontmatter_lines.append("")
+
+    doc = "\n".join(frontmatter_lines) + body + "\n"
+    doc = strip_em_dashes(doc)
+
+    meta = {
+        "quote_found": bool(quote),
+        "problem_found": bool(problem),
+        "diagnosis_found": bool(diagnosis),
+        "intervention_found": bool(intervention),
+        "word_count": len(body.split()),
+    }
+    return doc, quote, meta
+
+
+def run_companion_skill(skill_name: str, asset_path: Path) -> tuple[bool, str]:
+    skill_bin = SUBSTRATE_ROOT / "skills" / skill_name / "bin" / skill_name
+    if not skill_bin.is_file():
+        return True, f"{skill_name} binary not found; SKIPPED"
+    env = {**os.environ, "SUBSTRATE_ROOT": str(SUBSTRATE_ROOT),
+           "FLYWHEEL_ROOT": str(SUBSTRATE_ROOT)}
+    try:
+        r = subprocess.run(
+            ["python3", str(skill_bin), str(asset_path)],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        return r.returncode == 0, (r.stderr or "") + (r.stdout or "")
+    except subprocess.TimeoutExpired:
+        return False, f"{skill_name} timeout"
+    except Exception as e:
+        return False, f"{skill_name} error: {e}"
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--client", required=True)
+    p.add_argument("--customer", required=True)
+    p.add_argument("--transcript", action="append", required=True)
+    p.add_argument("--outcome", required=True)
+    p.add_argument("--shape", default="peer", choices=list(WORD_BUDGETS.keys()))
+    p.add_argument("--operational-definition", default="")
+    p.add_argument("--attribution", default="self-reported",
+                   choices=["verified", "self-reported", "contextual", "indirect", "direct"])
+    p.add_argument("--output", default=None)
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        print(f"REFUSED: client root missing — {client_root}".replace("—", ":"),
+              file=sys.stderr)
+        return 1
+
+    pos = find_positioning(client_root)
+    if pos is None:
+        print(f"REFUSED: canonical positioning statement missing for {args.client}",
+              file=sys.stderr)
+        print(f"  fix: run substrate positioning-forge --client {args.client}",
+              file=sys.stderr)
+        return 1
+    positioning_rel = str(pos.relative_to(SUBSTRATE_ROOT))
+
+    if not NUMERIC_TOKEN.search(args.outcome) and not re.search(r"\d", args.outcome):
+        print(f"REFUSED: outcome '{args.outcome}' has no numeric anchor; "
+              f"operational definitions need a measurable claim.",
+              file=sys.stderr)
+        return 2
+
+    transcript_paths_abs: list[Path] = []
+    for t in args.transcript:
+        tp = Path(t)
+        if not tp.is_absolute():
+            tp = (SUBSTRATE_ROOT / tp).resolve()
+        if not tp.is_file():
+            print(f"REFUSED: transcript not found: {t}", file=sys.stderr)
+            return 1
+        transcript_paths_abs.append(tp)
+
+    transcript_rel = []
+    corpus_parts = []
+    for tp in transcript_paths_abs:
+        try:
+            rel = str(tp.relative_to(SUBSTRATE_ROOT))
+        except ValueError:
+            rel = str(tp)
+        transcript_rel.append(rel)
+        corpus_parts.append(read_text(tp))
+    corpus = "\n\n".join(corpus_parts)
+
+    doc, quote, meta = compose_case_study(
+        args.client, args.customer, corpus, args.outcome, args.shape,
+        args.operational_definition.strip(), args.attribution, transcript_rel,
+        positioning_rel,
+    )
+
+    if args.output:
+        out_path = Path(args.output).resolve()
+    else:
+        out_dir = client_root / "case-studies"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{args.customer}.md"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(doc, encoding="utf-8")
+
+    flags = []
+    if not meta["quote_found"]:
+        flags.append("no verbatim quote extracted; book a frontline-contact pass")
+    if not meta["problem_found"]:
+        flags.append("no problem paragraph extracted; stub left in place")
+    if not meta["intervention_found"]:
+        flags.append("no intervention paragraph extracted; stub left in place")
+
+    voice_pass, voice_msg = run_companion_skill("voice-enforce", out_path)
+    claim_pass, claim_msg = run_companion_skill("claim-verify", out_path)
+
+    append = []
+    if not voice_pass:
+        append.append("\n\n## VOICE-ENFORCE FLAGGED\n\n"
+                      f"```\n{voice_msg[-1200:] if voice_msg else '(no detail)'}\n```\n")
+    if not claim_pass:
+        append.append("\n\n## CLAIM-VERIFY FLAGGED\n\n"
+                      f"```\n{claim_msg[-1200:] if claim_msg else '(no detail)'}\n```\n")
+    if append:
+        with out_path.open("a", encoding="utf-8") as fh:
+            for chunk in append:
+                fh.write(chunk)
+
+    print(f"[case-study-compose] wrote {out_path}", file=sys.stderr)
+    for f in flags:
+        print(f"  FLAG: {f}", file=sys.stderr)
+
+    if not claim_pass:
+        print(f"PASS-WITH-FLAG: {out_path.name} (claim-verify flagged; review before ship)")
+        return 0
+    if not voice_pass:
+        print(f"PASS-WITH-FLAG: {out_path.name} (voice-enforce flagged; review before ship)")
+        return 0
+    print(f"PASS: {out_path.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""deflection-experiment-design, design a real deflection test for a cluster.
+
+Reads a clusters JSON from `ticket-cluster-analysis`. Picks the highest-
+priority cluster (or an operator-named one). Composes a right-routing-ladder
+experiment (control + chatbot suggest + article surface + community route +
+human-direct), with a measurement contract that requires both a deflection-
+or-resolution metric AND an effort-or-CSAT metric. Refuses any measurement
+that drops the customer-effort half.
+
+Usage:
+    deflection-experiment-design --client <client> \
+        --clusters <clusters.json> \
+        [--cluster <cluster_id>] \
+        [--variant-mode ladder|article-only|chatbot-only|community-only] \
+        [--holdout-share 0.30] [--duration-days 28]
+
+Outputs:
+    clients/<client>/support/deflection-experiment-<cluster_id>-<date>.md
+    clients/<client>/support/deflection-experiment-<cluster_id>-<date>.json
+
+Exit codes:
+    0, spec written
+    3, preflight refusal
+    4, invalid args
+
+Per deflection-is-not-the-goal, deflection is a side effect of right-routing
+done well, not the goal of the system. The required-both-metrics rule
+operationalises this.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+KILL_LIST = {
+    "orchestration", "seamless", "strategic", "leverage", "transform",
+    "holistic", "synergy", "bespoke", "unlock", "robust", "sophisticated",
+    "comprehensive",
+}
+THROAT_CLEAR_OPENERS = [
+    "we hope you're well", "we hope this finds you", "thanks so much for being",
+    "as you know", "we are excited to", "we are thrilled to",
+    "we wanted to reach out",
+]
+EM_DASH_RE = re.compile(r"—")
+DOUBLE_HYPHEN_RE = re.compile(r"--")
+
+MIN_CLUSTER_VOLUME = 50
+HOLDOUT_FLOOR = 0.10
+DURATION_FLOOR_DAYS = 14
+
+
+def voice_gate(copy: str) -> tuple[bool, list[str]]:
+    findings: list[str] = []
+    lower = copy.lower()
+    for word in KILL_LIST:
+        pattern = r"(?:^|[^a-z])" + re.escape(word) + r"(?:[^a-z]|$)"
+        if re.search(pattern, lower):
+            findings.append(f"kill-list word: '{word}'")
+    if EM_DASH_RE.search(copy):
+        findings.append("em-dash found in body")
+    if DOUBLE_HYPHEN_RE.search(copy):
+        findings.append("double-hyphen (--) found in body")
+    for opener in THROAT_CLEAR_OPENERS:
+        if opener in lower:
+            findings.append(f"throat-clearing opener: '{opener}'")
+    return len(findings) == 0, findings
+
+
+def pick_cluster(clusters_doc: dict, cluster_id: str | None) -> dict:
+    """Pick the cluster to test. Operator override or highest-priority."""
+    clusters = clusters_doc.get("clusters", [])
+    if cluster_id:
+        match = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+        if not match:
+            raise KeyError(cluster_id)
+        return match
+    # Highest-priority: size × CSAT-deficit
+    def priority(c: dict) -> float:
+        size = float(c.get("size", 0))
+        csat = (c.get("csat_summary") or {}).get("median")
+        deficit = max(0.0, 5.0 - float(csat)) + 1.0 if csat is not None else 1.0
+        return size * deficit
+    if not clusters:
+        raise KeyError("no clusters in input")
+    return max(clusters, key=priority)
+
+
+def compose_variants(variant_mode: str, cluster: dict, suggested_topic: str) -> list[dict]:
+    """Compose the right-routing ladder of variants. Returns list of dict specs."""
+    cluster_label = cluster.get("label", "this cluster")
+    variants: list[dict] = []
+    # Control is always included
+    variants.append({
+        "variant_id": "A-control",
+        "kind": "control",
+        "name": "Current routing",
+        "description": (
+            f"Tickets in the {cluster_label} cluster route through the existing flow with no change. "
+            "This arm is the baseline against which the other variants are measured."
+        ),
+        "customer_facing_copy": "(no copy change; current flow)",
+    })
+    if variant_mode in ("ladder", "chatbot-only"):
+        variants.append({
+            "variant_id": "B-chatbot-suggest",
+            "kind": "automation",
+            "name": "Chatbot suggest",
+            "description": (
+                "On ticket open, the bot offers a one-line suggested answer derived from the cluster topic. "
+                f"Topic: {suggested_topic}. The user can accept (case resolves) or escalate (continues to a human). "
+                "The bot does not block escalation and does not loop on rejected answers; one suggestion, then escalate if not accepted."
+            ),
+            "customer_facing_copy": (
+                "Quick suggestion before we route this to a teammate: based on the topic, you might be looking for an answer to "
+                f"\"{suggested_topic}\". Want us to share what we have, or skip ahead to a human?"
+            ),
+        })
+    if variant_mode in ("ladder", "article-only"):
+        variants.append({
+            "variant_id": "C-article-surface",
+            "kind": "automation",
+            "name": "Article surface",
+            "description": (
+                "On ticket open, surface the most relevant help article inline (the article that covers the cluster topic). "
+                "The user can read and self-resolve, or escalate. The escalate option remains visible at the bottom of the article."
+            ),
+            "customer_facing_copy": (
+                f"This question lines up with our \"{suggested_topic}\" article. Read it first; if it does not resolve, "
+                "the escalate-to-a-human option is at the bottom and we will pick up the thread."
+            ),
+        })
+    if variant_mode in ("ladder", "community-only"):
+        variants.append({
+            "variant_id": "D-community-route",
+            "kind": "automation",
+            "name": "Community route",
+            "description": (
+                "Route the ticket to a community thread on the same topic. The user reads peers' answers and can resolve, "
+                "ask a follow-up in the community, or escalate to support."
+            ),
+            "customer_facing_copy": (
+                f"There is an active community thread on \"{suggested_topic}\". Read it first; if it does not resolve "
+                "or you want a vendor answer, the escalate-to-support option stays available."
+            ),
+        })
+    if variant_mode == "ladder":
+        variants.append({
+            "variant_id": "E-human-direct",
+            "kind": "right-routing-arm",
+            "name": "Human direct (no automation)",
+            "description": (
+                "Escalate immediately to a human; no chatbot, no article, no community. This arm tests the loyalty cost / saving "
+                "of bypassing the automation entirely. It is the right-routing arm for high-effort intents."
+            ),
+            "customer_facing_copy": (
+                "Routing you straight to a teammate. No bot, no article. We will pick up your thread within the response-time SLA."
+            ),
+        })
+    return variants
+
+
+def measurement_contract(today: str, duration_days: int) -> dict:
+    resolution_date = (datetime.fromisoformat(today) + timedelta(days=duration_days + 14)).strftime("%Y-%m-%d")
+    return {
+        "primary_required_metrics": [
+            {
+                "metric": "resolution-without-escalation rate",
+                "definition": "share of tickets resolved in the variant arm without escalating to a human (or the next tier).",
+                "direction": "higher is better",
+                "baseline_required": True,
+                "predicted_lift_pct": "operator-set",
+                "kind": "deflection-side",
+            },
+            {
+                "metric": "post-interaction CSAT (or effort score)",
+                "definition": "Likert score collected at interaction close. Either a 1-5 CSAT or a 1-7 customer-effort score; both are acceptable.",
+                "direction": "higher CSAT (or lower effort) is better",
+                "baseline_required": True,
+                "predicted_lift_pct": "operator-set",
+                "kind": "loyalty-side",
+            },
+        ],
+        "secondary_metrics": [
+            {
+                "metric": "30-day return-ticket rate",
+                "definition": "share of tickets in the cohort that returned to support within 30 days for the same intent.",
+                "direction": "lower is better",
+                "kind": "validity check on resolution",
+            },
+            {
+                "metric": "ICP-fit-stratified retention",
+                "definition": "90-day retention of accounts whose first interaction was the variant arm, split by ICP-fit band.",
+                "direction": "higher is better in high-fit; flat is acceptable in low-fit",
+                "kind": "long-window validity",
+            },
+        ],
+        "rejection_rule": (
+            "An experiment that loses on the loyalty-side metric while winning on the deflection-side metric is a failure, "
+            "not a win. Per the deflection-is-not-the-goal pattern, the deflection metric is acceptable as a side metric, "
+            "never as a primary metric. The kill criterion: a 5pp or greater drop in the loyalty-side metric vetoes any "
+            "deflection-side gain regardless of magnitude."
+        ),
+        "resolution_date": resolution_date,
+    }
+
+
+def write_md(
+    out_path: Path,
+    client: str,
+    today: str,
+    cluster: dict,
+    variants: list[dict],
+    holdout_share: float,
+    duration_days: int,
+    contract: dict,
+    voice_gate_findings: list[str],
+    sample_size_note: str,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cid = cluster.get("cluster_id", "unknown")
+    cluster_size = cluster.get("size", 0)
+    csat = (cluster.get("csat_summary") or {}).get("median")
+    csat_text = str(csat) if csat is not None else "n/a"
+    suggested_topic = cluster.get("suggested_topic") or "(operator review needed)"
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: deflection experiment, {client}, cluster {cid}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [deflection-is-not-the-goal, tickets-are-product-feedback-channel]")
+    lines.append("contradictions_aware: []")
+    lines.append(f"client: {client}")
+    lines.append(f"cluster_id: {cid}")
+    lines.append(f"cluster_size: {cluster_size}")
+    lines.append(f"holdout_share: {holdout_share}")
+    lines.append(f"duration_days: {duration_days}")
+    lines.append("produced_by: deflection-experiment-design")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Deflection experiment, {client}, cluster `{cid}`, {today}")
+    lines.append("")
+    lines.append(
+        f"Per `deflection-is-not-the-goal`, this experiment measures both right-routing efficacy and customer effort or satisfaction. The deflection-side metric is acceptable as a primary outcome only when paired with a loyalty-side metric; an experiment that loses on loyalty while winning on deflection is rejected by the kill criterion below."
+    )
+    lines.append("")
+
+    # Cluster context
+    lines.append("## 1. Cluster context")
+    lines.append("")
+    lines.append(f"- Cluster: `{cid}` ({cluster.get('label','')})")
+    lines.append(f"- Size in latest run: {cluster_size}")
+    lines.append(f"- Median CSAT: {csat_text}")
+    lines.append(f"- Suggested topic (in customer language): _{suggested_topic}_")
+    sample_ids = cluster.get("sample_ticket_ids", [])
+    if sample_ids:
+        lines.append(f"- Source sample tickets: {', '.join(f'`{t}`' for t in sample_ids[:3])}")
+    lines.append("")
+
+    # Variants
+    lines.append("## 2. Variants (right-routing ladder)")
+    lines.append("")
+    lines.append("| Variant | Kind | Name | Description |")
+    lines.append("|---|---|---|---|")
+    for v in variants:
+        # Truncate description for table cell readability
+        desc = v["description"][:200].rstrip()
+        if len(v["description"]) > 200:
+            desc += "..."
+        lines.append(f"| `{v['variant_id']}` | {v['kind']} | {v['name']} | {desc} |")
+    lines.append("")
+
+    lines.append("### Variant detail")
+    lines.append("")
+    for v in variants:
+        lines.append(f"#### `{v['variant_id']}` — {v['name']}")
+        lines.append("")
+        lines.append(v["description"])
+        lines.append("")
+        cf = v.get("customer_facing_copy", "")
+        if cf:
+            lines.append("Customer-facing copy:")
+            lines.append("")
+            lines.append(f"> {cf}")
+            lines.append("")
+
+    # Stratification + holdout + duration
+    lines.append("## 3. Holdout, stratification, duration")
+    lines.append("")
+    lines.append(f"- Holdout share: {holdout_share * 100:.1f}% of eligible tickets routed to control (variant A).")
+    lines.append("- Stratification: ICP-fit band (high / mid / low / unknown). Variant assignment uniform within band; per-band reads at close.")
+    lines.append(f"- Duration: {duration_days} days minimum. The window is the floor; if sample-size requirements are not met at day {duration_days}, extend the window before reading.")
+    lines.append("")
+    lines.append(f"Sample-size note: {sample_size_note}")
+    lines.append("")
+
+    # Measurement contract
+    lines.append("## 4. Measurement contract")
+    lines.append("")
+    lines.append("Two metrics are required. The deflection-side and the loyalty-side are co-equal; an experiment cannot be declared a win on the deflection-side alone.")
+    lines.append("")
+    lines.append("**Primary metrics (both required):**")
+    lines.append("")
+    for m in contract["primary_required_metrics"]:
+        lines.append(f"- **{m['metric']}** ({m['kind']}). _Definition:_ {m['definition']} _Direction:_ {m['direction']}.")
+    lines.append("")
+    lines.append("**Secondary metrics:**")
+    lines.append("")
+    for m in contract["secondary_metrics"]:
+        lines.append(f"- _{m['metric']}_ ({m['kind']}). {m['definition']} _Direction:_ {m['direction']}.")
+    lines.append("")
+    lines.append("**Kill criterion:**")
+    lines.append("")
+    lines.append(f"> {contract['rejection_rule']}")
+    lines.append("")
+    lines.append(f"Resolution date: **{contract['resolution_date']}**")
+    lines.append("")
+
+    # Voice gate
+    lines.append("## 5. Voice gate result")
+    lines.append("")
+    if voice_gate_findings:
+        lines.append("Voice gate failed:")
+        lines.append("")
+        for f in voice_gate_findings:
+            lines.append(f"- {f}")
+    else:
+        lines.append("- Customer-facing copy across all variants passes the voice gate (no kill-list words, no em-dashes in body, no throat-clearing openers).")
+    lines.append("")
+
+    # Failure modes
+    lines.append("## 6. Failure modes the experiment must guard against")
+    lines.append("")
+    lines.append("- **Channel-forcing.** Variants must include a clean escape path to a human at any step. A bot that traps the user in a loop is the failure mode this entire pattern exists to prevent.")
+    lines.append("- **Deflection-only reading.** At resolution, both primary metrics must be reported. A team that reports the deflection lift without the CSAT/effort number is in violation of the contract.")
+    lines.append("- **Overweighting low-fit cohorts.** The ICP-fit-stratified retention metric exists to surface the case where a deflection win on low-fit traffic mascots a flat or lossy reading on high-fit traffic.")
+    lines.append("- **Survey-fatigue contamination.** If the post-interaction CSAT survey is also part of `csat-loop-design`, suppress the relational survey for the experiment cohort to avoid contamination.")
+    lines.append("")
+
+    # Substrate
+    lines.append("## 7. Substrate citations")
+    lines.append("")
+    lines.append(f"- Cluster source: from `ticket-cluster-analysis` JSON.")
+    lines.append(f"- ICP layer: `clients/{client}/icp/icp.md` (drives stratification).")
+    lines.append(f"- VoC layer: `clients/{client}/voc/voc.md` (drives customer-language phrasing).")
+    lines.append(f"- Product knowledge: `clients/{client}/product-knowledge/product-knowledge.md` (grounds article-surface variant).")
+    lines.append(f"- Brand voice: `clients/{client}/brand-voice/brand-voice.md` (drives the voice gate).")
+    lines.append("- Pattern grounding: `knowledge/patterns/deflection-is-not-the-goal.md` (the goal is right-routing; both-metrics rule operationalises it).")
+    lines.append("- Pattern grounding: `knowledge/patterns/tickets-are-product-feedback-channel.md` (the experiment reads ticket clusters as product feedback substrate).")
+    lines.append("")
+
+    lines.append("## 8. Next reads")
+    lines.append("")
+    lines.append(f"- After resolution, re-run `skills/ticket-cluster-analysis/bin/ticket-cluster-analysis --client {client}` to confirm the cluster shrank.")
+    lines.append(f"- After resolution, re-run `skills/csat-loop-design/bin/csat-loop-design --client {client}` to confirm CSAT held.")
+    lines.append(f"- Open a goal in `goals/ledger.md` against the predicted lifts; resolve at the experiment close date.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def sample_size_heuristic(cluster_size_corpus: int, holdout_share: float, duration_days: int) -> str:
+    """Heuristic: estimate per-arm sample-size and feasibility."""
+    # Assume the corpus duration was ~30 days; daily ticket rate per cluster:
+    daily_rate = max(1.0, cluster_size_corpus / 30.0)
+    expected_total = int(daily_rate * duration_days)
+    n_variants = 5  # ladder
+    per_arm = max(1, int(expected_total / n_variants))
+    # For a 5pp lift on a binary outcome at p=0.5, n_per_arm ~ 384 (alpha=0.05, power=0.8).
+    # Conservative bar; report against it.
+    needed_per_arm = 384
+    if per_arm >= needed_per_arm:
+        feasibility = "sufficient under standard assumptions"
+    elif per_arm >= needed_per_arm // 2:
+        feasibility = "marginal; expect to extend duration or accept lower power"
+    else:
+        feasibility = "insufficient; extend duration, restrict variants, or pick a higher-volume cluster"
+    return (
+        f"Cluster carried {cluster_size_corpus} tickets in the latest run. Assuming a similar daily rate, "
+        f"expected total over {duration_days} days is ~{expected_total} tickets. With {n_variants} arms, "
+        f"~{per_arm} tickets per arm. Target {needed_per_arm} per arm to detect a 5pp lift on a binary "
+        f"outcome at α=0.05, power=0.80 (conservative). Feasibility: {feasibility}."
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--clusters", required=True)
+    parser.add_argument("--cluster", default=None, help="cluster_id to test (optional; default picks highest-priority)")
+    parser.add_argument("--variant-mode", choices=["ladder", "article-only", "chatbot-only", "community-only"], default="ladder")
+    parser.add_argument("--holdout-share", type=float, default=0.30)
+    parser.add_argument("--duration-days", type=int, default=28)
+    parser.add_argument(
+        "--measure-deflection-only", action="store_true",
+        help="(refused; included only to demonstrate the refusal exists)",
+    )
+    parser.add_argument("--out-dir", default=None)
+    args = parser.parse_args()
+
+    if args.measure_deflection_only:
+        print(
+            "REFUSED: deflection-only-measurement, the both-metrics rule is non-negotiable. "
+            "Per the deflection-is-not-the-goal pattern, an experiment that measures deflection "
+            "without measuring effort or CSAT is the failure mode the pattern exists to prevent.",
+            file=sys.stderr,
+        )
+        return 3
+
+    if args.holdout_share < HOLDOUT_FLOOR:
+        print(
+            f"REFUSED: holdout-too-small, --holdout-share={args.holdout_share} is below the 0.10 floor. "
+            "An experiment without a meaningful holdout has no read.",
+            file=sys.stderr,
+        )
+        return 3
+
+    if args.duration_days < DURATION_FLOOR_DAYS:
+        print(
+            f"REFUSED: duration-too-short, --duration-days={args.duration_days} below the 14-day floor. "
+            "Per the engagement-decay-as-relevance-signal pattern and standard A/B test discipline, sub-2-week "
+            "windows do not produce stable reads.",
+            file=sys.stderr,
+        )
+        return 3
+
+    # Substrate preflight
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    fails: list[str] = []
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{args.client}/")
+    else:
+        for layer in ("icp", "voc", "product-knowledge", "brand-voice"):
+            if not (client_root / layer).is_dir() and not (client_root / f"{layer}.md").is_file():
+                fails.append(f"{layer} layer missing: clients/{args.client}/{layer}/")
+    if fails:
+        print("REFUSED: substrate-gap (icp + voc + product-knowledge + brand-voice required)", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        return 3
+
+    clusters_path = Path(args.clusters).resolve()
+    if not clusters_path.is_file():
+        print(f"REFUSED: missing-clusters, {clusters_path} not found", file=sys.stderr)
+        return 3
+    try:
+        clusters_doc = json.loads(clusters_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"REFUSED: missing-clusters, JSON parse error: {e}", file=sys.stderr)
+        return 3
+
+    try:
+        cluster = pick_cluster(clusters_doc, args.cluster)
+    except KeyError as e:
+        print(f"REFUSED: cluster-not-found, '{e.args[0]}' not in input or input has no clusters", file=sys.stderr)
+        return 3
+
+    if cluster.get("size", 0) < MIN_CLUSTER_VOLUME:
+        print(
+            f"REFUSED: insufficient-volume, cluster '{cluster.get('cluster_id','')}' has size "
+            f"{cluster.get('size',0)} (minimum {MIN_CLUSTER_VOLUME}). "
+            "A test against a sub-50-ticket cluster cannot produce a reliable read in a reasonable window.",
+            file=sys.stderr,
+        )
+        return 3
+
+    # Compose
+    suggested_topic = cluster.get("suggested_topic") or cluster.get("label", "this topic")
+    variants = compose_variants(args.variant_mode, cluster, suggested_topic)
+
+    # Voice gate over all customer-facing copy
+    union = "\n\n".join(v.get("customer_facing_copy", "") for v in variants)
+    passed, findings = voice_gate(union)
+    if not passed:
+        print("REFUSED: voice-gate-failed", file=sys.stderr)
+        for f in findings:
+            print(f"  - {f}", file=sys.stderr)
+        return 3
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    contract = measurement_contract(today, args.duration_days)
+
+    sample_size_note = sample_size_heuristic(
+        cluster.get("size", 0), args.holdout_share, args.duration_days
+    )
+
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else SUBSTRATE_ROOT / "clients" / args.client / "support"
+    cid = cluster.get("cluster_id", "unknown")
+    md_path = out_dir / f"deflection-experiment-{cid}-{today}.md"
+    json_path = out_dir / f"deflection-experiment-{cid}-{today}.json"
+
+    write_md(
+        md_path,
+        client=args.client,
+        today=today,
+        cluster=cluster,
+        variants=variants,
+        holdout_share=args.holdout_share,
+        duration_days=args.duration_days,
+        contract=contract,
+        voice_gate_findings=findings,
+        sample_size_note=sample_size_note,
+    )
+
+    payload = {
+        "client": args.client,
+        "generated_at": today,
+        "cluster": cluster,
+        "variants": variants,
+        "holdout_share": args.holdout_share,
+        "duration_days": args.duration_days,
+        "measurement_contract": contract,
+        "sample_size_note": sample_size_note,
+        "voice_gate_passed": passed,
+        "voice_gate_findings": findings,
+        "patterns_grounded": ["deflection-is-not-the-goal", "tickets-are-product-feedback-channel"],
+    }
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    print(f"[deflection-experiment-design] markdown: {md_path}")
+    print(f"[deflection-experiment-design] json:     {json_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

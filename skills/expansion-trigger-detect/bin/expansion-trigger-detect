@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""expansion-trigger-detect, score accounts on behavioral signals for expansion.
+
+Reads events CSV, computes per-account behavioral signals (adoption-breadth,
+value-event density, growth-rate, threshold-proximity), scores each account
+on a weighted composite, and emits a band-stratified trigger queue.
+
+Tenure is *not* the primary axis. Per the
+behavioral-expansion-signals-beat-tenure pattern.
+
+Usage:
+    expansion-trigger-detect --client <client> --events <path> \
+        [--score-band-thresholds cold:0-30,warm:30-60,hot:60-80,burning:80-100] \
+        [--min-tenure-days 7] [--lookback-days 30]
+
+Outputs:
+    clients/<client>/retention/expansion-triggers-<date>.md
+    clients/<client>/retention/expansion-triggers-<date>.json
+    clients/<client>/retention/expansion-triggers-<date>.csv
+
+Exit codes:
+    0, triggers written
+    3, preflight refusal
+    4, invalid args
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+# Default score weights, must sum to 1.0
+WEIGHTS = {
+    "adoption_breadth": 0.30,
+    "value_event_density": 0.30,
+    "growth_rate": 0.25,
+    "threshold_proximity": 0.15,
+}
+
+# Value events to count for density. Pulled from product-knowledge if the
+# layer carries a value-events.md; else fall back to this list.
+DEFAULT_VALUE_EVENTS = {
+    "first_value_event",
+    "invited_teammate",
+    "integration_added",
+    "session_active",
+    "seat_added",
+}
+
+# Pricing-tier thresholds, fallback if product-knowledge silent.
+# Format: tier_name -> (axis, threshold). axis is one of seat_count, value_events_30d.
+DEFAULT_TIER_THRESHOLDS = [
+    ("starter -> team", "seat_count", 5),
+    ("team -> business", "seat_count", 25),
+]
+
+
+def parse_ts(value: str) -> datetime | None:
+    if not value:
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def load_events(path: Path) -> tuple[list[dict], int, set[str]]:
+    rows: list[dict] = []
+    event_names: set[str] = set()
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or not all(c in reader.fieldnames for c in ("user_id", "event_name", "ts")):
+            raise ValueError(f"events CSV missing required columns. Found: {reader.fieldnames}")
+        for raw in reader:
+            ts = parse_ts(raw.get("ts", ""))
+            if not ts:
+                continue
+            rows.append({
+                "user_id": raw["user_id"],
+                "event_name": raw["event_name"],
+                "ts": ts,
+                "props": {k: v for k, v in raw.items() if k.startswith("property_")},
+            })
+            event_names.add(raw["event_name"])
+    return rows, len(rows), event_names
+
+
+def index_by_workspace(rows: list[dict]) -> dict[str, list[dict]]:
+    """Bucket events by workspace_id (or by user_id if workspace_id absent).
+
+    The 'account' is the workspace; users within a workspace contribute to the
+    same account's signals.
+    """
+    by_acct: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        ws = r["props"].get("property_workspace_id") or r["user_id"]
+        by_acct[ws].append(r)
+    for k in by_acct:
+        by_acct[k].sort(key=lambda x: x["ts"])
+    return by_acct
+
+
+def signup_ts(events: list[dict]) -> datetime | None:
+    for ev in events:
+        if ev["event_name"] == "signup":
+            return ev["ts"]
+    return events[0]["ts"] if events else None
+
+
+def latest_ts_in(rows: list[dict]) -> datetime:
+    return max((r["ts"] for r in rows), default=datetime.now(timezone.utc))
+
+
+def parse_band_thresholds(spec: str) -> list[tuple[str, int, int]]:
+    """Parse `name1:lo-hi,name2:lo-hi` into [(name, lo, hi), ...]."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            continue
+        name, rng = part.split(":", 1)
+        if "-" not in rng:
+            continue
+        lo_s, hi_s = rng.split("-", 1)
+        try:
+            lo, hi = int(lo_s), int(hi_s)
+        except ValueError:
+            continue
+        out.append((name.strip(), lo, hi))
+    out.sort(key=lambda x: x[1])
+    return out
+
+
+def band_for_score(score: float, bands: list[tuple[str, int, int]]) -> str:
+    for name, lo, hi in bands:
+        if lo <= score < hi:
+            return name
+    if bands:
+        # cap into top band
+        return bands[-1][0]
+    return "unbanded"
+
+
+def compute_account_signals(
+    account_id: str,
+    events: list[dict],
+    today: datetime,
+    lookback_days: int,
+    value_events: set[str],
+    tier_thresholds: list[tuple[str, str, int]],
+) -> dict:
+    """Compute per-account behavioral signals."""
+    if not events:
+        return {}
+    signup = signup_ts(events)
+    if signup is None:
+        return {}
+    tenure_days = (today - signup).days
+
+    # Adoption breadth: distinct value events touched.
+    distinct_value = {ev["event_name"] for ev in events if ev["event_name"] in value_events}
+
+    # Value-event density (lookback): count of value events in the past lookback_days.
+    lookback_start = today - timedelta(days=lookback_days)
+    value_events_in_window = sum(
+        1 for ev in events if ev["event_name"] in value_events and ev["ts"] >= lookback_start
+    )
+    # Active days in lookback (distinct day-buckets where session_active fired)
+    active_days = {
+        ev["ts"].date()
+        for ev in events
+        if ev["event_name"] == "session_active" and ev["ts"] >= lookback_start
+    }
+    value_density_per_active_day = (
+        value_events_in_window / max(len(active_days), 1) if active_days else 0.0
+    )
+
+    # Growth rate: seat or team_size growth across the lookback window.
+    seat_series = []
+    for ev in events:
+        ts = ev["ts"]
+        if ts < lookback_start:
+            continue
+        team_size_str = ev["props"].get("property_team_size", "")
+        try:
+            seats = int(team_size_str)
+            seat_series.append((ts, seats))
+        except (ValueError, TypeError):
+            continue
+    seat_series.sort(key=lambda x: x[0])
+    if len(seat_series) >= 2:
+        first_seats = seat_series[0][1]
+        last_seats = seat_series[-1][1]
+        growth_pct = ((last_seats - first_seats) / first_seats * 100.0) if first_seats else 0.0
+    else:
+        first_seats = last_seats = (seat_series[0][1] if seat_series else 0)
+        growth_pct = 0.0
+
+    # Plan changes: detect upgrade events
+    upgraded_in_window = any(
+        ev["event_name"] in {"upgrade_initiated", "paid_started", "seat_added"}
+        and ev["ts"] >= lookback_start
+        for ev in events
+    )
+
+    # Threshold proximity: distance from the next pricing tier as a 0-100 score.
+    # 100 = at or past threshold. 0 = no signal or too far.
+    tier_signals: list[dict] = []
+    for tier_name, axis, threshold in tier_thresholds:
+        if axis == "seat_count":
+            current = last_seats
+        elif axis == "value_events_30d":
+            current = value_events_in_window
+        else:
+            continue
+        if current <= 0 or threshold <= 0:
+            continue
+        ratio = current / threshold
+        # crossed -> 100; within 10% below -> 80; within 25% below -> 50; else 0
+        if ratio >= 1.0:
+            proximity = 100.0
+        elif ratio >= 0.9:
+            proximity = 80.0
+        elif ratio >= 0.75:
+            proximity = 50.0
+        elif ratio >= 0.5:
+            proximity = 25.0
+        else:
+            proximity = 0.0
+        tier_signals.append({
+            "tier": tier_name,
+            "axis": axis,
+            "current": current,
+            "threshold": threshold,
+            "proximity_score": proximity,
+        })
+    threshold_proximity = max((t["proximity_score"] for t in tier_signals), default=0.0)
+
+    # Normalize component scores to 0-100 each.
+    # adoption breadth: distinct value events / max-possible (len(value_events))
+    max_breadth = max(len(value_events), 1)
+    adoption_breadth_score = min(100.0, len(distinct_value) / max_breadth * 100.0)
+    # density: cap at p90-ish, 5 events per active day = 100; scale linearly
+    density_score = min(100.0, value_density_per_active_day / 5.0 * 100.0)
+    # growth rate: clamp; 50% growth in window = 100
+    growth_score = max(0.0, min(100.0, growth_pct / 50.0 * 100.0))
+
+    composite = (
+        WEIGHTS["adoption_breadth"] * adoption_breadth_score
+        + WEIGHTS["value_event_density"] * density_score
+        + WEIGHTS["growth_rate"] * growth_score
+        + WEIGHTS["threshold_proximity"] * threshold_proximity
+    )
+
+    plan = ""
+    for ev in reversed(events):
+        plan = ev["props"].get("property_plan", "")
+        if plan:
+            break
+
+    return {
+        "account_id": account_id,
+        "tenure_days": tenure_days,
+        "current_plan": plan,
+        "current_seats": last_seats,
+        "first_seats_in_window": first_seats,
+        "seat_growth_pct": round(growth_pct, 1),
+        "distinct_value_events": sorted(distinct_value),
+        "adoption_breadth_score": round(adoption_breadth_score, 1),
+        "value_events_in_window": value_events_in_window,
+        "active_days_in_window": len(active_days),
+        "value_density_per_active_day": round(value_density_per_active_day, 2),
+        "value_density_score": round(density_score, 1),
+        "growth_score": round(growth_score, 1),
+        "tier_signals": tier_signals,
+        "threshold_proximity_score": round(threshold_proximity, 1),
+        "composite_score": round(composite, 1),
+        "upgraded_in_window": upgraded_in_window,
+    }
+
+
+def rationale_for(signals: dict) -> str:
+    parts = []
+    if signals["threshold_proximity_score"] >= 80:
+        tiers = [t for t in signals["tier_signals"] if t["proximity_score"] >= 80]
+        if tiers:
+            parts.append(f"crossing tier threshold ({tiers[0]['tier']}: {tiers[0]['current']}/{tiers[0]['threshold']} {tiers[0]['axis']})")
+    if signals["seat_growth_pct"] >= 25:
+        parts.append(f"seat growth +{signals['seat_growth_pct']}% in window")
+    if signals["value_density_score"] >= 60:
+        parts.append(f"high value-event density ({signals['value_density_per_active_day']}/active-day)")
+    if signals["adoption_breadth_score"] >= 60:
+        parts.append(f"broad feature adoption ({len(signals['distinct_value_events'])} value events)")
+    if signals["upgraded_in_window"]:
+        parts.append("recent paid upgrade or seat add")
+    if not parts:
+        parts.append("baseline signal; no single trigger crossed threshold")
+    return "; ".join(parts)
+
+
+def recommended_action(signals: dict, band: str) -> str:
+    if band == "burning":
+        return "Trigger AE expansion conversation immediately; account is at or past tier threshold."
+    if band == "hot":
+        return "CSM check-in within 7 days; surface tier comparison + outcomes proof."
+    if band == "warm":
+        return "In-product nudge for adjacent value event; CSM low-touch monitoring."
+    return "No action; revisit in next routine."
+
+
+def write_md(
+    out_path: Path,
+    client: str,
+    events_path: Path,
+    events_count: int,
+    today: str,
+    triggers: list[dict],
+    band_counts: dict,
+    bands: list[tuple[str, int, int]],
+    weights: dict,
+    lookback_days: int,
+    skipped_young: int,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: expansion triggers, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [behavioral-expansion-signals-beat-tenure, retention-cohort-curves-over-blended-rates]")
+    lines.append(f"client: {client}")
+    lines.append(f"events_source: {events_path}")
+    lines.append(f"lookback_days: {lookback_days}")
+    lines.append(f"weights: {weights}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Expansion triggers, {client}, {today}")
+    lines.append("")
+    lines.append(f"Source: `{events_path}` (rows: {events_count}; ingested {today})")
+    lines.append("")
+    lines.append(
+        "Per `knowledge/patterns/behavioral-expansion-signals-beat-tenure.md`: tenure is not the primary gate. The composite score reads behavioral signals "
+        f"(adoption breadth × {weights['adoption_breadth']}, value-event density × {weights['value_event_density']}, "
+        f"growth rate × {weights['growth_rate']}, threshold proximity × {weights['threshold_proximity']}). Tenure < min-tenure-days excludes; otherwise it's a tie-breaker."
+    )
+    lines.append("")
+    if skipped_young:
+        lines.append(f"_Skipped {skipped_young} accounts younger than the min-tenure window. Behavioral signal in week one is unreliable._")
+        lines.append("")
+
+    lines.append("## Score distribution by band")
+    lines.append("")
+    lines.append("| Band | Range | Count |")
+    lines.append("|---|---|---:|")
+    for name, lo, hi in bands:
+        lines.append(f"| {name} | {lo}-{hi} | {band_counts.get(name, 0)} |")
+    lines.append("")
+
+    lines.append("## Trigger queue (top 20 by composite score)")
+    lines.append("")
+    lines.append("| Account | Band | Score | Plan | Seats | Growth | Density | Threshold | Rationale | Action |")
+    lines.append("|---|---|---:|---|---:|---:|---:|---:|---|---|")
+    for t in triggers[:20]:
+        lines.append(
+            f"| `{t['account_id']}` | {t['band']} | {t['composite_score']} | {t.get('current_plan', '')} | "
+            f"{t['current_seats']} | +{t['seat_growth_pct']}% | {t['value_density_score']} | "
+            f"{t['threshold_proximity_score']} | {t['rationale']} | {t['recommended_action']} |"
+        )
+    lines.append("")
+
+    lines.append("## Threshold-proximity flags")
+    lines.append("")
+    flagged = [t for t in triggers if t["threshold_proximity_score"] >= 80]
+    if flagged:
+        lines.append("| Account | Tier | Axis | Current | Threshold |")
+        lines.append("|---|---|---|---:|---:|")
+        for t in flagged:
+            for ts in t["tier_signals"]:
+                if ts["proximity_score"] >= 80:
+                    lines.append(f"| `{t['account_id']}` | {ts['tier']} | {ts['axis']} | {ts['current']} | {ts['threshold']} |")
+    else:
+        lines.append("No accounts within 10% of a tier threshold.")
+    lines.append("")
+
+    lines.append("## Recent upgrades (in window)")
+    lines.append("")
+    upgraded = [t for t in triggers if t.get("upgraded_in_window")]
+    if upgraded:
+        lines.append(f"{len(upgraded)} accounts upgraded or added seats in the last {lookback_days} days. These are warm follow-up candidates for the next tier.")
+        lines.append("")
+        for t in upgraded[:10]:
+            lines.append(f"- `{t['account_id']}`: now on `{t.get('current_plan', '')}`, {t['current_seats']} seats")
+    else:
+        lines.append("_No upgrade events in the window._")
+    lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- Events export: `{events_path}` (rows: {events_count})")
+    lines.append(f"- ICP layer: `clients/{client}/icp/icp.md` (high-fit identification)")
+    lines.append(f"- Product knowledge: `clients/{client}/product-knowledge/product-knowledge.md` (tier thresholds + value-event taxonomy)")
+    lines.append("- Pattern grounding: `knowledge/patterns/behavioral-expansion-signals-beat-tenure.md` (behavioral over tenure).")
+    lines.append("- Pattern grounding: `knowledge/patterns/retention-cohort-curves-over-blended-rates.md` (cohort-conditioned reading).")
+    lines.append("")
+
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append("- `routines/expansion-watcher.md`, schedule weekly run.")
+    lines.append("- `skills/narrative-compose/`, compose in-product nudge or AE talk track from the trigger queue.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_json_csv(
+    json_path: Path,
+    csv_path: Path,
+    payload: dict,
+    triggers: list[dict],
+) -> None:
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    cols = [
+        "account_id", "band", "composite_score", "current_plan", "current_seats",
+        "seat_growth_pct", "value_density_score", "threshold_proximity_score",
+        "adoption_breadth_score", "growth_score", "rationale", "recommended_action",
+        "tenure_days", "upgraded_in_window",
+    ]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=cols)
+        writer.writeheader()
+        for t in triggers:
+            writer.writerow({k: t.get(k, "") for k in cols})
+
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/")
+    if not (client_root / "product-knowledge").is_dir() and not (client_root / "product-knowledge.md").is_file():
+        fails.append(f"product-knowledge layer missing: clients/{client}/product-knowledge/")
+    return len(fails) == 0, fails
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--events", required=True)
+    parser.add_argument("--score-band-thresholds", default="cold:0-30,warm:30-60,hot:60-80,burning:80-101")
+    parser.add_argument("--min-tenure-days", type=int, default=7)
+    parser.add_argument("--lookback-days", type=int, default=30)
+    parser.add_argument("--strict-substrate", action="store_true")
+    args = parser.parse_args()
+
+    events_path = Path(args.events).resolve()
+    if not events_path.is_file():
+        print(f"REFUSED: events CSV not found at {events_path}", file=sys.stderr)
+        return 3
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        if args.strict_substrate:
+            return 3
+        print("  (continuing without substrate; outputs will use default tier thresholds)", file=sys.stderr)
+
+    try:
+        rows, count, _ = load_events(events_path)
+    except ValueError as e:
+        print(f"REFUSED: missing-events-export, {e}", file=sys.stderr)
+        return 3
+
+    by_acct = index_by_workspace(rows)
+    if not by_acct:
+        print("REFUSED: events file has no parseable rows", file=sys.stderr)
+        return 3
+
+    bands = parse_band_thresholds(args.score_band_thresholds)
+    today_dt = max(r["ts"] for r in rows)
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    print(
+        f"[expansion-trigger-detect] client={args.client} events={events_path.name} "
+        f"accounts={len(by_acct)} bands={[b[0] for b in bands]}",
+        file=sys.stderr,
+    )
+
+    triggers: list[dict] = []
+    skipped_young = 0
+    for acct, events in by_acct.items():
+        signals = compute_account_signals(
+            acct, events, today_dt, args.lookback_days, DEFAULT_VALUE_EVENTS, DEFAULT_TIER_THRESHOLDS
+        )
+        if not signals:
+            continue
+        if signals["tenure_days"] < args.min_tenure_days:
+            skipped_young += 1
+            continue
+        signals["band"] = band_for_score(signals["composite_score"], bands)
+        signals["rationale"] = rationale_for(signals)
+        signals["recommended_action"] = recommended_action(signals, signals["band"])
+        triggers.append(signals)
+
+    triggers.sort(key=lambda x: -x["composite_score"])
+
+    band_counts: dict = defaultdict(int)
+    for t in triggers:
+        band_counts[t["band"]] += 1
+
+    out_dir = SUBSTRATE_ROOT / "clients" / args.client / "retention"
+    md_path = out_dir / f"expansion-triggers-{today_str}.md"
+    json_path = out_dir / f"expansion-triggers-{today_str}.json"
+    csv_path = out_dir / f"expansion-triggers-{today_str}.csv"
+
+    write_md(
+        md_path,
+        client=args.client,
+        events_path=events_path,
+        events_count=count,
+        today=today_str,
+        triggers=triggers,
+        band_counts=dict(band_counts),
+        bands=bands,
+        weights=WEIGHTS,
+        lookback_days=args.lookback_days,
+        skipped_young=skipped_young,
+    )
+    write_json_csv(
+        json_path,
+        csv_path,
+        payload={
+            "client": args.client,
+            "generated_at": today_str,
+            "events_source": str(events_path),
+            "events_row_count": count,
+            "weights": WEIGHTS,
+            "lookback_days": args.lookback_days,
+            "min_tenure_days": args.min_tenure_days,
+            "bands": [{"name": n, "lo": lo, "hi": hi} for n, lo, hi in bands],
+            "band_counts": dict(band_counts),
+            "skipped_young": skipped_young,
+            "triggers": triggers,
+        },
+        triggers=triggers,
+    )
+
+    print(f"[expansion-trigger-detect] triggers: {len(triggers)} (skipped young: {skipped_young})", file=sys.stderr)
+    print(f"[expansion-trigger-detect] markdown: {md_path}")
+    print(f"[expansion-trigger-detect] json:     {json_path}")
+    print(f"[expansion-trigger-detect] csv:      {csv_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

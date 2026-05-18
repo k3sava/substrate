@@ -1,0 +1,27 @@
+company,domain,industry,size,geo,tech_stack,signals,strategic,logo_value,vertical_leader
+Acme Health,acmehealth.example,healthcare-saas,250,US,salesforce|hubspot|aircall,g2|pricing-page,true,high,true
+Bluewave Logistics,bluewave.example,logistics,1200,EU,sap|cloudtalk,homepage|webinar,false,med,false
+Catalyst Edu,catalyst.example,edtech,80,US,intercom|hubspot,doc-visit|webinar,false,low,false
+Dorian Capital,dorianvc.example,fintech,150,US,salesforce|outreach|kixie,demo-request,true,high,true
+Elementai Robotics,elementai.example,robotics,400,JP,zendesk|aloware,g2|review|ad-click,false,med,false
+Forge Industrial,forge.example,manufacturing,2500,US,oracle|dialpad,pricing-page,true,high,true
+Granite Insurance,granite.example,insurance,1800,UK,salesforce|gohighlevel,homepage,false,med,false
+Helio Solar,helio.example,energy-saas,90,DE,hubspot|aircall,g2|webinar|pricing-page,false,low,false
+Indigo Talent,indigo.example,hr-tech,180,US,greenhouse|aircall,doc-visit,false,low,false
+Juniper Realty,juniper.example,proptech,320,US,salesforce|cloudtalk,homepage|ad-click,false,med,true
+Kestrel Cyber,kestrel.example,cybersecurity,260,US,salesforce|hubspot,demo-request|g2,true,high,false
+Lumina Media,lumina.example,media-saas,140,US,intercom|cloudtalk,doc-visit|webinar,false,low,false
+Meridian Bank,meridian.example,banking,9500,EU,salesforce|aircall|outreach,homepage|pricing-page,true,high,true
+Nimbus Education,nimbus.example,edtech,50,US,intercom,homepage,false,low,false
+Olive Pharma,olivepharma.example,pharma,3500,EU,sap|aircall,demo-request|webinar,true,high,false
+Polaris Auto,polaris.example,automotive,4200,US,oracle|dialpad,homepage,false,med,true
+Quartz Logistics,quartz.example,logistics,950,US,salesforce|cloudtalk|kixie,g2|review,false,med,false
+Redwood Foods,redwood.example,food-manufacturing,2100,US,sap|gohighlevel,homepage,false,low,false
+Sapphire Mobility,sapphire.example,mobility-saas,310,US,hubspot|aircall|outreach,demo-request|webinar,true,high,true
+Tundra Hosting,tundra.example,hosting,180,CA,intercom|aloware,doc-visit,false,low,false
+Umber Studios,umber.example,gaming,420,US,zendesk|cloudtalk,g2|ad-click,false,med,false
+Volt Mobility,volt.example,mobility-saas,140,EU,intercom|kixie,homepage|webinar,false,low,false
+Westport Marine,westport.example,marine,560,US,oracle|dialpad,homepage,false,med,false
+Xenon Robotics,xenon.example,robotics,200,US,salesforce|aircall,demo-request|g2,true,high,true
+Yellow Apparel,yellow.example,retail-apparel,1100,US,shopify|gohighlevel,homepage|ad-click,false,low,false
+Zephyr Wellness,zephyr.example,wellness,75,US,intercom|aircall,doc-visit|webinar,false,low,false

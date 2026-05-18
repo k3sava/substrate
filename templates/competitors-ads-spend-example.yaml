@@ -1,0 +1,116 @@
+# competitor paid-ads tracking schema
+#
+# One file per competitor, stored at:
+#   clients/<client>/ads/competitive/<competitor-slug>.yaml
+#
+# Updated quarterly via competitive-scout signal review or manual entry.
+# Citations are required for any number; the format is the substrate evidence ladder.
+
+competitor: <competitor-slug>
+display_name: <Competitor Display Name>
+last_verified: <YYYY-MM-DD>
+verified_by: <operator-name>
+
+# Spend signals across paid channels.
+# Cite a source for every estimate. Acceptable sources:
+#   - SimilarWeb / SEMrush / Ahrefs paid-search estimates
+#   - Meta Ad Library (qualitative; volume of active creatives)
+#   - LinkedIn Ad Library (qualitative; volume + role-targeting indicators)
+#   - Founder/CEO public posts ("we spend $X/mo on Meta")
+#   - Glassdoor / LinkedIn job postings ("paid acquisition lead, $200k budget")
+#   - Industry analyst reports (Gartner, Forrester, niche analysts)
+spend:
+  google_search:
+    estimated_monthly_usd: <integer or "unknown">
+    confidence: <verified | self-reported | contextual | indirect | direct>
+    source: <URL or substrate path>
+    last_observed: <YYYY-MM-DD>
+    notes: |
+      Free-form. Bid signals (top-of-page rate, ad rank trend), category share-of-voice,
+      brand vs nonbrand split if observable.
+
+  google_pmax:
+    estimated_monthly_usd: <integer or "unknown">
+    confidence: <verified | self-reported | contextual | indirect | direct>
+    source: <URL or substrate path>
+    last_observed: <YYYY-MM-DD>
+
+  meta_paid_social:
+    estimated_monthly_usd: <integer or "unknown">
+    active_creatives_count: <integer>
+    creative_cadence: <weekly_new_count: integer or "unknown">
+    confidence: <verified | self-reported | contextual | indirect | direct>
+    source: <Meta Ad Library URL>
+    last_observed: <YYYY-MM-DD>
+    notes: |
+      Hook patterns observed (stat-led, customer-led, demo-led, founder-led).
+      Audience indicators (interest tags inferred from creative messaging).
+      Funnel stage (prospecting / retargeting / both).
+
+  linkedin_sponsored:
+    estimated_monthly_usd: <integer or "unknown">
+    targeting_signals: |
+      Roles, seniorities, company sizes inferred from the creative copy
+      and the LinkedIn Ad Library targeting reveal.
+    confidence: <verified | self-reported | contextual | indirect | direct>
+    source: <LinkedIn Ad Library URL>
+    last_observed: <YYYY-MM-DD>
+
+  tiktok_paid_social:
+    estimated_monthly_usd: <integer or "unknown">
+    confidence: <verified | self-reported | contextual | indirect | direct>
+    source: <URL>
+    last_observed: <YYYY-MM-DD>
+
+  x_paid_social:
+    estimated_monthly_usd: <integer or "unknown">
+    confidence: <verified | self-reported | contextual | indirect | direct>
+    source: <URL>
+    last_observed: <YYYY-MM-DD>
+
+  youtube_paid:
+    estimated_monthly_usd: <integer or "unknown">
+    confidence: <verified | self-reported | contextual | indirect | direct>
+    source: <URL>
+    last_observed: <YYYY-MM-DD>
+
+  reddit_paid:
+    estimated_monthly_usd: <integer or "unknown">
+    confidence: <verified | self-reported | contextual | indirect | direct>
+    source: <URL>
+    last_observed: <YYYY-MM-DD>
+
+# What the competitor's paid program is signaling about their GTM motion.
+# These fields feed competitive-scout and the messaging-matrix.
+gtm_signals:
+  primary_buyer_state: <unaware | problem-aware | solution-aware | most-aware>
+  primary_funnel_emphasis: <demand-gen | demand-capture | both>
+  category_definition_attempt: |
+    Are they trying to define a new category, or compete inside one?
+    Cite the headline copy that supports the read.
+  status_quo_target: |
+    What incumbent / behavior are they framing as the alternative?
+    (Spreadsheets, manual outreach, legacy vendor by name, "doing nothing.")
+  named_competitor_targets:
+    - competitor: <slug>
+      framing: <"vs" page | comparison ad | switcher offer>
+      url: <if applicable>
+
+# Specific creatives + LPs worth tracking.
+# These get pulled into the competitive layer for displacement framing.
+notable_creatives:
+  - id: <slug>
+    channel: <google_search | meta_paid_social | linkedin_sponsored | ...>
+    url_or_screenshot: <path or URL>
+    hook: <one-line description of the opening creative>
+    lp_destination: <URL>
+    funnel_stage: <prospecting | retargeting | both>
+    observed_date: <YYYY-MM-DD>
+    notes: |
+      What's strong, what's weak, what we should learn from or counter.
+
+# Updates that should propagate when this file changes.
+propagation_targets:
+  - clients/<client>/04-competitive/battle-cards/<competitor>.md
+  - clients/<client>/ads/competitive/_observed-creative-patterns.md
+  - clients/<client>/06-conversion-narrative.md  (if status-quo target changed)

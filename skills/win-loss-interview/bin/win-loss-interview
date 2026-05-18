@@ -1,0 +1,737 @@
+#!/usr/bin/env bash
+# win-loss-interview — substrate skill runtime (v2.0)
+#
+# Generates positioning-aware interview scripts; captures structured
+# interviews; scores them against an objective rubric; aggregates a
+# quarter into ranked deal-pattern drivers. Refuses without canonical
+# positioning, without a deal-id, or without enough corpus to aggregate.
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+MODE=""
+DEAL_ID=""
+OUTCOME=""
+ALTERNATIVE=""
+PARTICIPANT=""
+TRANSCRIPT=""
+LOSS_AMOUNT=""
+QUARTER=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)                  CLIENT="$2"; shift 2 ;;
+    --mode)                    MODE="$2"; shift 2 ;;
+    --deal-id)                 DEAL_ID="$2"; shift 2 ;;
+    --outcome)                 OUTCOME="$2"; shift 2 ;;
+    --alternative-considered)  ALTERNATIVE="$2"; shift 2 ;;
+    --participant)             PARTICIPANT="$2"; shift 2 ;;
+    --transcript)              TRANSCRIPT="$2"; shift 2 ;;
+    --loss-amount)             LOSS_AMOUNT="$2"; shift 2 ;;
+    --quarter)                 QUARTER="$2"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+win-loss-interview — script, capture, score, aggregate
+
+Usage:
+  win-loss-interview --client <c> --mode script --deal-id <id> --outcome <o> [--participant <name>]
+  win-loss-interview --client <c> --mode capture --deal-id <id> --outcome <o> --alternative-considered <slug> [--loss-amount <usd>]
+  win-loss-interview --client <c> --mode score --deal-id <id> --transcript <path>
+  win-loss-interview --client <c> --mode aggregate [--quarter <YYYY-Qn>]
+
+See skills/win-loss-interview/SKILL.md for full spec.
+EOF
+      exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+if [ -z "$CLIENT" ]; then
+  echo "ERR: --client required" >&2
+  echo "  try: win-loss-interview --help" >&2
+  exit 4
+fi
+if [ -z "$MODE" ]; then
+  echo "ERR: --mode required (script|capture|score|aggregate)" >&2
+  exit 4
+fi
+
+skill_preflight "win-loss-interview" "$CLIENT" || exit 3
+
+# Refusal: missing canonical positioning
+POS_FILE=$(ls "$SUBSTRATE_ROOT/clients/$CLIENT/positioning/positioning-canonical-statement"*.md 2>/dev/null | head -1)
+if [ -z "$POS_FILE" ] && [ ! -f "$SUBSTRATE_ROOT/clients/$CLIENT/positioning/positioning-canonical-statement.md" ]; then
+  echo "REFUSED: missing-positioning" >&2
+  echo "  no canonical statement at clients/$CLIENT/positioning/positioning-canonical-statement*.md" >&2
+  echo "  run: substrate positioning-forge --diagnose --client $CLIENT" >&2
+  exit 3
+fi
+POS_FILE="${POS_FILE:-$SUBSTRATE_ROOT/clients/$CLIENT/positioning/positioning-canonical-statement.md}"
+
+WL_DIR="$SUBSTRATE_ROOT/clients/$CLIENT/win-loss"
+mkdir -p "$WL_DIR"
+
+exec /usr/bin/env python3 - "$SUBSTRATE_ROOT" "$CLIENT" "$MODE" "$DEAL_ID" "$OUTCOME" "$ALTERNATIVE" "$PARTICIPANT" "$TRANSCRIPT" "$LOSS_AMOUNT" "$QUARTER" "$POS_FILE" <<'PYEOF'
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timezone, date
+from pathlib import Path
+
+(SR, CLIENT, MODE, DEAL_ID, OUTCOME, ALTERNATIVE, PARTICIPANT, TRANSCRIPT,
+ LOSS_AMOUNT, QUARTER, POS_FILE) = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6],
+    sys.argv[7], sys.argv[8], sys.argv[9], sys.argv[10], sys.argv[11],
+)
+
+SUBSTRATE_ROOT = Path(SR)
+CLIENT_ROOT = SUBSTRATE_ROOT / "clients" / CLIENT
+WL_DIR = CLIENT_ROOT / "win-loss"
+WL_DIR.mkdir(parents=True, exist_ok=True)
+TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def refuse(reason, detail=""):
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    sys.exit(3)
+
+
+def read_positioning():
+    """Extract canonical statement + load-bearing terms from positioning file."""
+    text = Path(POS_FILE).read_text(encoding="utf-8")
+    canonical = ""
+    in_block = False
+    for line in text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(canonical|the position|statement|positioning)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block and s.startswith("#"):
+            in_block = False
+        if in_block and s:
+            canonical = s.lstrip("*").strip()
+            if canonical:
+                break
+    if not canonical:
+        canonical = text.splitlines()[0] if text.splitlines() else ""
+
+    cat = ""
+    alts = []
+    m = re.search(r"\bis the ([A-Za-z][\w\s-]+?) that", canonical, re.IGNORECASE)
+    if m:
+        cat = m.group(1).strip()
+    m = re.search(r"\bunlike ([A-Za-z][\w\s,-]+?)(?:\.|$)", canonical, re.IGNORECASE)
+    if m:
+        alts = [a.strip() for a in m.group(1).split(",") if a.strip()]
+    audience_match = re.search(r"^For ([^,]+),", canonical, re.IGNORECASE)
+    audience = audience_match.group(1).strip() if audience_match else ""
+
+    return {"canonical": canonical, "category": cat, "alternatives": alts, "audience": audience}
+
+
+def read_quarter(q):
+    if q:
+        return q
+    today = date.today()
+    qn = (today.month - 1) // 3 + 1
+    return f"{today.year}-Q{qn}"
+
+
+def quarter_window(q):
+    """Return (start_date, end_date) for a YYYY-Qn quarter."""
+    m = re.match(r"(\d{4})-Q([1-4])", q)
+    if not m:
+        return (None, None)
+    y = int(m.group(1))
+    qn = int(m.group(2))
+    start_month = (qn - 1) * 3 + 1
+    start = date(y, start_month, 1)
+    if qn == 4:
+        end = date(y + 1, 1, 1)
+    else:
+        end = date(y, start_month + 3, 1)
+    return start, end
+
+
+# ---------------------------------------------------------------- modes ----
+
+def mode_script():
+    if not DEAL_ID:
+        refuse("missing-deal-record", "--deal-id required for script mode")
+    if OUTCOME not in ("won", "lost", "no-decision", "stalled"):
+        refuse("missing-outcome", "--outcome required (won|lost|no-decision|stalled)")
+    pos = read_positioning()
+    out_path = WL_DIR / f"{DEAL_ID}-script.md"
+    parts = []
+    parts.append(f"# Win-loss interview script, {DEAL_ID}, {OUTCOME}, {TODAY}")
+    parts.append("")
+    parts.append(f"**Participant:** {PARTICIPANT or '<TBD>'}  ")
+    parts.append(f"**Outcome:** {OUTCOME}  ")
+    parts.append(f"**Canonical statement under test:** {pos['canonical']}  ")
+    parts.append(f"**Audience in canonical:** {pos['audience'] or '<not extracted>'}  ")
+    parts.append(f"**Category in canonical:** {pos['category'] or '<not extracted>'}  ")
+    parts.append(f"**Named alternatives in canonical:** {', '.join(pos['alternatives']) or '<none>'}  ")
+    parts.append("")
+    parts.append("## Pre-call checklist")
+    parts.append("")
+    parts.append("- Pull the deal record from CRM. Confirm deal-id, owner, and stage history.")
+    parts.append("- Re-read positioning canonical (above) and the head-to-head competitive ledger for any named alternative.")
+    parts.append("- Have on hand: alternatives the buyer evaluated, price quoted, deal duration.")
+    parts.append("- Set up recording with consent. Set the call for 30-45 min; budget 60.")
+    parts.append("")
+    parts.append("## Section 1, Trigger and search")
+    parts.append("")
+    parts.append("Per `knowledge/patterns/jtbd-as-buyer-mental-model.md` (forces of progress framework). Use Voss-style mirrors and labels.")
+    parts.append("")
+    parts.append("1. Tell me about the moment you decided this was worth solving.")
+    parts.append("2. What pushed you from \"fine as-is\" to \"looking\"?")
+    parts.append("3. Walk me through the alternatives you considered, in the order you considered them.")
+    parts.append("   - Probe specifically: status quo, internal build, no-decision, named competitors.")
+    parts.append("4. Who else was in the room when you evaluated? What was their stance?")
+    parts.append("")
+    parts.append("## Section 2, Decision drivers")
+    parts.append("")
+    parts.append("5. What three things mattered most when you compared the options?")
+    parts.append("6. If you could only have got one of those three, which would you have picked?")
+    parts.append("7. When did you decide? What happened in the 24 hours before that decision?")
+    parts.append("")
+    parts.append("## Section 3, Positioning probe (canonical-statement under test)")
+    parts.append("")
+    parts.append("Test whether the canonical statement landed for this buyer. The questions probe each load-bearing term.")
+    parts.append("")
+    if pos["audience"]:
+        parts.append(f"8. When you first heard about us, did you think we were for someone like you ({pos['audience']})? Why or why not?")
+    else:
+        parts.append("8. When you first heard about us, did you think we were for someone like you? Why or why not?")
+    if pos["category"]:
+        parts.append(f"9. How would you describe what we do in one sentence? (Listen for whether the buyer's category-noun matches our \"{pos['category']}\".)")
+    else:
+        parts.append("9. How would you describe what we do in one sentence?")
+    if pos["alternatives"]:
+        parts.append(f"10. We typically frame ourselves against {', '.join(pos['alternatives'])}. Did that framing match your mental model?")
+    else:
+        parts.append("10. Was there an alternative framing of the choice you would have found more useful?")
+    parts.append("")
+    parts.append("## Section 4, What we did well / poorly (Voss-style accusation audit)")
+    parts.append("")
+    parts.append("11. You probably think a few things didn't go well in our process. What were they?")
+    parts.append("12. What's the worst thing you could honestly say about our pitch?")
+    parts.append("13. Where could we have helped you more?")
+    parts.append("")
+
+    if OUTCOME in ("lost", "no-decision", "stalled"):
+        parts.append("## Section 5, What would have changed your mind")
+        parts.append("")
+        parts.append("14. If we could have changed one thing about our pitch, what would have moved the decision?")
+        parts.append("15. Was there evidence you needed that we didn't provide?")
+        parts.append("16. If you had to do this evaluation again next quarter, would the answer be different? Why?")
+        parts.append("17. (no-decision branch) When you went back to status quo, what made staying easier than switching?")
+        parts.append("")
+
+    parts.append("## Section 6, Pricing reaction")
+    parts.append("")
+    parts.append("18. What was your first reaction to the price?")
+    parts.append("19. Did you anchor against any other vendor's price?")
+    parts.append("20. If we had been 30% more expensive, would the answer have been different?")
+    parts.append("21. If we had been 30% cheaper, would the answer have been different?")
+    parts.append("")
+    parts.append("## Section 7, Quote pulls")
+    parts.append("")
+    parts.append("22. (Closing.) If a peer in your shoes asked you whether to evaluate us, what would you tell them in one sentence?")
+    parts.append("23. (Closing.) Anything we did not ask that you wanted to share?")
+    parts.append("")
+    parts.append("## Capture template (for `--mode capture`)")
+    parts.append("")
+    parts.append("After the call, run:")
+    parts.append("```")
+    parts.append(f"substrate win-loss-interview --client {CLIENT} --mode capture --deal-id {DEAL_ID} \\")
+    parts.append(f"  --outcome {OUTCOME} --alternative-considered <slug>")
+    if OUTCOME in ("lost", "no-decision", "stalled"):
+        parts.append("  --loss-amount <usd>")
+    parts.append("```")
+    parts.append("")
+    parts.append("## Substrate citations")
+    parts.append("")
+    parts.append("- Positioning: `clients/" + CLIENT + "/positioning/positioning-canonical-statement.md`")
+    parts.append("- Pattern: `knowledge/patterns/frontline-as-pmm-substrate.md`")
+    parts.append("- Pattern: `knowledge/patterns/jtbd-as-buyer-mental-model.md`")
+    parts.append("- Pattern: `knowledge/patterns/status-quo-is-the-competitor.md`")
+    parts.append("- Pattern: `knowledge/patterns/diagnose-before-execute.md`")
+    parts.append("- Contradiction: `knowledge/contradictions/no-decision-vs-named-competitor.md`")
+
+    out_path.write_text("\n".join(parts), encoding="utf-8")
+    print(f"[win-loss-interview] script: {out_path}")
+
+
+def mode_capture():
+    if not DEAL_ID or not OUTCOME or not ALTERNATIVE:
+        refuse(
+            "missing-deal-record",
+            "--deal-id, --outcome, --alternative-considered all required for capture mode"
+        )
+    if OUTCOME != "won" and not LOSS_AMOUNT:
+        refuse("missing-loss-amount", "--loss-amount required for non-won outcomes")
+    pos = read_positioning()
+    out_path = WL_DIR / f"{DEAL_ID}.md"
+    json_path = WL_DIR / f"{DEAL_ID}.json"
+    if out_path.exists():
+        print(f"  warn: {out_path} already exists; capture is overwriting", file=sys.stderr)
+
+    # Pick contradiction position per the alternative
+    if ALTERNATIVE in ("no-decision", "status-quo", "internal-build"):
+        contradiction_position = "A"
+        rationale = (
+            f"alternative-considered={ALTERNATIVE}: this loss is not to a named competitor; "
+            "the failure mode is the buyer's status quo / no-decision per Dunford. The contradiction "
+            "(no-decision-vs-named-competitor) resolves to Position A: status-quo is the competitor."
+        )
+    else:
+        contradiction_position = "B"
+        rationale = (
+            f"alternative-considered={ALTERNATIVE}: a named competitor was chosen. Position B applies: "
+            "the contradiction resolves to named-competitor-as-real-competitor. The downstream "
+            "battle-card and competitive-scout work targets this competitor."
+        )
+
+    parts = []
+    parts.append("---")
+    parts.append(f"deal_id: {DEAL_ID}")
+    parts.append(f"outcome: {OUTCOME}")
+    parts.append(f"alternative_considered: {ALTERNATIVE}")
+    parts.append(f"participant: {PARTICIPANT}")
+    parts.append(f"loss_amount_usd: {LOSS_AMOUNT or 'null'}")
+    parts.append(f"interview_date: {TODAY}")
+    parts.append("produced_by: win-loss-interview")
+    parts.append("patterns_grounded: [frontline-as-pmm-substrate, status-quo-is-the-competitor, diagnose-before-execute, jtbd-as-buyer-mental-model]")
+    parts.append("contradictions_aware: [no-decision-vs-named-competitor]")
+    parts.append(f"contradiction_positions: [no-decision-vs-named-competitor: {contradiction_position}]")
+    parts.append(f"position_rationale: \"{rationale}\"")
+    parts.append("---")
+    parts.append("")
+    parts.append(f"# Win-loss capture, {DEAL_ID}, {OUTCOME}")
+    parts.append("")
+    parts.append("> Fill the sections below from the live interview. Verbatim quote pulls only. Per `knowledge/patterns/tf-idf-themes-from-customer-language.md`, paraphrasing kills resonance.")
+    parts.append("")
+    parts.append(f"## Contradiction position: {contradiction_position}")
+    parts.append("")
+    parts.append(rationale)
+    parts.append("")
+    parts.append("## 1. Trigger and forces of progress")
+    parts.append("")
+    parts.append("- **Push of the situation (what got worse):**")
+    parts.append("- **Pull of the new (what looked attractive):**")
+    parts.append("- **Anxiety about the new (what worried them):**")
+    parts.append("- **Allegiance to the existing (why staying was easier):**")
+    parts.append("")
+    parts.append("## 2. Alternatives evaluated (in order)")
+    parts.append("")
+    parts.append("| Order | Alternative | Considered duration | Reason eliminated |")
+    parts.append("|---:|---|---|---|")
+    parts.append("| 1 | | | |")
+    parts.append("| 2 | | | |")
+    parts.append("| 3 | | | |")
+    parts.append("")
+    parts.append("## 3. Decision drivers (top three)")
+    parts.append("")
+    parts.append("1. ")
+    parts.append("2. ")
+    parts.append("3. ")
+    parts.append("")
+    parts.append("## 4. Mindset diagnosis (FOMO vs FOMU per Dixon)")
+    parts.append("")
+    parts.append("- **Mindset:** [no-problem | implied-need | explicit-need / FOMO | FOMU / indecision]")
+    parts.append("- **Evidence:** ")
+    parts.append("")
+    parts.append("## 5. Positioning probe (per canonical statement)")
+    parts.append("")
+    parts.append(f"_Canonical:_ {pos['canonical']}")
+    parts.append("")
+    parts.append("- **Did the buyer recognize themselves in the audience?** [yes|no|partial]")
+    parts.append("- **Did the buyer's category noun match ours?** [yes|no|partial]")
+    parts.append("- **Did our framing of the alternatives match theirs?** [yes|no|partial]")
+    parts.append("")
+    parts.append("## 6. Quote pulls (verbatim, with file/timestamp)")
+    parts.append("")
+    parts.append("- ")
+    parts.append("- ")
+    parts.append("- ")
+    parts.append("")
+    parts.append("## 7. Pricing reaction")
+    parts.append("")
+    parts.append("- **First reaction:** ")
+    parts.append("- **Anchor reference:** ")
+    parts.append("- **Counterfactual at 30% more:** ")
+    parts.append("- **Counterfactual at 30% less:** ")
+    parts.append("")
+    parts.append("## 8. Status-quo factor (forces of resistance)")
+    parts.append("")
+    parts.append("- **Stickiness of current process:** [low|medium|high]")
+    parts.append("- **Felt switching cost in dollars/hours:** ")
+    parts.append("- **Internal stakeholder resistance:** ")
+    parts.append("")
+    parts.append("## 9. What we did well / poorly")
+    parts.append("")
+    parts.append("- **Well:** ")
+    parts.append("- **Poorly:** ")
+    parts.append("")
+    parts.append("## 10. What would have changed the decision")
+    parts.append("")
+    parts.append("- ")
+    parts.append("")
+    parts.append("## Substrate updates queued")
+    parts.append("")
+    parts.append("- [ ] `competitive/<vendor>.md` head-to-head updated with this interview's signals")
+    parts.append("- [ ] `competitive/status-quo.md` updated if alternative=status-quo or no-decision")
+    parts.append("- [ ] `positioning/positioning-failures.md` flagged if positioning probe failed")
+    parts.append("- [ ] `voc/processed/win-loss/` cross-link to this file")
+    parts.append("")
+    parts.append("## Substrate citations")
+    parts.append("")
+    parts.append(f"- Positioning: `{Path(POS_FILE).relative_to(SUBSTRATE_ROOT)}`")
+    parts.append(f"- Deal record: CRM ID `{DEAL_ID}` (operator confirms before merging)")
+    parts.append("- Patterns: `knowledge/patterns/{frontline-as-pmm-substrate, status-quo-is-the-competitor, diagnose-before-execute, jtbd-as-buyer-mental-model}.md`")
+    parts.append(f"- Contradiction: `knowledge/contradictions/no-decision-vs-named-competitor.md` (Position {contradiction_position})")
+
+    out_path.write_text("\n".join(parts), encoding="utf-8")
+
+    json_payload = {
+        "deal_id": DEAL_ID,
+        "outcome": OUTCOME,
+        "alternative_considered": ALTERNATIVE,
+        "participant": PARTICIPANT,
+        "loss_amount_usd": float(LOSS_AMOUNT) if LOSS_AMOUNT else None,
+        "interview_date": TODAY,
+        "contradiction_position": contradiction_position,
+        "position_rationale": rationale,
+        "captured_at": TODAY,
+        "status": "captured-needs-fill",
+    }
+    json_path.write_text(json.dumps(json_payload, indent=2), encoding="utf-8")
+
+    print(f"[win-loss-interview] capture: {out_path}")
+    print(f"[win-loss-interview] json:    {json_path}")
+
+
+def mode_score():
+    if not DEAL_ID or not TRANSCRIPT:
+        refuse("missing-args", "--deal-id and --transcript both required for score mode")
+    transcript_path = Path(TRANSCRIPT)
+    if not transcript_path.exists():
+        # try interpret as relative to client dir
+        alt = WL_DIR / TRANSCRIPT
+        if alt.exists():
+            transcript_path = alt
+        else:
+            refuse("missing-transcript", f"path not found: {TRANSCRIPT}")
+    text = transcript_path.read_text(encoding="utf-8")
+    rubric = score_transcript_rubric(text)
+    out_path = WL_DIR / f"{DEAL_ID}-score.json"
+    out_path.write_text(json.dumps(rubric, indent=2), encoding="utf-8")
+    print(f"[win-loss-interview] rubric score: {rubric['rubric_total']}/{rubric['rubric_max']}")
+    for d in rubric["dimension_scores"]:
+        print(f"  - {d['dimension']}: {d['score']}/{d['max']}, {d['signal']}")
+    print(f"[win-loss-interview] score json: {out_path}")
+    if rubric["rubric_total"] / rubric["rubric_max"] < 0.5:
+        sys.exit(1)
+
+
+def score_transcript_rubric(text):
+    """Score the captured/transcript text against an objective rubric.
+
+    Dimensions, each 0-3:
+    - decision_driver_clarity: do we have explicit top 3?
+    - alternatives_surfaced: are 2+ alternatives named with verbatim text?
+    - status_quo_signal: is the status-quo / no-decision angle probed?
+    - quote_pulls_verbatim: do we have at least 3 verbatim quotes?
+    - mindset_diagnosis_present: is FOMO/FOMU/explicit-need labelled?
+    """
+    text_lower = text.lower()
+    dims = []
+
+    # decision-driver-clarity
+    n_drivers = 0
+    if re.search(r"##\s*\d?\.?\s*decision drivers", text_lower):
+        # count enumerated lines under the section
+        m = re.search(
+            r"##\s*\d?\.?\s*decision drivers.*?(?=##|\Z)", text_lower, re.DOTALL
+        )
+        if m:
+            block = m.group(0)
+            n_drivers = sum(
+                1 for ln in block.splitlines()
+                if re.match(r"^\s*\d+\.\s+\S", ln) and not ln.strip().endswith(".")
+            ) + sum(1 for ln in block.splitlines() if re.match(r"^\s*\d+\.\s+\S{8,}", ln))
+            n_drivers = min(n_drivers, 3)
+    dims.append({
+        "dimension": "decision_driver_clarity",
+        "score": n_drivers,
+        "max": 3,
+        "signal": f"{n_drivers} top-3 driver lines found",
+    })
+
+    # alternatives-surfaced
+    alt_indicators = [
+        "alternative", "considered", "evaluated", "looked at",
+        "in-house", "build our own", "spreadsheet", "no decision", "do nothing",
+    ]
+    alt_hits = sum(1 for ind in alt_indicators if ind in text_lower)
+    alt_score = min(3, alt_hits)
+    dims.append({
+        "dimension": "alternatives_surfaced",
+        "score": alt_score,
+        "max": 3,
+        "signal": f"{alt_hits} alternative-language hits",
+    })
+
+    # status-quo-signal
+    sq_indicators = [
+        "status quo", "no decision", "stay with", "keep what we have",
+        "current tool", "current process", "switching cost", "do nothing",
+    ]
+    sq_hits = sum(1 for ind in sq_indicators if ind in text_lower)
+    sq_score = min(3, sq_hits)
+    dims.append({
+        "dimension": "status_quo_signal",
+        "score": sq_score,
+        "max": 3,
+        "signal": f"{sq_hits} status-quo-language hits",
+    })
+
+    # quote-pulls-verbatim
+    quote_block_re = re.compile(r"^\s*>\s+\S", re.MULTILINE)
+    quote_hits = len(quote_block_re.findall(text))
+    # Also count quoted strings starting with " or ' followed by text
+    inline_quotes = len(re.findall(r"[\"“]([^\"”]{20,200})[\"”]", text))
+    qcount = quote_hits + inline_quotes
+    qscore = min(3, qcount // 1)
+    if qcount > 6:
+        qscore = 3
+    elif qcount >= 3:
+        qscore = 2
+    elif qcount >= 1:
+        qscore = 1
+    else:
+        qscore = 0
+    dims.append({
+        "dimension": "quote_pulls_verbatim",
+        "score": qscore,
+        "max": 3,
+        "signal": f"{qcount} quote markers ({quote_hits} blockquote, {inline_quotes} inline)",
+    })
+
+    # mindset-diagnosis
+    mindset_terms = ["fomo", "fomu", "explicit-need", "implied-need", "no-problem",
+                     "indecision", "indecis", "loss aversion", "switch trigger"]
+    mh = sum(1 for t in mindset_terms if t in text_lower)
+    mscore = min(3, mh)
+    dims.append({
+        "dimension": "mindset_diagnosis_present",
+        "score": mscore,
+        "max": 3,
+        "signal": f"{mh} mindset-language hits",
+    })
+
+    total = sum(d["score"] for d in dims)
+    return {
+        "deal_id": DEAL_ID,
+        "transcript_path": str(Path(TRANSCRIPT)),
+        "scored_at": TODAY,
+        "rubric_total": total,
+        "rubric_max": sum(d["max"] for d in dims),
+        "dimension_scores": dims,
+    }
+
+
+def mode_aggregate():
+    quarter = read_quarter(QUARTER)
+    start, end = quarter_window(quarter)
+    if not start:
+        refuse("invalid-quarter", f"unrecognized quarter: {quarter}")
+    captured = []
+    for p in WL_DIR.glob("*.json"):
+        if p.name.endswith("-score.json"):
+            continue
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        d = payload.get("interview_date") or payload.get("captured_at") or ""
+        try:
+            dd = datetime.strptime(d, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if start <= dd < end:
+            captured.append(payload)
+
+    if len(captured) < 5:
+        refuse(
+            "too-few-interviews",
+            f"need >=5 captures in {quarter}; have {len(captured)}. Pattern detection requires cohort.",
+        )
+
+    out_path = WL_DIR / f"aggregate-{quarter}.md"
+    json_path = WL_DIR / f"aggregate-{quarter}.json"
+
+    # ---- counts and rankings ----
+    by_outcome = Counter(p.get("outcome", "unknown") for p in captured)
+    by_alternative = Counter(p.get("alternative_considered", "unknown") for p in captured)
+    loss_amount_by_alt = defaultdict(float)
+    for p in captured:
+        if p.get("outcome", "won") != "won" and p.get("loss_amount_usd"):
+            try:
+                loss_amount_by_alt[p["alternative_considered"]] += float(p["loss_amount_usd"])
+            except Exception:
+                pass
+    contradiction_positions = Counter(p.get("contradiction_position", "?") for p in captured)
+
+    # Driver ranks: ranked by frequency × loss amount.
+    driver_rows = []
+    for alt, freq in by_alternative.most_common():
+        loss = loss_amount_by_alt.get(alt, 0.0)
+        score = freq * (1 + loss / 10000.0)  # weight loss by 10k-buckets
+        driver_rows.append({
+            "alternative": alt,
+            "frequency": freq,
+            "frequency_pct": round(freq / len(captured) * 100, 1),
+            "lost_amount_usd": round(loss, 2),
+            "rank_score": round(score, 2),
+        })
+    driver_rows.sort(key=lambda r: -r["rank_score"])
+
+    # Status-quo share
+    sq_alternatives = {"no-decision", "status-quo", "internal-build"}
+    sq_count = sum(by_alternative[a] for a in sq_alternatives if a in by_alternative)
+    sq_share = sq_count / len(captured)
+
+    # Render markdown aggregate
+    parts = []
+    parts.append("---")
+    parts.append(f"title: win-loss aggregate, {CLIENT}, {quarter}")
+    parts.append(f"client: {CLIENT}")
+    parts.append(f"quarter: {quarter}")
+    parts.append(f"interviews_captured: {len(captured)}")
+    parts.append("produced_by: win-loss-interview")
+    parts.append("patterns_grounded: [frontline-as-pmm-substrate, status-quo-is-the-competitor, diagnose-before-execute, jtbd-as-buyer-mental-model]")
+    parts.append("contradictions_aware: [no-decision-vs-named-competitor]")
+    if sq_share > 0.40:
+        parts.append("contradiction_positions: [no-decision-vs-named-competitor: A]")
+        parts.append(
+            f"position_rationale: \"status-quo / no-decision share is {round(sq_share*100,1)}% in {quarter}, "
+            f"above the 40% threshold per Dunford. The contradiction resolves to Position A globally for this quarter; "
+            f"campaigns should lead with status-quo framing, not competitor displacement.\""
+        )
+    else:
+        parts.append("contradiction_positions: [no-decision-vs-named-competitor: B]")
+        parts.append(
+            f"position_rationale: \"status-quo / no-decision share is {round(sq_share*100,1)}% in {quarter}, "
+            f"below 40%. Named competitors dominate the alternatives. Position B applies; battle cards and "
+            f"comparison content take precedence over status-quo framing.\""
+        )
+    parts.append("---")
+    parts.append("")
+    parts.append(f"# Win-loss aggregate, {CLIENT}, {quarter}")
+    parts.append("")
+    parts.append(f"_{len(captured)} interviews captured between {start} and {end}._")
+    parts.append("")
+
+    parts.append("## 1. Outcome distribution")
+    parts.append("")
+    parts.append("| Outcome | n | % |")
+    parts.append("|---|---:|---:|")
+    for outcome, n in by_outcome.most_common():
+        parts.append(f"| {outcome} | {n} | {round(n/len(captured)*100,1)}% |")
+    parts.append("")
+
+    parts.append("## 2. Ranked deal-pattern drivers")
+    parts.append("")
+    parts.append(
+        "Ranked by **frequency × (1 + lost_amount/10k)**. "
+        "A high-frequency alternative with high lost-amount is the load-bearing pattern."
+    )
+    parts.append("")
+    parts.append("| Rank | Alternative | Frequency | % of corpus | Lost USD | Rank score |")
+    parts.append("|---:|---|---:|---:|---:|---:|")
+    for i, row in enumerate(driver_rows, 1):
+        parts.append(
+            f"| {i} | `{row['alternative']}` | {row['frequency']} | {row['frequency_pct']}% | "
+            f"${row['lost_amount_usd']:,.0f} | {row['rank_score']} |"
+        )
+    parts.append("")
+
+    parts.append("## 3. Status-quo share")
+    parts.append("")
+    parts.append(f"- Status-quo / no-decision / internal-build share: **{round(sq_share*100,1)}%**")
+    parts.append("- Threshold (Dunford): 40% — above this, status-quo is the dominant competitor.")
+    parts.append("")
+    if sq_share > 0.40:
+        parts.append("**Action**: per status-quo-is-the-competitor pattern, the messaging matrix and narrative-strategy should lead with the buyer's status quo, not with named-competitor displacement. Update `competitive/status-quo.md` with the trailing quarter's verbatim resistance language.")
+    else:
+        parts.append("**Action**: named competitors dominate. Update battle cards (`competitive/<vendor>.md`) for top alternatives; ensure displacement framing is sharp.")
+    parts.append("")
+
+    parts.append("## 4. Contradiction position distribution")
+    parts.append("")
+    parts.append("| Position | n |")
+    parts.append("|---|---:|")
+    for pos, n in contradiction_positions.most_common():
+        parts.append(f"| {pos} | {n} |")
+    parts.append("")
+
+    parts.append("## 5. Captured interviews (links)")
+    parts.append("")
+    for p in captured:
+        deal = p.get("deal_id", "?")
+        outcome = p.get("outcome", "?")
+        alt = p.get("alternative_considered", "?")
+        parts.append(f"- [{deal}](`./{deal}.md`), outcome={outcome}, alternative={alt}")
+    parts.append("")
+
+    parts.append("## Substrate citations")
+    parts.append("")
+    parts.append(f"- Positioning: `clients/{CLIENT}/positioning/positioning-canonical-statement.md`")
+    parts.append(f"- Per-deal artefacts: `clients/{CLIENT}/win-loss/<deal-id>.md`")
+    parts.append("- Patterns: `knowledge/patterns/{frontline-as-pmm-substrate, status-quo-is-the-competitor, jtbd-as-buyer-mental-model, diagnose-before-execute}.md`")
+    parts.append("- Contradiction: `knowledge/contradictions/no-decision-vs-named-competitor.md`")
+
+    out_path.write_text("\n".join(parts), encoding="utf-8")
+
+    json_payload = {
+        "client": CLIENT,
+        "quarter": quarter,
+        "interviews_captured": len(captured),
+        "by_outcome": dict(by_outcome),
+        "by_alternative": dict(by_alternative),
+        "loss_amount_by_alternative_usd": {k: round(v, 2) for k, v in loss_amount_by_alt.items()},
+        "ranked_drivers": driver_rows,
+        "status_quo_share_pct": round(sq_share * 100, 1),
+        "contradiction_position_global": "A" if sq_share > 0.40 else "B",
+        "contradiction_distribution": dict(contradiction_positions),
+        "captured_deal_ids": [p.get("deal_id") for p in captured],
+    }
+    json_path.write_text(json.dumps(json_payload, indent=2), encoding="utf-8")
+
+    print(f"[win-loss-interview] aggregate: {out_path}")
+    print(f"[win-loss-interview] json:      {json_path}")
+
+
+# ---- dispatch ----
+
+if MODE == "script":
+    mode_script()
+elif MODE == "capture":
+    mode_capture()
+elif MODE == "score":
+    mode_score()
+elif MODE == "aggregate":
+    mode_aggregate()
+else:
+    refuse("unknown-mode", f"unknown --mode={MODE}; use script|capture|score|aggregate")
+PYEOF

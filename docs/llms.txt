@@ -1,0 +1,107 @@
+# Substrate
+
+> Substrate is an open-source, context-first operating system for go-to-market. Every function, every metric, every surface, from first principles. The system raises the floor; humans own the ceiling.
+
+A working operating system, not a methodology paper. Released MIT in May 2026 by Kesava Mandiga, after fourteen months of in-the-field iteration across PMM, content marketing, performance/growth, SEO/AEO/GEO, sales, success, support, product, and leadership/RevOps. The framework is field-tested. The OSS release strips every client-specific artifact and ships the structure: the loop, the principles, the skills, the gates, the calibration ledger, and the personas-as-fragments architecture.
+
+Canonical home: https://substrate.iamkesava.com/. Source: https://github.com/k3sava/substrate. License: MIT.
+
+## Agent discovery
+
+- [Agent permissions](https://substrate.iamkesava.com/.well-known/agent-permissions.json): use rights, attribution, license.
+- [API catalog](https://substrate.iamkesava.com/.well-known/api-catalog): RFC 9727 linkset to discoverable resources.
+- [Agent skills](https://substrate.iamkesava.com/.well-known/agent-skills/index.json): Agent Skills Discovery v0.2 index.
+
+## Sister sites by Kesava
+
+- [apps.iamkesava.com](https://apps.iamkesava.com/): apps and AI playground experiments.
+- [tools.iamkesava.com](https://tools.iamkesava.com/): browser tools, ad-free.
+- [toys.iamkesava.com](https://toys.iamkesava.com/): creative experiments.
+- [codex.iamkesava.com](https://codex.iamkesava.com/): operator insight library.
+
+## The thesis
+
+The same person, with the same model, with shared context, produces materially better work than the same person without it. Faster, sharper, with citations that hold up. Most teams treat context as documentation. Substrate treats it as the load-bearing layer, alongside goals you can score and skills that refuse bad input. AI is not the multiplier. The context AI reads is.
+
+## The eight layers
+
+1. Context: ten layers per project (positioning, ICP, voice-of-customer, competitive, product knowledge, conversion narrative, brand voice, market context, roadmap, strategy). Canonical, cited, freshness-windowed. Augmented by `knowledge/patterns/` (39 codex-grounded patterns) and `knowledge/contradictions/` (11 conditioned disagreements).
+2. Skills: 37 gated CLI runtimes that refuse bad input before it ships. Each declares `patterns_grounded` and `contradictions_aware` in frontmatter. Includes pre-publish-check, lp-ship, voice-enforce, audience-test, competitive-scout, claim-verify, frontline-contact, win-loss-interview, tactical-empathy-discovery, narrative-strategy, status-quo-frame, agent-jtbd-map, eval-rubric, pricing-strategic, aeo-relevance, aeo-manual-action, pseo-framework, lp-cro-rubric, mental-models, design-principles, design-thinking-content, help-docs, campaign-strategy, launch-plan, messaging-matrix, pmm-coaching, capability-pin, plus the v1.0 set.
+3. Goals: falsifiable predictions with measurement contracts. Calibration-scored at resolution (Brier score).
+4. Routines: recurring workflows on a schedule. frontline-contact, signal, goal, content, aeo, narrative-drift, digest-ingest.
+5. UX: operator review queue (bin/substrate-status) plus a static dashboard.
+6. Calibration: per-(operator, taste-type) Brier history. Authority follows accuracy, not the org chart.
+7. Principles: PRINCIPLES.md. Nine rules. The slowest layer to change. Rule 9: every skill grounds in patterns and knows the contradictions.
+8. Reconciliation: weekly knowledge check. Always-on freshness and link integrity.
+
+A closed loop: ingest signals, ground the context, open goals, generate assets, gate quality, ship, close the loop. Context carries the routine. Humans own taste, which goals are worth opening, and asset approval.
+
+## The codex-grounded knowledge layer (v1.1)
+
+Substrate's framework reads from a corpus of operator-grade research. Patterns are claims with 3+ operator citations; contradictions are places where credible operators disagree, with the conditioning that picks the right position.
+
+Tier A patterns (20) include: substrate runs the loop / humans run alignment (8 operators), context is the bottleneck not capability (5 operators), generalists with taste shipping end-to-end (6), frontline contact IS the PMM substrate (7), agents mapped 1:1 to JTBD with named human checkpoints (7), agent-first GTM rebuild not bolt-on (5), distribution as moat (5), status quo is the real competitor (4), narrative is strategy (4), make the implicit explicit (4), diagnose before executing (5), AEO triangle (7), quality + friction-as-feature as growth levers (5), absolute counts beat stage rates (4), build for the next model (6), agents are first-class users (4), evals as data analysis (3), economic Turing test → revenue per employee (4), principal IC as force multiplier (4), LLM as OS (6).
+
+Contradictions (11) include: agents-as-team vs agents-as-tools (Vo vs Cherny, conditioned by persistence + heterogeneity), build-quietly vs distribution-first (Younis vs Verna/Balfour, conditioned by stage + operator capital), no-decision vs named competitor (Dunford vs Klue-style, conditioned by category maturity + buyer urgency), quality-as-growth vs marginal-friction-removal (Naik vs Verna, conditioned by cohort lifecycle).
+
+Source: codex insight library at https://codex.iamkesava.com/. Substrate mirrors and applies; codex stays the source of truth.
+
+## Who Substrate is for
+
+Product, PMM, content marketing, performance / growth, SEO / AEO / GEO, sales, customer success, customer support, leadership / RevOps. Cross-functional by design. The same canonical positioning that gates a PMM landing page gates a sales sequence, a CS playbook, an AEO-tuned passage, and a product-page claim.
+
+## What Substrate fixes (the pain)
+
+Product, marketing, sales, and support each know different parts of the business: what we offer, why it matters, who it's for, and how we deliver it. None of it is first-class data. Understanding of the product, the market, the customer, the positioning, and how we serve our customer's jobs in the real world is often siloed. Briefs live in docs. Positioning is theoretical. Messaging changes on a whim. Competitor research is fragmented. Battle cards rot in folders nobody reads. Data lives somewhere else altogether. AI-assisted work makes it worse: outputs get faster, the floor stays put.
+
+Underneath all that, GTM outcomes are genuinely hard to measure and attribute. Pipeline takes weeks to materialize. Retention takes months. Multi-touch attribution is a polite fiction. So measurement and prioritization keep losing to internal politics: stakeholders cannot agree on a baseline, definitions shift mid-quarter, attribution windows flex to flatter whoever is reporting, and the metric we said we would measure quietly becomes a different metric three weeks in. Source systems disagree (Amplitude says 100, HubSpot says 87, Google Analytics says 142) and the report uses whichever number is most favorable.
+
+There is a structural pattern under all the politics: upstream functions lose to downstream ones. Product marketing's positioning loses to whatever sales is saying on the call. Product marketing's roadmap influence loses to product's shipping queue. Support's churn signal loses to sales's expansion forecast. Whoever owns the revenue moment wins the strategic call, even when the upstream signal was right months earlier.
+
+Substrate makes the context first-class, scores goals, refuses bad input, catches drift before ship, and treats measurement as the first step in planning, not a way to find outcomes after execution.
+
+## First principles
+
+1. Anti-fabrication: every claim cites a context file by path. No invented metrics, dates, composite quotes, or aggressive rounding.
+2. Five-tier evidence ladder: verified, self-reported, contextual, indirect, direct. Source-system pulls beat operator reports beat inferred guesses.
+3. Buyer is the audience, not the marketer: drafts are tested against pinned buyer panels. Internal applause is not signal.
+
+Full operating rules in PRINCIPLES.md (https://github.com/k3sava/substrate/blob/main/PRINCIPLES.md).
+
+## Operating model
+
+Revenue per operator is the north star metric. Not assets shipped, not campaigns run, not goals opened. Calibrated bets with measurement contracts. Brier scores at resolution. Authority follows accuracy. AI-mediated buyers (ChatGPT, Perplexity, AI-assisted research) require machine-readable differentiation: schema.org typed entities, passages-as-citation-units, off-domain mirrors. Substrate ships an aeo-tune weekly watcher and a per-vertical pass to compound on that surface.
+
+## Self-evolution loop
+
+A daily ingest reads research digests produced by an upstream pipeline, extracts items tagged for Substrate, and either auto-merges low-risk knowledge updates or files a proposal for the human-in-loop gate. The framework keeps pace with what is actually working in the field, without anyone having to remember to update it. See routines/digest-ingest.md.
+
+## Quick start
+
+```
+git clone https://github.com/k3sava/substrate.git
+cd substrate
+export PATH="$PWD/bin:$PATH"
+substrate --list
+mkdir -p clients/<your-product>
+cp -r templates/client-bootstrap/* clients/<your-product>/
+substrate pre-publish-check <draft.md> --client <your-product>
+```
+
+## How to cite
+
+Mandiga, Kesava. "Substrate: a context-first operating system for GTM." 2026. https://substrate.iamkesava.com/.
+
+For a specific principle or skill, anchor to the file: e.g. https://github.com/k3sava/substrate/blob/main/PRINCIPLES.md#anti-fabrication.
+
+## Author
+
+Kesava Mandiga. PMM operator, twenty years across support, sales, ops, social, content, and product marketing. Built Substrate at scale across one full-time role and uses it for consulting engagements now. https://iamkesava.com.
+
+## Voice
+
+Operator voice. Plain English. No em dashes in body copy. No kill-list filler ("orchestration", "seamless", "leverage", "transform", "holistic", "synergy", "bespoke", "unlock"). No throat-clearing openers. Direct claims, citations, falsifiability.
+
+## License
+
+MIT. Use freely. Anything that ships externally cites the canonical author.

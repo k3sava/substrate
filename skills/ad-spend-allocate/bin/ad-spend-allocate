@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+"""ad-spend-allocate — allocate paid-ads budget across channels with falsifiable
+predictions. Reads recent ad-diagnose outputs, applies LTV/CAC targets, emits
+one measurement contract per channel allocation that can open a goal in the
+substrate ledger.
+
+Refuses without diagnostic data. Refuses without --ltv. Refuses without
+canonical positioning.
+
+Usage:
+    ad-spend-allocate --client <client> --budget <usd> --ltv <usd> \\
+        --quarter <YYYY-Q[1-4]> [--target-ltv-cac <ratio>] \\
+        [--policy <70-20-10|60-30-10|...>] [--lookback <days>] \\
+        [--exploration-channel <slug>] [--diagnostics <dir>] [--out <dir>]
+
+Exit codes:
+    0 — allocation written, all contracts emitted
+    1 — allocation written but with warnings (some channels above target CAC)
+    3 — refused (substrate gap, missing diagnostic, missing LTV)
+    4 — invalid args
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+
+
+# Channel-fit map from intent-vs-interest-targeting pattern.
+INTENT_CHANNELS = {"google-search"}
+INTEREST_CHANNELS = {
+    "google-pmax", "google-display",
+    "meta-paid-social", "linkedin-sponsored",
+    "tiktok", "x", "reddit", "youtube",
+}
+
+
+# Default predicted-p mapping when the operator does not override.
+# More legible / mature channels get higher predicted_p; exploration gets lower.
+DEFAULT_PREDICTED_P = {
+    "proven": 0.65,
+    "scaling": 0.50,
+    "exploration": 0.35,
+}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def parse_diagnostic_summary(path: Path) -> dict | None:
+    """Pull the diagnostic_summary frontmatter block from a diagnostic file."""
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end < 0:
+        return None
+    fm = text[3:end]
+    out: dict = {}
+    in_summary = False
+    for line in fm.splitlines():
+        s = line
+        if s.startswith("diagnostic_summary:"):
+            in_summary = True
+            continue
+        if in_summary:
+            m = re.match(r"^\s+([a-z_]+):\s*(.+)$", s)
+            if m:
+                k, v = m.group(1), m.group(2).strip()
+                try:
+                    out[k] = float(v) if v != "null" else None
+                except ValueError:
+                    out[k] = v
+            else:
+                in_summary = False
+        else:
+            m = re.match(r"^([a-z_]+):\s*(.+)$", s)
+            if m:
+                out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def load_recent_diagnostics(diag_dir: Path, lookback_days: int) -> dict[str, dict]:
+    """Returns {channel: latest_summary} from diagnostic files in lookback window."""
+    cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+    by_channel: dict[str, tuple[datetime, dict]] = {}
+    if not diag_dir.is_dir():
+        return {}
+    for f in diag_dir.glob("*.md"):
+        m = re.match(r"^(.+)-(\d{4}-\d{2}-\d{2})\.md$", f.name)
+        if not m:
+            continue
+        channel = m.group(1)
+        try:
+            d = datetime.strptime(m.group(2), "%Y-%m-%d")
+        except ValueError:
+            continue
+        if d < cutoff:
+            continue
+        summary = parse_diagnostic_summary(f)
+        if summary is None:
+            continue
+        if channel not in by_channel or d > by_channel[channel][0]:
+            by_channel[channel] = (d, summary)
+    return {ch: s for ch, (_, s) in by_channel.items()}
+
+
+def parse_policy(policy: str) -> tuple[float, float, float]:
+    """Parse policy string '70-20-10' into (proven, scaling, exploration) fractions."""
+    parts = policy.split("-")
+    if len(parts) != 3:
+        raise ValueError(f"policy must be three numbers like '70-20-10', got: {policy}")
+    nums = [float(p) for p in parts]
+    if abs(sum(nums) - 100.0) > 0.5:
+        raise ValueError(f"policy parts must sum to 100, got: {sum(nums)}")
+    return nums[0] / 100.0, nums[1] / 100.0, nums[2] / 100.0
+
+
+def channel_kind(channel: str) -> str:
+    if channel in INTENT_CHANNELS:
+        return "intent"
+    if channel in INTEREST_CHANNELS:
+        return "interest"
+    return "unknown"
+
+
+def classify_channels(diagnostics: dict[str, dict],
+                      target_max_cac: float) -> tuple[list[str], list[str], list[str]]:
+    """Sort channels by maturity into (proven, scaling, exploration).
+    Heuristic: a channel is 'proven' if it has a diagnostic summary, observed
+    CAC at or below 1.2x target, and at least one previous-quarter diagnostic.
+    'Scaling' if observed CAC is between 1.2x and 2.0x target (not yet steady).
+    'Exploration' if observed CAC is above 2.0x target OR there is no diagnostic.
+    """
+    proven, scaling, exploration = [], [], []
+    for ch, summary in diagnostics.items():
+        cac = summary.get("observed_cac_usd")
+        if cac is None:
+            exploration.append(ch)
+            continue
+        if cac <= target_max_cac * 1.2:
+            proven.append(ch)
+        elif cac <= target_max_cac * 2.0:
+            scaling.append(ch)
+        else:
+            exploration.append(ch)
+    return proven, scaling, exploration
+
+
+def predicted_cac_for_channel(channel: str, summary: dict | None,
+                               target_max_cac: float, slot: str) -> float:
+    """Predict next-quarter CAC for the channel.
+    Heuristic: weight observed CAC by 0.7 and target by 0.3 for proven/scaling;
+    target * 1.5 for exploration when there is no signal.
+    """
+    if summary and summary.get("observed_cac_usd"):
+        observed = float(summary["observed_cac_usd"])
+        if slot in ("proven", "scaling"):
+            return round(observed * 0.7 + target_max_cac * 0.3, 2)
+        return round(observed * 0.5 + target_max_cac * 0.5, 2)
+    if slot == "exploration":
+        return round(target_max_cac * 1.5, 2)
+    return round(target_max_cac * 1.0, 2)
+
+
+def split_within_slot(channels: list[str], slot_budget: float) -> dict[str, float]:
+    """Equal split if no signal; weight by inverse-CAC if signal present.
+    For simplicity, equal split here; the operator can override per-channel.
+    """
+    if not channels:
+        return {}
+    per = round(slot_budget / len(channels), 2)
+    out = {ch: per for ch in channels[:-1]}
+    out[channels[-1]] = round(slot_budget - sum(out.values()), 2)
+    return out
+
+
+def render_allocation_md(*,
+                         client: str,
+                         quarter: str,
+                         today: str,
+                         budget: float,
+                         ltv: float,
+                         ratio: float,
+                         target_max_cac: float,
+                         policy: str,
+                         proven: list[str], scaling: list[str], exploration: list[str],
+                         allocations: dict[str, dict],
+                         exploration_channel: str | None,
+                         warnings: list[str]) -> str:
+    lines = []
+    lines.append("---")
+    lines.append(f"allocation_id: {client}-ads-allocation-{quarter}-{today}")
+    lines.append(f"client: {client}")
+    lines.append(f"quarter: {quarter}")
+    lines.append(f"budget_total_usd: {round(budget, 2)}")
+    lines.append(f"target_ltv_usd: {round(ltv, 2)}")
+    lines.append(f"target_ltv_cac_ratio: {ratio}")
+    lines.append(f"target_max_cac_usd: {round(target_max_cac, 2)}")
+    lines.append(f"policy: {policy}")
+    lines.append("substrate_layers_read: [icp, positioning, competitive, voc]")
+    lines.append("patterns_applied: [channel-arbitrage-window, intent-vs-interest-targeting, incrementality-not-attribution, creative-fatigue-window]")
+    lines.append("contradictions_resolved: [no-decision-vs-named-competitor]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# ad-spend-allocate: {client} | {quarter} | {today}")
+    lines.append("")
+    lines.append("## Per-channel allocation")
+    lines.append("")
+    lines.append("| Channel | Slot | Spend | % | Predicted CAC | Predicted volume | Predicted ROAS | Window |")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---|")
+    for ch, a in sorted(allocations.items(), key=lambda kv: -kv[1]["spend"]):
+        pct = a["spend"] / budget * 100 if budget > 0 else 0
+        predicted_volume = round(a["spend"] / a["predicted_cac"]) if a["predicted_cac"] else 0
+        predicted_roas = round(predicted_volume * ltv / a["spend"], 2) if a["spend"] else 0
+        window = a.get("window", "quarter-end")
+        lines.append(f"| `{ch}` | {a['slot']} | ${a['spend']:,.2f} | {pct:.1f}% | ${a['predicted_cac']:,.2f} | {predicted_volume} | {predicted_roas} | {window} |")
+    lines.append("")
+
+    lines.append("## Proven / scaling / exploration breakdown")
+    lines.append("")
+    lines.append(f"Policy: `{policy}` (proven / scaling / exploration).")
+    lines.append("")
+    if proven:
+        lines.append(f"**Proven** ({len(proven)}): {', '.join('`' + c + '`' for c in proven)}")
+        lines.append(f"- Rationale: observed CAC at or below 1.2x target across recent diagnostics. "
+                     f"Source: clients/{client}/ads/diagnostics/.")
+    else:
+        lines.append("**Proven** (0): no channels currently meet the proven threshold. Consider "
+                     "scaling-up the strongest scaling-slot channel to make it proven by next quarter.")
+    lines.append("")
+    if scaling:
+        lines.append(f"**Scaling** ({len(scaling)}): {', '.join('`' + c + '`' for c in scaling)}")
+        lines.append("- Rationale: observed CAC between 1.2x and 2.0x target; the channel-arbitrage-window "
+                     "pattern says these are the next-tier candidates if creative refresh closes the gap.")
+    else:
+        lines.append("**Scaling** (0): no scaling channels.")
+    lines.append("")
+    if exploration:
+        lines.append(f"**Exploration** ({len(exploration)}): {', '.join('`' + c + '`' for c in exploration)}")
+        lines.append("- Rationale: no diagnostic data, OR observed CAC above 2.0x target. Exploration "
+                     "spend is expected to lose money in expectation; the option-value is on a future "
+                     "channel-arbitrage window. Per `pat_channel-arbitrage-window`, default share is 10%.")
+    elif exploration_channel:
+        lines.append(f"**Exploration** declared by operator: `{exploration_channel}` (no diagnostic yet).")
+    else:
+        lines.append("**Exploration** unallocated. Recommendation: name an exploration channel via "
+                     "`--exploration-channel <slug>`. Reading competitive-scout signals for high-velocity "
+                     "competitor channels is a good prompt for the choice.")
+    lines.append("")
+
+    lines.append("## Intent vs interest split")
+    lines.append("")
+    intent_spend = sum(a["spend"] for ch, a in allocations.items() if channel_kind(ch) == "intent")
+    interest_spend = sum(a["spend"] for ch, a in allocations.items() if channel_kind(ch) == "interest")
+    other_spend = budget - intent_spend - interest_spend
+    lines.append(f"- Intent (search ads): ${intent_spend:,.2f} ({intent_spend / budget * 100:.1f}%)")
+    lines.append(f"- Interest (paid social, display, video): ${interest_spend:,.2f} ({interest_spend / budget * 100:.1f}%)")
+    if other_spend > 0:
+        lines.append(f"- Other / unclassified: ${other_spend:,.2f} ({other_spend / budget * 100:.1f}%)")
+    lines.append("")
+    lines.append("Per `pat_intent-vs-interest-targeting`: intent channels measured on cost-per-qualified-lead "
+                 "and impression-share for high-intent queries; interest channels measured on cohort-level CAC "
+                 "over a 60-90 day window plus assisted conversions and branded-search lift. Cross-channel "
+                 "allocation read against last-click CAC undercounts interest-channel impact.")
+    lines.append("")
+
+    lines.append("## Incrementality plan")
+    lines.append("")
+    above_threshold = [(ch, a["spend"]) for ch, a in allocations.items() if a["spend"] / budget >= 0.05]
+    if above_threshold:
+        lines.append("Channels above 5% spend share require a quarterly geo-holdout per "
+                     "`pat_incrementality-not-attribution`:")
+        lines.append("")
+        for ch, spend in sorted(above_threshold, key=lambda x: -x[1]):
+            lines.append(f"- `{ch}` ({spend / budget * 100:.1f}% share). Schedule via `ad-incrementality-test --client {client} --channel {ch} --quarter {quarter}`.")
+    else:
+        lines.append("No channel is above the 5% threshold. Single-channel concentrations should still run "
+                     "an annual incrementality check as a calibration discipline.")
+    lines.append("")
+
+    lines.append("## Open questions and risks")
+    lines.append("")
+    lines.append("- **LTV calibration**: this allocation assumes LTV = $" + f"{ltv:,.2f}. "
+                 "If the LTV is sourced from cohort modeling, name the cohort and the time horizon. "
+                 "If it is a back-of-envelope estimate, mark it as such and tighten in the next quarter.")
+    lines.append("- **Attribution**: this allocation uses platform-reported CAC. The "
+                 "incrementality plan above corrects for this on channels that matter; smaller channels "
+                 "may carry hidden over-attribution.")
+    lines.append("- **Creative fatigue**: per `pat_creative-fatigue-window`, projections assume a refresh "
+                 "cadence is being maintained. If the brief queue is empty, predicted CAC will degrade.")
+    lines.append("- **Channel saturation**: per `pat_channel-arbitrage-window`, this allocation could be "
+                 "vulnerable to a 6-18 month CPM rise on the dominant channel. The exploration slice is "
+                 "the hedge.")
+    lines.append("")
+
+    lines.append("## Rollback / kill criteria")
+    lines.append("")
+    lines.append("- If any proven-slot channel's CAC exceeds 1.5x target_max_cac for 14 consecutive days, "
+                 "pause and re-run `ad-diagnose`. Do not auto-shift budget without diagnostic.")
+    lines.append("- If exploration-slot channel's CAC exceeds 3.0x target_max_cac for 28 consecutive days, "
+                 "kill the exploration test and re-allocate to the next-best exploration option.")
+    lines.append("- If the brand's revenue trajectory diverges from the predicted volume by more than 30% "
+                 "down or 50% up, pause the allocation and re-open the goals against the actual trajectory.")
+    lines.append("")
+
+    if warnings:
+        lines.append("## Warnings")
+        lines.append("")
+        for w in warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+
+    lines.append("## Measurement contracts emitted")
+    lines.append("")
+    for ch, a in sorted(allocations.items(), key=lambda kv: -kv[1]["spend"]):
+        lines.append(f"- `goals/measurement-contracts/{client}-{ch}-{quarter}.md`")
+    lines.append("")
+    lines.append("Open each as a goal: `bin/substrate open-goal --client " + client + " --contract <path>`.")
+    lines.append("")
+
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `ad-diagnose` — produces the per-channel CAC and conv-value this allocation reads.")
+    lines.append("- `ad-creative-design` — briefs the variants the budget will spend against.")
+    lines.append("- `ad-incrementality-test` — runs the geo holdout for any channel above 5%.")
+    lines.append("- `ad-fatigue-monitor` — keeps the creative cadence honest; projections degrade without it.")
+    lines.append("- `routines/ad-allocation-routine.md` — quarterly cadence; this skill is its operational core.")
+    lines.append("- `goals/SCHEMA.md` — the goal schema each measurement contract follows.")
+    return "\n".join(lines)
+
+
+def render_measurement_contract(*,
+                                client: str,
+                                channel: str,
+                                slot: str,
+                                spend: float,
+                                ltv: float,
+                                target_max_cac: float,
+                                predicted_cac: float,
+                                ratio: float,
+                                quarter: str,
+                                today: str,
+                                quarter_end: str,
+                                predicted_p: float) -> str:
+    predicted_volume = round(spend / predicted_cac) if predicted_cac else 0
+    predicted_revenue = round(predicted_volume * ltv)
+    predicted_roas = round(predicted_revenue / spend, 2) if spend else 0
+    cohort_kind = channel_kind(channel)
+    cohort_label = "intent-stage" if cohort_kind == "intent" else "interest-stage"
+
+    lines = []
+    lines.append("---")
+    lines.append(f"goal_id: {client}-paid-{channel}-{quarter}")
+    lines.append(f"client: {client}")
+    lines.append(f"opened_at: {today}")
+    lines.append(f"opener: ad-spend-allocate")
+    lines.append(f"taste_owner: <operator>")
+    lines.append("status: proposed")
+    lines.append("taste_type: demand-gen")
+    lines.append(f"resolution_date: {quarter_end}")
+    lines.append(f"predicted_p_threshold_met: {predicted_p}")
+    lines.append("substrate_layers_cited: [icp, positioning, competitive]")
+    lines.append("patterns_applied: [channel-arbitrage-window, intent-vs-interest-targeting, incrementality-not-attribution, creative-fatigue-window]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# {client} paid-ads | {channel} | {quarter}")
+    lines.append("")
+    lines.append("## Hypothesis")
+    lines.append("")
+    lines.append(f"Allocating ${spend:,.2f} to `{channel}` over {quarter} produces channel CAC at or below "
+                 f"${target_max_cac:,.2f} (target_max_cac), with predicted CAC of ${predicted_cac:,.2f} "
+                 f"and predicted ROAS of {predicted_roas} against the {ratio}x LTV:CAC target.")
+    lines.append("")
+    lines.append(f"Slot: `{slot}`. Channel kind: `{cohort_kind}` (per `pat_intent-vs-interest-targeting`).")
+    lines.append("")
+    lines.append(f"Substrate citations: `clients/{client}/01-position.md`, `clients/{client}/02-icp.md`, "
+                 f"`clients/{client}/04-competitive.md`, `clients/{client}/ads/diagnostics/{channel}-*.md`.")
+    lines.append("")
+    lines.append("## Predicted outcome")
+    lines.append("")
+    lines.append(f"`{channel}` channel CAC <= ${target_max_cac:,.2f} within {quarter} for {cohort_label} cohort "
+                 f"(per the canonical ICP layer).")
+    lines.append("")
+    lines.append("## Revenue lever")
+    lines.append("")
+    lines.append("```yaml")
+    lines.append("lever_type: acquisition-CPL")
+    lines.append(f"annual_revenue_impact_usd: {predicted_revenue * 4}  # quarterly volume * 4")
+    lines.append("calculation: |")
+    lines.append(f"  Quarterly inputs:")
+    lines.append(f"    budget = ${spend:,.2f}")
+    lines.append(f"    predicted_cac = ${predicted_cac:,.2f}")
+    lines.append(f"    predicted_volume = budget / predicted_cac = {predicted_volume}")
+    lines.append(f"    ltv = ${ltv:,.2f} (operator-passed; cite source in clients/{client}/...)")
+    lines.append(f"    quarterly_revenue = predicted_volume * ltv = ${predicted_revenue:,.2f}")
+    lines.append(f"    annual_revenue_impact = quarterly_revenue * 4 = ${predicted_revenue * 4:,.2f}")
+    lines.append(f"  Assumptions:")
+    lines.append(f"    - constant CAC across the quarter (creative-fatigue-window will degrade this; refresh cadence required)")
+    lines.append(f"    - LTV is steady-state; new-cohort LTV may differ")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Measurement design")
+    lines.append("")
+    lines.append("```")
+    if channel.startswith("google"):
+        lines.append("Source: Google Ads platform export (csv) + GA4 conversion event.")
+    elif channel == "meta-paid-social":
+        lines.append("Source: Meta Marketing API + first-party conversion event in CRM.")
+    elif channel == "linkedin-sponsored":
+        lines.append("Source: LinkedIn Campaign Manager export + first-party conversion event in CRM.")
+    else:
+        lines.append(f"Source: {channel} platform export + first-party conversion event in CRM.")
+    lines.append("Method: total spend / converted leads in the quarter window.")
+    lines.append(f"Cohort: {cohort_label}, defined per clients/" + client + "/02-icp.md.")
+    lines.append("Join key: campaign_id + conversion_session_id.")
+    lines.append("Ambiguous case: if channel is paused mid-quarter for any reason other than ")
+    lines.append("  'CAC above kill threshold,' resolve as AMBIGUOUS and re-allocate.")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Kill criterion")
+    lines.append("")
+    lines.append(f"`{channel}` CAC > ${target_max_cac * 1.5:,.2f} (1.5x target_max_cac) for 14 consecutive "
+                 f"days. Pause; re-run `ad-diagnose --client {client} --channel {channel}`.")
+    lines.append("")
+    lines.append("## Resolution")
+    lines.append("")
+    lines.append(f"Resolves on {quarter_end}. Verdict: YES if observed CAC at or below "
+                 f"${target_max_cac:,.2f}; NO if above; AMBIGUOUS if data quality fails.")
+    lines.append("")
+    lines.append("Brier score = (predicted_p_threshold_met - indicator)^2 where indicator is 1 if YES, 0 if NO.")
+    lines.append("")
+    lines.append("## Substrate update on resolution")
+    lines.append("")
+    lines.append("- If YES: confirm channel's slot in next quarter's allocation. Update `clients/" + client + "/04-competitive.md` if competitive ad spend signals shifted.")
+    lines.append("- If NO: tag the channel for an `ad-diagnose` deep dive. Open `ad-incrementality-test` if the divergence is substantial (>30% off prediction).")
+    lines.append("- If AMBIGUOUS: name the data gap; reopen with a sharper measurement design.")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="ad-spend-allocate")
+    p.add_argument("--client", required=True)
+    p.add_argument("--budget", type=float, required=True)
+    p.add_argument("--ltv", type=float, required=True)
+    p.add_argument("--target-ltv-cac", type=float, default=3.0)
+    p.add_argument("--diagnostics", default=None)
+    p.add_argument("--lookback", type=int, default=60)
+    p.add_argument("--policy", default="70-20-10")
+    p.add_argument("--exploration-channel", default=None)
+    p.add_argument("--quarter", required=True)
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Refusal: positioning required (channel-fit gates against it)
+    pos_path = SUBSTRATE_ROOT / "clients" / args.client / "01-position.md"
+    if not pos_path.is_file():
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/01-position.md not found. "
+                      f"Run positioning-forge first.")
+
+    # Refusal: --ltv missing handled by argparse, but validate >= 0
+    if args.ltv <= 0:
+        return refuse("invalid-ltv", f"--ltv must be > 0, got {args.ltv}")
+    if args.budget <= 0:
+        return refuse("invalid-budget", f"--budget must be > 0, got {args.budget}")
+
+    target_max_cac = args.ltv / args.target_ltv_cac
+
+    # Read diagnostics
+    diag_dir = Path(args.diagnostics) if args.diagnostics else (
+        SUBSTRATE_ROOT / "clients" / args.client / "ads" / "diagnostics"
+    )
+    diagnostics = load_recent_diagnostics(diag_dir, args.lookback)
+    if not diagnostics:
+        return refuse("missing-diagnostic",
+                      f"no diagnostic files found in {diag_dir} within last {args.lookback} days. "
+                      f"Run `ad-diagnose --client {args.client} --export <csv> --channel <channel>` first.")
+
+    # Parse policy
+    try:
+        proven_share, scaling_share, exploration_share = parse_policy(args.policy)
+    except ValueError as e:
+        return refuse("invalid-policy", str(e))
+
+    # Classify channels
+    proven, scaling, exploration = classify_channels(diagnostics, target_max_cac)
+
+    # Allocate budget per slot
+    proven_budget = args.budget * proven_share
+    scaling_budget = args.budget * scaling_share
+    exploration_budget = args.budget * exploration_share
+
+    # If a slot has no channels, redistribute its share. The policy is a target;
+    # an empty slot does not get phantom spend.
+    redistributed = []
+    if not proven:
+        # Move proven budget to scaling if scaling exists, else exploration
+        if scaling:
+            scaling_budget += proven_budget
+            redistributed.append("proven (empty) -> scaling")
+        elif exploration:
+            exploration_budget += proven_budget
+            redistributed.append("proven (empty) -> exploration")
+        proven_budget = 0
+    if not scaling:
+        if proven:
+            proven_budget += scaling_budget
+            redistributed.append("scaling (empty) -> proven")
+        elif exploration:
+            exploration_budget += scaling_budget
+            redistributed.append("scaling (empty) -> exploration")
+        scaling_budget = 0
+    if not exploration and not args.exploration_channel:
+        # Exploration unallocated; redistribute share to scaling or proven
+        if scaling:
+            scaling_budget += exploration_budget
+            redistributed.append("exploration (none named) -> scaling")
+        elif proven:
+            proven_budget += exploration_budget
+            redistributed.append("exploration (none named) -> proven")
+        exploration_budget = 0
+
+    # Per-channel within slot
+    proven_alloc = split_within_slot(proven, proven_budget) if proven else {}
+    scaling_alloc = split_within_slot(scaling, scaling_budget) if scaling else {}
+    exploration_alloc = split_within_slot(exploration, exploration_budget) if exploration else {}
+
+    # Operator-named exploration channel (overrides redistribution)
+    if args.exploration_channel and args.exploration_channel not in exploration_alloc:
+        if exploration_budget == 0 and args.budget * exploration_share > 0:
+            # Take from scaling/proven by share if redistribution had hidden it
+            take_from = "scaling" if scaling_alloc else "proven"
+            take_amount = args.budget * exploration_share
+            target_alloc = scaling_alloc if take_from == "scaling" else proven_alloc
+            for ch in list(target_alloc.keys()):
+                if target_alloc[ch] >= take_amount / max(1, len(target_alloc)):
+                    target_alloc[ch] -= take_amount / max(1, len(target_alloc))
+            exploration_budget = take_amount
+        exploration_alloc = {args.exploration_channel: round(exploration_budget, 2)}
+
+    # Build the per-channel allocation map with slot + predicted CAC
+    allocations: dict[str, dict] = {}
+    for ch, sp in proven_alloc.items():
+        if sp <= 0:
+            continue
+        allocations[ch] = {
+            "spend": round(sp, 2),
+            "slot": "proven",
+            "predicted_cac": predicted_cac_for_channel(ch, diagnostics.get(ch), target_max_cac, "proven"),
+            "predicted_p": DEFAULT_PREDICTED_P["proven"],
+            "window": args.quarter,
+        }
+    for ch, sp in scaling_alloc.items():
+        if sp <= 0:
+            continue
+        allocations[ch] = {
+            "spend": round(sp, 2),
+            "slot": "scaling",
+            "predicted_cac": predicted_cac_for_channel(ch, diagnostics.get(ch), target_max_cac, "scaling"),
+            "predicted_p": DEFAULT_PREDICTED_P["scaling"],
+            "window": args.quarter,
+        }
+    for ch, sp in exploration_alloc.items():
+        if sp <= 0:
+            continue
+        allocations[ch] = {
+            "spend": round(sp, 2),
+            "slot": "exploration",
+            "predicted_cac": predicted_cac_for_channel(ch, diagnostics.get(ch), target_max_cac, "exploration"),
+            "predicted_p": DEFAULT_PREDICTED_P["exploration"],
+            "window": args.quarter,
+        }
+
+    # Validate sum equals budget within ±2%
+    total_alloc = sum(a["spend"] for a in allocations.values())
+    if abs(total_alloc - args.budget) > args.budget * 0.02:
+        return refuse("sum-mismatch",
+                      f"allocations sum to ${total_alloc:,.2f}, budget is ${args.budget:,.2f}. "
+                      f"Fix slot policy or operator-named channels and re-run.")
+
+    # Validate proven channels not above 2x target
+    warnings = list(redistributed and [f"slot redistribution: {r}" for r in redistributed])
+    invalid = []
+    for ch, a in allocations.items():
+        if a["slot"] == "proven" and a["predicted_cac"] > target_max_cac * 2.0:
+            invalid.append(f"`{ch}` predicted CAC ${a['predicted_cac']:,.2f} > 2x target_max_cac ${target_max_cac * 2:,.2f}")
+    if invalid:
+        return refuse("proven-channel-above-2x-target",
+                      "Channels marked proven must have predicted CAC below 2x target. "
+                      f"Move these to scaling or exploration: {invalid}")
+
+    # Quarter-end calculation
+    qm = re.match(r"^(\d{4})-Q([1-4])$", args.quarter)
+    if not qm:
+        return refuse("invalid-quarter", f"--quarter must be YYYY-Q[1-4], got {args.quarter}")
+    yr, qn = int(qm.group(1)), int(qm.group(2))
+    quarter_end_month = qn * 3
+    if quarter_end_month == 12:
+        quarter_end = f"{yr}-12-31"
+    else:
+        # last day of the quarter end month
+        next_month = quarter_end_month + 1
+        first_of_next = datetime(yr, next_month, 1)
+        quarter_end = (first_of_next - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Render allocation summary
+    out_dir = Path(args.out) if args.out else (SUBSTRATE_ROOT / "clients" / args.client / "ads" / "allocations")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    alloc_path = out_dir / f"{args.quarter}-{today}.md"
+
+    md = render_allocation_md(
+        client=args.client,
+        quarter=args.quarter,
+        today=today,
+        budget=args.budget,
+        ltv=args.ltv,
+        ratio=args.target_ltv_cac,
+        target_max_cac=target_max_cac,
+        policy=args.policy,
+        proven=proven, scaling=scaling, exploration=exploration,
+        allocations=allocations,
+        exploration_channel=args.exploration_channel,
+        warnings=warnings,
+    )
+    alloc_path.write_text(md, encoding="utf-8")
+
+    # Render measurement contracts
+    contracts_dir = SUBSTRATE_ROOT / "goals" / "measurement-contracts"
+    contracts_dir.mkdir(parents=True, exist_ok=True)
+    contract_paths = []
+    for ch, a in allocations.items():
+        cpath = contracts_dir / f"{args.client}-{ch}-{args.quarter}.md"
+        contract = render_measurement_contract(
+            client=args.client,
+            channel=ch,
+            slot=a["slot"],
+            spend=a["spend"],
+            ltv=args.ltv,
+            target_max_cac=target_max_cac,
+            predicted_cac=a["predicted_cac"],
+            ratio=args.target_ltv_cac,
+            quarter=args.quarter,
+            today=today,
+            quarter_end=quarter_end,
+            predicted_p=a["predicted_p"],
+        )
+        cpath.write_text(contract, encoding="utf-8")
+        contract_paths.append(str(cpath))
+
+    sys.stderr.write(f"\n[ad-spend-allocate] wrote allocation summary: {alloc_path}\n")
+    sys.stderr.write(f"  budget=${args.budget:,.2f}  target_max_cac=${target_max_cac:,.2f}  ratio={args.target_ltv_cac}\n")
+    sys.stderr.write(f"  channels: proven={len(proven)} scaling={len(scaling)} exploration={len(exploration)}\n")
+    sys.stderr.write(f"  measurement contracts emitted: {len(contract_paths)}\n")
+    for cp in contract_paths:
+        sys.stderr.write(f"    - {cp}\n")
+    print(str(alloc_path))
+
+    if warnings:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

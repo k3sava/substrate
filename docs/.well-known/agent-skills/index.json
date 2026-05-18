@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+  "skills": [
+    {
+      "name": "substrate-overview",
+      "type": "skill-md",
+      "description": "Open-source GTM operating system. Read PRINCIPLES.md and the eight layers via the canonical README.",
+      "url": "https://github.com/k3sava/substrate#readme"
+    },
+    {
+      "name": "substrate-cli",
+      "type": "skill-md",
+      "description": "Run skills, list registered skills, view review queue. bin/substrate <skill> <args>.",
+      "url": "https://github.com/k3sava/substrate/tree/main/bin"
+    }
+  ]
+}

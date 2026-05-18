@@ -1,0 +1,844 @@
+#!/usr/bin/env python3
+"""campaign-strategy — multi-channel campaign sequencing logic.
+
+Stages: thesis → audience → channel mix → cadence → measurement.
+
+Outputs a campaign spec with sub-files:
+  - spec.md (top-level)
+  - measurement-contract.md (goal-ledger contract opened at plan time)
+  - cadence.md (week-by-week launch sequence)
+  - briefs/<asset>.md per asset
+
+Refuses without:
+  - canonical positioning at clients/<client>/positioning/
+  - --campaign + --cohort + --outcome + --horizon + --channels (for plan mode)
+  - a falsifiable prediction (vanity metrics rejected)
+
+Patterns applied:
+  - launch-as-coordinated-distribution
+  - narrative-as-strategy
+  - distribution-as-moat
+  - agents-mapped-to-jtbd
+  - measurement-correlated-short-signals
+  - trigger-events-beat-cadence-blast
+  - channel-arbitrage-window
+  - intent-vs-interest-targeting
+
+Contradictions navigated:
+  - build-quietly-vs-distribution-first
+  - short-feedback-vs-long-term-holdouts
+  - outbound-vs-inbound-budget
+
+Exit codes:
+  0  spec written
+  1  written with warnings
+  3  refused
+  4  invalid args
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+os.environ["SUBSTRATE_ROOT"] = str(SUBSTRATE_ROOT)
+os.environ.setdefault("FLYWHEEL_ROOT", str(SUBSTRATE_ROOT))
+
+
+# Channel-fit map per pat_intent-vs-interest-targeting
+INTENT_CHANNELS = {"google-search", "bing-search", "google-shopping"}
+INTEREST_CHANNELS = {"google-pmax", "google-display", "meta-paid-social",
+                      "linkedin-sponsored", "tiktok", "x", "reddit", "youtube"}
+EARNED_CHANNELS = {"owned-blog", "newsletter", "podcast", "youtube-organic",
+                    "linkedin-organic", "twitter-organic", "community", "partners",
+                    "sales-outbound", "events", "press", "pr"}
+INBOUND_CHANNELS = {"owned-blog", "google-search", "newsletter", "podcast",
+                     "youtube-organic", "linkedin-organic", "community",
+                     "google-pmax", "google-display", "meta-paid-social"}
+OUTBOUND_CHANNELS = {"sales-outbound", "linkedin-sponsored", "events", "press"}
+
+
+VANITY_METRICS = {"engagement", "impressions", "reach", "followers",
+                   "shares", "likes", "brand awareness", "buzz", "mentions",
+                   "vanity", "noise", "viral"}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def find_positioning(client_root: Path) -> Path | None:
+    for candidate in ["positioning/positioning-canonical-statement.md",
+                      "positioning/canonical.md", "positioning.md"]:
+        p = client_root / candidate
+        if p.is_file():
+            return p
+    pos_dir = client_root / "positioning"
+    if pos_dir.is_dir():
+        canon = sorted(pos_dir.glob("*canonical*.md"), reverse=True)
+        if canon:
+            return canon[0]
+        any_md = sorted(pos_dir.glob("*.md"), reverse=True)
+        if any_md:
+            return any_md[0]
+    sub_dir = client_root / "substrate"
+    if sub_dir.is_dir():
+        canon = sorted(sub_dir.glob("positioning-canonical-statement-*.md"), reverse=True)
+        if canon:
+            return canon[0]
+    return None
+
+
+def detect_pmf_stage(client_root: Path) -> str:
+    for path in [client_root / "strategy" / "pmf-stage.md",
+                 client_root / "BRIEF.md",
+                 client_root / "00-INDEX.md"]:
+        if path.is_file():
+            text = path.read_text(encoding="utf-8").lower()
+            if "post-pmf" in text or "post pmf" in text:
+                return "post-pmf"
+            if "pre-pmf" in text or "pre pmf" in text:
+                return "pre-pmf"
+    return "unknown"
+
+
+def is_falsifiable_outcome(outcome: str) -> bool:
+    """Reject vanity-metric outcomes; require a measurable shape."""
+    o_lower = outcome.lower()
+    for v in VANITY_METRICS:
+        if v in o_lower and "measurement" not in o_lower:
+            # mention of vanity metric without measurement context
+            return False
+    # Acceptable: contains a number/threshold or a source-system or a percent
+    if any(token in o_lower for token in ["%", "$", "x ", " by ", "increase ", "decrease ",
+                                            "lift ", "above ", "below ", "to "]) or \
+       re.search(r"\d", o_lower):
+        return True
+    # Otherwise: refuse
+    return False
+
+
+def classify_channel(ch: str) -> dict[str, bool]:
+    return {
+        "intent": ch in INTENT_CHANNELS,
+        "interest": ch in INTEREST_CHANNELS,
+        "earned": ch in EARNED_CHANNELS,
+        "inbound": ch in INBOUND_CHANNELS,
+        "outbound": ch in OUTBOUND_CHANNELS,
+        "algorithm_rented": ch in ({"google-search", "google-pmax", "google-display"} |
+                                    {"meta-paid-social", "linkedin-sponsored", "tiktok", "x"}),
+    }
+
+
+def channel_kpi_for(ch: str) -> str:
+    """Per pat_intent-vs-interest-targeting: pick the KPI the channel actually fits."""
+    cls = classify_channel(ch)
+    if cls["intent"]:
+        return "cost-per-qualified-lead + impression-share for high-intent queries"
+    if cls["interest"]:
+        return "cohort-level CAC over 60-90 day window + assisted conversions + branded-search lift"
+    if ch in ("owned-blog", "podcast", "youtube-organic", "linkedin-organic"):
+        return "organic traffic to AEO-optimized pages + citation rate on target prompts"
+    if ch == "newsletter":
+        return "open rate × click rate × downstream conversion in CRM"
+    if ch == "sales-outbound":
+        return "trigger-events-mapped meeting rate (per pat_trigger-events-beat-cadence-blast)"
+    if ch == "community":
+        return "earned mentions density + community-attributed signups"
+    if ch == "partners":
+        return "partner-co-marketing leads × close rate × deal size"
+    return "channel-specific (refuse generic CTR / impressions)"
+
+
+def render_spec(*,
+                client: str,
+                campaign: str,
+                cohort: str,
+                outcome: str,
+                horizon_weeks: int,
+                channels: list[str],
+                pmf_stage: str,
+                positioning_path: Path | None,
+                today: str,
+                start_date: datetime) -> str:
+    end_date = start_date + timedelta(weeks=horizon_weeks)
+    cohort_size_signals = "TBD (fill from clients/" + client + "/icp/<cohort>.md)"
+
+    # Build channel matrix
+    channel_rows = []
+    intent_share = 0
+    interest_share = 0
+    earned_share = 0
+    rented_share = 0
+    outbound_share = 0
+    inbound_share = 0
+    for ch in channels:
+        cls = classify_channel(ch)
+        kpi = channel_kpi_for(ch)
+        if cls["intent"]:
+            intent_share += 1
+        if cls["interest"]:
+            interest_share += 1
+        if cls["earned"]:
+            earned_share += 1
+        if cls["algorithm_rented"]:
+            rented_share += 1
+        if cls["outbound"]:
+            outbound_share += 1
+        if cls["inbound"]:
+            inbound_share += 1
+        kind = "intent" if cls["intent"] else "interest" if cls["interest"] else "earned" if cls["earned"] else "other"
+        channel_rows.append((ch, kind, kpi, "yes" if cls["algorithm_rented"] else "no"))
+
+    n = max(1, len(channels))
+
+    # Contradiction navigation: outbound-vs-inbound-budget
+    if outbound_share / n > 0.6:
+        outbound_position = "Position B (outbound-weighted)"
+        outbound_rationale = (
+            f"Channel mix is {outbound_share}/{n} outbound channels. The campaign weights outbound; "
+            "this is appropriate when the cohort is high-value enterprise where trigger events drive "
+            "bookings (per pat_trigger-events-beat-cadence-blast) and inbound has not compounded yet."
+        )
+    elif inbound_share / n > 0.6:
+        outbound_position = "Position A (inbound-weighted)"
+        outbound_rationale = (
+            f"Channel mix is {inbound_share}/{n} inbound channels. The campaign weights inbound; "
+            "this is appropriate when the cohort is reachable through search + content + product-led "
+            "discovery, and the playbook compounds via earned distribution per pat_distribution-as-moat."
+        )
+    else:
+        outbound_position = "Position C (balanced)"
+        outbound_rationale = (
+            f"Channel mix balances inbound ({inbound_share}/{n}) and outbound ({outbound_share}/{n}). "
+            "The campaign tests both motions in parallel and resolves which one returns better unit economics "
+            "in the retrospective."
+        )
+
+    # Contradiction navigation: short-feedback-vs-long-term-holdouts
+    if horizon_weeks <= 4:
+        feedback_position = "Position A (short feedback)"
+        feedback_rationale = (
+            f"Horizon = {horizon_weeks} weeks. Short feedback loop is sharper than a long-window holdout "
+            "for a sub-month campaign; cohort size noise dominates beyond the window."
+        )
+    elif horizon_weeks >= 12:
+        feedback_position = "Position B (long-term holdout)"
+        feedback_rationale = (
+            f"Horizon = {horizon_weeks} weeks. The window is long enough to disambiguate the campaign's "
+            "effect from baseline trend; the geo-holdout or cohort-holdout is the right discipline."
+        )
+    else:
+        feedback_position = "Position A+B (mid-window: hybrid)"
+        feedback_rationale = (
+            f"Horizon = {horizon_weeks} weeks. Run a short-feedback loop in week 2 against the early "
+            "indicators (correlated short signals per pat_measurement-correlated-short-signals) plus a "
+            "cohort-holdout reading at the campaign close."
+        )
+
+    # Contradiction navigation: build-quietly-vs-distribution-first
+    if pmf_stage == "pre-pmf":
+        build_quietly_position = "Position A (build quietly)"
+        build_quietly_rationale = (
+            "PMF stage: pre-pmf. The campaign defers to research-preview-only motion; the multi-channel "
+            "coordinated push activates only post-PMF."
+        )
+    else:
+        build_quietly_position = "Position B (distribution-first)"
+        build_quietly_rationale = (
+            f"PMF stage: {pmf_stage}. Per pat_distribution-as-moat, the moat is distribution; the campaign "
+            "compounds the channel mix that earned its place."
+        )
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: campaign-spec")
+    lines.append("produced_by: campaign-strategy")
+    lines.append(f"client: {client}")
+    lines.append(f"campaign: {campaign}")
+    lines.append(f"cohort: {cohort}")
+    lines.append(f"outcome: {outcome}")
+    lines.append(f"horizon_weeks: {horizon_weeks}")
+    lines.append(f"channels: [{', '.join(channels)}]")
+    lines.append(f"start_date: {start_date.strftime('%Y-%m-%d')}")
+    lines.append(f"end_date: {end_date.strftime('%Y-%m-%d')}")
+    lines.append(f"pmf_stage: {pmf_stage}")
+    lines.append(f"authored_at: {today}")
+    lines.append("substrate_layers_cited: [positioning, icp, voc, market-context, sales-pitch, conversion-narrative]")
+    lines.append("patterns_applied: [launch-as-coordinated-distribution, narrative-as-strategy, distribution-as-moat, channel-arbitrage-window, intent-vs-interest-targeting, trigger-events-beat-cadence-blast, measurement-correlated-short-signals]")
+    lines.append("contradiction_positions:")
+    lines.append(f"  build-quietly-vs-distribution-first: {build_quietly_position}")
+    lines.append(f"  short-feedback-vs-long-term-holdouts: {feedback_position}")
+    lines.append(f"  outbound-vs-inbound-budget: {outbound_position}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Campaign spec — {client} | {campaign}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"A {horizon_weeks}-week campaign targeting `{cohort}` with the outcome **{outcome}**, "
+                 f"shipping across {len(channels)} channels: {', '.join(f'`{c}`' for c in channels)}. "
+                 f"Window: {start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}. "
+                 "Measurement contract opened at plan time; channels are adaptations of one canonical "
+                 "narrative spine; the kill criterion is named.")
+    lines.append("")
+    lines.append("## Stage 1 — Thesis (the bet)")
+    lines.append("")
+    lines.append("**The claim**: TBD — fill the canonical narrative this campaign instantiates. Per "
+                 "pat_narrative-as-strategy, the spine is one canonical story; every channel adaptation "
+                 "below traces back to this single spine.")
+    lines.append("")
+    lines.append(f"**The shift in 1-3 words**: TBD (e.g. \"calls are not enough\")")
+    lines.append("")
+    lines.append("**The world-shift**: TBD — what changed in the world that makes this campaign timely.")
+    lines.append("")
+    if positioning_path:
+        rel = positioning_path.relative_to(SUBSTRATE_ROOT) if str(positioning_path).startswith(str(SUBSTRATE_ROOT)) else positioning_path
+        lines.append(f"**Positioning citation**: `{rel}`. Every claim in every asset traces to this file.")
+    lines.append("")
+    lines.append("## Stage 2 — Audience (cohort + size)")
+    lines.append("")
+    lines.append(f"**Cohort**: `{cohort}`. Sourced from `clients/{client}/icp/`.")
+    lines.append("")
+    lines.append(f"**Cohort size signals**: {cohort_size_signals}")
+    lines.append("")
+    lines.append("**Buyer state**: TBD — name the buyer-state cohort (unaware / problem-aware / "
+                 "solution-aware / product-aware / most-aware). Different states call for different "
+                 "asset shapes.")
+    lines.append("")
+    lines.append("**VoC citations**: pull 2-3 verbatim buyer quotes from `clients/" + client + "/voc/processed/` "
+                 "that grounded the cohort definition. Without them, the cohort is theoretical.")
+    lines.append("")
+    lines.append("## Stage 3 — Channel mix")
+    lines.append("")
+    lines.append(f"Mix selection per pat_channel-arbitrage-window + pat_intent-vs-interest-targeting + "
+                 "pat_distribution-as-moat:")
+    lines.append("")
+    lines.append("| Channel | Kind | Algorithm-rented | KPI fit |")
+    lines.append("|---|---|---|---|")
+    for ch, kind, kpi, rented in channel_rows:
+        lines.append(f"| `{ch}` | {kind} | {rented} | {kpi} |")
+    lines.append("")
+    lines.append("**Composition summary**:")
+    lines.append("")
+    lines.append(f"- Intent channels (search): {intent_share}/{n}")
+    lines.append(f"- Interest channels (paid social, display, video): {interest_share}/{n}")
+    lines.append(f"- Earned channels: {earned_share}/{n}")
+    lines.append(f"- Algorithm-rented share: {rented_share}/{n}")
+    lines.append("")
+    lines.append(f"Per pat_distribution-as-moat, every dollar in algorithm-rented channels makes the "
+                 "platform richer, not the brand. The earned-channel share is the moat the campaign builds.")
+    lines.append("")
+    if intent_share > 0 and interest_share > 0:
+        lines.append("**Cross-channel KPI separation** (per pat_intent-vs-interest-targeting):")
+        lines.append("- Hold intent channels to cost-per-qualified-lead, impression-share for high-intent queries.")
+        lines.append("- Hold interest channels to cohort-level CAC over 60-90 day window plus assisted conversions and branded-search lift.")
+        lines.append("- Cross-channel allocation read against last-click CAC undercounts interest-channel impact.")
+        lines.append("")
+    lines.append("## Stage 4 — Cadence")
+    lines.append("")
+    lines.append(f"Week-by-week launch sequence. Output: `cadence.md` (also written by this skill).")
+    lines.append("")
+    lines.append("Sequence principle (per pat_launch-as-coordinated-distribution): one canonical narrative "
+                 "spine, channel-specific instantiations, staggered for amplification rather than simultaneous.")
+    lines.append("")
+    lines.append(f"| Week | Phase | Asset | Channel | Owner |")
+    lines.append("|---|---|---|---|---|")
+    for w in range(min(horizon_weeks, 8)):
+        if w == 0:
+            phase = "kickoff"
+            asset = "narrative announcement post"
+            ch = channels[0] if channels else "owned-blog"
+        elif w == 1:
+            phase = "amplify"
+            asset = "supporting asset (case study / data deep-dive)"
+            ch = channels[1 % len(channels)] if channels else "social"
+        elif w == horizon_weeks - 1:
+            phase = "close"
+            asset = "retrospective + measurement reading"
+            ch = "owned-blog"
+        else:
+            phase = "compound"
+            asset = f"cadence asset {w + 1} (cohort engagement)"
+            ch = channels[w % len(channels)] if channels else "social"
+        lines.append(f"| W{w + 1} | {phase} | {asset} | `{ch}` | TBD |")
+    if horizon_weeks > 8:
+        lines.append(f"| … | … | … | … | … |")
+        lines.append(f"| W{horizon_weeks} | resolution | retrospective | owned-blog | PMM |")
+    lines.append("")
+    lines.append("**Trigger-events overlay**: per pat_trigger-events-beat-cadence-blast, layer trigger-event "
+                 "outreach into the cadence (a buyer-side event — funding round, hire, product launch, "
+                 "competitor switch — fires a 1:1 outbound touch within 48h of detection).")
+    lines.append("")
+    lines.append("## Stage 5 — Measurement")
+    lines.append("")
+    lines.append(f"**Predicted outcome**: {outcome}")
+    lines.append("")
+    lines.append(f"**Source-system**: TBD (analytics / CRM / billing — name the canonical artifact).")
+    lines.append("")
+    lines.append(f"**Window**: {start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')} "
+                 f"({horizon_weeks} weeks).")
+    lines.append("")
+    lines.append("**Calibrated prediction (P)**: TBD (operator's probability estimate, 0-1). Brier-scored at resolution.")
+    lines.append("")
+    lines.append("**Correlated short signal** (per pat_measurement-correlated-short-signals): pick a 7-day "
+                 "or 14-day proxy that correlates with the 12-week outcome; track it weekly.")
+    lines.append("")
+    lines.append(f"**Output**: `measurement-contract.md` (a goal-ledger contract, written alongside this spec).")
+    lines.append("")
+    lines.append("## Stage 6 — Kill criterion")
+    lines.append("")
+    lines.append("Named conditions that trigger early termination:")
+    lines.append("")
+    lines.append(f"- Correlated short signal at week 2 trends below the 50% confidence band of the prediction.")
+    lines.append(f"- A frontier asset is rescinded by a customer.")
+    lines.append(f"- A regulatory or compliance issue surfaces.")
+    lines.append(f"- Cumulative spend (if paid channels) exceeds 60% of budget without 50% of the predicted lift.")
+    lines.append(f"- Narrative drift detected: shipped asset contradicts the spine (per pat_narrative-as-strategy).")
+    lines.append("")
+    lines.append("## Contradiction navigation")
+    lines.append("")
+    lines.append(f"### build-quietly-vs-distribution-first → {build_quietly_position}")
+    lines.append("")
+    lines.append(build_quietly_rationale)
+    lines.append("")
+    lines.append(f"### short-feedback-vs-long-term-holdouts → {feedback_position}")
+    lines.append("")
+    lines.append(feedback_rationale)
+    lines.append("")
+    lines.append(f"### outbound-vs-inbound-budget → {outbound_position}")
+    lines.append("")
+    lines.append(outbound_rationale)
+    lines.append("")
+    lines.append("## Open questions")
+    lines.append("")
+    lines.append("- Which 2-3 verbatim buyer quotes ground the cohort? (pull from VoC corpus before launch)")
+    lines.append("- What is the predicted lift on the primary metric? Without P, the campaign is theater.")
+    lines.append("- Which competitor is the primary displacement target? Source: competitive layer.")
+    lines.append(f"- Which weeks need a creative refresh? Per pat_creative-fatigue-window, the refresh cadence "
+                 "is the lever; an empty brief queue degrades predicted CAC.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append(f"- `clients/{client}/campaigns/{campaign}/measurement-contract.md`")
+    lines.append(f"- `clients/{client}/campaigns/{campaign}/cadence.md`")
+    lines.append(f"- `clients/{client}/campaigns/{campaign}/briefs/`")
+    lines.append("- `knowledge/patterns/launch-as-coordinated-distribution.md`")
+    lines.append("- `knowledge/patterns/distribution-as-moat.md`")
+    lines.append("- `knowledge/patterns/intent-vs-interest-targeting.md`")
+    lines.append("- `knowledge/patterns/channel-arbitrage-window.md`")
+    lines.append("- `knowledge/patterns/measurement-correlated-short-signals.md`")
+    lines.append("- `knowledge/patterns/trigger-events-beat-cadence-blast.md`")
+
+    return "\n".join(lines)
+
+
+def render_measurement_contract(*, client: str, campaign: str, cohort: str,
+                                 outcome: str, horizon_weeks: int,
+                                 today: str, start_date: datetime,
+                                 channels: list[str]) -> str:
+    end_date = start_date + timedelta(weeks=horizon_weeks)
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"goal_id: {client}-campaign-{campaign}")
+    lines.append(f"client: {client}")
+    lines.append(f"opener: campaign-strategy")
+    lines.append(f"opened_at: {today}")
+    lines.append("status: proposed")
+    lines.append("taste_type: demand-gen")
+    lines.append(f"resolution_date: {end_date.strftime('%Y-%m-%d')}")
+    lines.append("substrate_layers_cited: [positioning, icp, voc, market-context]")
+    lines.append("patterns_applied: [launch-as-coordinated-distribution, measurement-correlated-short-signals]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Measurement contract — {client} campaign {campaign}")
+    lines.append("")
+    lines.append("## Hypothesis")
+    lines.append("")
+    lines.append(f"Running campaign `{campaign}` against `{cohort}` over {horizon_weeks} weeks "
+                 f"({start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}) produces the "
+                 f"named outcome: **{outcome}**.")
+    lines.append("")
+    lines.append("## Predicted outcomes (falsifiable)")
+    lines.append("")
+    lines.append("| Metric | Direction | Threshold | Window | Source-system |")
+    lines.append("|---|---|---|---|---|")
+    lines.append(f"| (primary) | (up/down) | (delta) | {horizon_weeks}w | (named system) |")
+    lines.append(f"| (correlated short signal — 7d) | (up/down) | (delta) | 7d | (named system) |")
+    lines.append("")
+    lines.append("Per pat_measurement-correlated-short-signals: pick a 7-day or 14-day proxy that "
+                 "correlates with the longer outcome; track it weekly.")
+    lines.append("")
+    lines.append("## Predicted probability of hitting threshold (P)")
+    lines.append("")
+    lines.append("Operator's calibrated prediction: P = (fill, 0-1). Brier-scored at resolution.")
+    lines.append("")
+    lines.append("## Kill criterion")
+    lines.append("")
+    lines.append("- Correlated short signal at week 2 below 50% confidence band of prediction → pause; diagnose.")
+    lines.append("- Cumulative paid spend > 60% of budget without > 50% of predicted lift → pause; diagnose.")
+    lines.append("- Narrative drift detected on a shipped asset → fix and rerun the publish gate.")
+    lines.append("")
+    lines.append("## Resolution")
+    lines.append(f"Resolves at {end_date.strftime('%Y-%m-%d')}. Verdict: YES if predicted outcome hit threshold; "
+                 "NO if missed; AMBIGUOUS if data quality fails.")
+    lines.append("")
+    lines.append("Brier score: (P - indicator)^2. Feeds calibration ledger.")
+    lines.append("")
+    lines.append("## Substrate update on resolution")
+    lines.append("")
+    lines.append("- If YES: confirm channel mix; capture customer artifacts that emerged.")
+    lines.append("- If NO: open follow-up goal against corrected hypothesis; update voc + competitive.")
+    lines.append("- If AMBIGUOUS: name the data gap; reopen with sharper measurement design.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append(f"- `clients/{client}/campaigns/{campaign}/spec.md`")
+    lines.append("- `goals/ledger.md`")
+    return "\n".join(lines)
+
+
+def render_cadence(*, client: str, campaign: str, channels: list[str],
+                   horizon_weeks: int, start_date: datetime, today: str) -> str:
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: campaign-cadence")
+    lines.append("produced_by: campaign-strategy")
+    lines.append(f"client: {client}")
+    lines.append(f"campaign: {campaign}")
+    lines.append(f"horizon_weeks: {horizon_weeks}")
+    lines.append(f"channels: [{', '.join(channels)}]")
+    lines.append(f"authored_at: {today}")
+    lines.append("substrate_layers_cited: [positioning, icp]")
+    lines.append("patterns_applied: [launch-as-coordinated-distribution, trigger-events-beat-cadence-blast, channel-arbitrage-window]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Cadence — {client} campaign {campaign}")
+    lines.append("")
+    lines.append("## Week-by-week schedule")
+    lines.append("")
+    lines.append("Per pat_launch-as-coordinated-distribution: staggered for amplification, not simultaneous.")
+    lines.append("")
+    for w in range(horizon_weeks):
+        wd = start_date + timedelta(weeks=w)
+        lines.append(f"### Week {w + 1} — {wd.strftime('%Y-%m-%d')}")
+        lines.append("")
+        if w == 0:
+            lines.append("- **Monday**: kickoff — narrative spine published on owned blog.")
+            lines.append(f"- **Tuesday**: amplify on `{channels[0]}` if not the kickoff channel.")
+            lines.append("- **Wednesday**: email to all-customer + waitlist + prospects.")
+            lines.append("- **Thursday-Friday**: monitor cadence; escalate if signal is off-prediction.")
+        elif w == horizon_weeks - 1:
+            lines.append("- **Monday**: final asset ships (retrospective preview).")
+            lines.append("- **Tuesday-Thursday**: data pulls from each source-system.")
+            lines.append("- **Friday**: retrospective written; goal resolved; calibration ledger updated.")
+        else:
+            for j, ch in enumerate(channels):
+                day = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"][j % 5]
+                lines.append(f"- **{day}**: `{ch}` asset shipped.")
+        lines.append("")
+    lines.append("## Trigger-events overlay")
+    lines.append("")
+    lines.append("Per pat_trigger-events-beat-cadence-blast: layer trigger-event outreach into the cadence. "
+                 "A buyer-side event (funding round, hire, product launch, competitor switch) detected in the cohort "
+                 "fires a 1:1 outbound touch within 48h.")
+    lines.append("")
+    lines.append("Sources to monitor (per the cohort): TBD — fill from `clients/" + client + "/intent-feeds/` if present.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append(f"- `clients/{client}/campaigns/{campaign}/spec.md`")
+    lines.append("- `knowledge/patterns/trigger-events-beat-cadence-blast.md`")
+    return "\n".join(lines)
+
+
+def render_brief(client: str, campaign: str, asset: str, channel: str, today: str) -> str:
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: campaign-brief")
+    lines.append("produced_by: campaign-strategy")
+    lines.append(f"client: {client}")
+    lines.append(f"campaign: {campaign}")
+    lines.append(f"asset: {asset}")
+    lines.append(f"channel: {channel}")
+    lines.append(f"authored_at: {today}")
+    lines.append("substrate_layers_cited: [positioning, icp, voc]")
+    lines.append("patterns_applied: [narrative-as-strategy]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Brief — {asset} for {channel}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"One-page brief that another skill (`lp-ship`, `narrative-compose`, `outbound-sequence-design`, "
+                 "etc.) consumes to produce the asset. The brief is canonical; the asset is the implementation.")
+    lines.append("")
+    lines.append("## Audience")
+    lines.append("")
+    lines.append("- Cohort: TBD")
+    lines.append("- Buyer state: TBD")
+    lines.append("- VoC anchors (verbatim): TBD")
+    lines.append("")
+    lines.append("## Outcome")
+    lines.append("")
+    lines.append("What the buyer should do after consuming this asset: TBD.")
+    lines.append("")
+    lines.append("## Narrative spine reference")
+    lines.append("")
+    lines.append("- Spine: TBD (cite the campaign spec)")
+    lines.append("- One-line message: TBD")
+    lines.append("- Three supporting points: TBD")
+    lines.append("")
+    lines.append("## Channel constraints")
+    lines.append("")
+    lines.append(f"- Format: per `{channel}`")
+    lines.append("- Length: TBD")
+    lines.append("- Voice: per `clients/" + client + "/brand-voice/` and `knowledge/voice/how-we-write.md`")
+    lines.append("")
+    lines.append("## Refusal triggers")
+    lines.append("")
+    lines.append("- Asset that contradicts the spine.")
+    lines.append("- Asset that uses kill-list words (orchestration, seamless, leverage, transform, holistic, synergy, bespoke, unlock).")
+    lines.append("- Claim that doesn't trace to a context path.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append(f"- `clients/{client}/campaigns/{campaign}/spec.md`")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="campaign-strategy — multi-channel campaign sequencing")
+    p.add_argument("--client", required=True)
+    p.add_argument("--campaign", required=False, help="campaign slug")
+    p.add_argument("--cohort", required=False, help="pinned ICP cohort")
+    p.add_argument("--outcome", required=False, help="named business outcome (must be falsifiable)")
+    p.add_argument("--horizon", type=int, default=None, help="campaign window in weeks")
+    p.add_argument("--channels", default=None,
+                   help="comma-separated channel slugs (e.g. owned-blog,linkedin-organic,google-search,meta-paid-social)")
+    p.add_argument("--start-date", default=None, help="YYYY-MM-DD; defaults to next Monday")
+    p.add_argument("--mode", default="plan",
+                   choices=["plan", "brief", "measure", "retrospective"])
+    p.add_argument("--asset", default=None, help="asset slug for --mode brief")
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        return refuse(
+            f"client root missing: clients/{args.client}/",
+            f"run: bin/substrate-bootstrap-prospect {args.client}",
+        )
+
+    # Refusal: positioning
+    positioning_path = find_positioning(client_root)
+    if not positioning_path:
+        return refuse(
+            "missing-positioning",
+            f"no canonical positioning at clients/{args.client}/positioning/. "
+            f"Run positioning-forge --diagnose --client {args.client} first.",
+        )
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if args.mode == "plan":
+        for arg_name in ("campaign", "cohort", "outcome", "horizon", "channels"):
+            if not getattr(args, arg_name):
+                return refuse(
+                    f"missing-{arg_name.replace('_', '-')}",
+                    f"--{arg_name.replace('_', '-')} required for --mode plan",
+                )
+
+        # Refusal: falsifiable outcome
+        if not is_falsifiable_outcome(args.outcome):
+            return refuse(
+                "missing-falsifiable-prediction",
+                f"--outcome '{args.outcome}' is not falsifiable. The outcome must reference a measurable "
+                "shape (a number, percent, dollar amount, source-system metric). Vanity metrics like "
+                "'engagement', 'impressions', 'reach', 'brand awareness' (without a measurement contract) "
+                "are refused. See pat_measurement-correlated-short-signals.",
+            )
+
+        channels = [c.strip() for c in args.channels.split(",") if c.strip()]
+        if not channels:
+            return refuse("missing-channels", "--channels list is empty after parsing.")
+
+        # Determine start date
+        if args.start_date:
+            try:
+                start_date = datetime.strptime(args.start_date, "%Y-%m-%d")
+            except ValueError:
+                return refuse("invalid-start-date", f"--start-date must be YYYY-MM-DD, got: {args.start_date}")
+        else:
+            now = datetime.now(timezone.utc)
+            days_until_monday = (0 - now.weekday()) % 7
+            if days_until_monday == 0:
+                days_until_monday = 7
+            start_date = (now + timedelta(days=days_until_monday)).replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
+
+        pmf_stage = detect_pmf_stage(client_root)
+
+        out_dir = Path(args.out) if args.out else (client_root / "campaigns" / args.campaign)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        spec_path = out_dir / "spec.md"
+        spec_path.write_text(render_spec(
+            client=args.client,
+            campaign=args.campaign,
+            cohort=args.cohort,
+            outcome=args.outcome,
+            horizon_weeks=args.horizon,
+            channels=channels,
+            pmf_stage=pmf_stage,
+            positioning_path=positioning_path,
+            today=today,
+            start_date=start_date,
+        ), encoding="utf-8")
+
+        contract_path = out_dir / "measurement-contract.md"
+        contract_path.write_text(render_measurement_contract(
+            client=args.client,
+            campaign=args.campaign,
+            cohort=args.cohort,
+            outcome=args.outcome,
+            horizon_weeks=args.horizon,
+            today=today,
+            start_date=start_date,
+            channels=channels,
+        ), encoding="utf-8")
+
+        cadence_path = out_dir / "cadence.md"
+        cadence_path.write_text(render_cadence(
+            client=args.client,
+            campaign=args.campaign,
+            channels=channels,
+            horizon_weeks=args.horizon,
+            start_date=start_date,
+            today=today,
+        ), encoding="utf-8")
+
+        # Bootstrap a brief per channel
+        briefs_dir = out_dir / "briefs"
+        briefs_dir.mkdir(exist_ok=True)
+        for ch in channels:
+            asset_slug = ch  # 1 brief per channel; operator can add more
+            brief_path = briefs_dir / f"{asset_slug}.md"
+            if not brief_path.exists():
+                brief_path.write_text(render_brief(args.client, args.campaign, asset_slug, ch, today), encoding="utf-8")
+
+        sys.stderr.write(f"\n[campaign-strategy] mode=plan\n")
+        sys.stderr.write(f"  spec:        {spec_path}\n")
+        sys.stderr.write(f"  contract:    {contract_path}\n")
+        sys.stderr.write(f"  cadence:     {cadence_path}\n")
+        sys.stderr.write(f"  briefs:      {briefs_dir}/ ({len(channels)} bootstrapped)\n")
+        sys.stderr.write(f"  channels:    {len(channels)} (intent={sum(1 for c in channels if classify_channel(c)['intent'])} interest={sum(1 for c in channels if classify_channel(c)['interest'])} earned={sum(1 for c in channels if classify_channel(c)['earned'])})\n")
+        print(str(spec_path))
+        return 0
+
+    if args.mode == "brief":
+        if not args.campaign or not args.asset:
+            return refuse("missing-args", "--campaign and --asset required for --mode brief")
+        out_dir = Path(args.out) if args.out else (client_root / "campaigns" / args.campaign / "briefs")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        brief_path = out_dir / f"{args.asset}.md"
+        brief_path.write_text(render_brief(args.client, args.campaign, args.asset,
+                                            args.channels or "owned-blog", today), encoding="utf-8")
+        sys.stderr.write(f"\n[campaign-strategy] wrote brief: {brief_path}\n")
+        print(str(brief_path))
+        return 0
+
+    if args.mode in ("measure", "retrospective"):
+        if not args.campaign:
+            return refuse("missing-campaign", f"--campaign required for --mode {args.mode}")
+        # For now, both modes route to a retrospective-shaped artifact
+        out_dir = Path(args.out) if args.out else (client_root / "campaigns" / args.campaign)
+        retro_path = out_dir / ("retrospective.md" if args.mode == "retrospective" else "mid-campaign-read.md")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Re-derive from the spec if possible
+        spec_path = out_dir / "spec.md"
+        if spec_path.is_file():
+            spec_text = spec_path.read_text(encoding="utf-8")
+            cohort_match = re.search(r"^cohort:\s*(.+)$", spec_text, re.MULTILINE)
+            outcome_match = re.search(r"^outcome:\s*(.+)$", spec_text, re.MULTILINE)
+            cohort = cohort_match.group(1) if cohort_match else (args.cohort or "TBD")
+            outcome = outcome_match.group(1) if outcome_match else (args.outcome or "TBD")
+        else:
+            cohort = args.cohort or "TBD"
+            outcome = args.outcome or "TBD"
+
+        lines = []
+        lines.append("---")
+        lines.append(f"asset_type: campaign-{args.mode}")
+        lines.append("produced_by: campaign-strategy")
+        lines.append(f"client: {args.client}")
+        lines.append(f"campaign: {args.campaign}")
+        lines.append(f"cohort: {cohort}")
+        lines.append(f"outcome: {outcome}")
+        lines.append(f"resolved_at: {today}")
+        lines.append("substrate_layers_cited: [positioning, icp, voc]")
+        lines.append("patterns_applied: [launch-as-coordinated-distribution, measurement-correlated-short-signals]")
+        lines.append("---")
+        lines.append("")
+        lines.append(f"# Campaign {args.mode} — {args.client} | {args.campaign}")
+        lines.append("")
+        if args.mode == "retrospective":
+            lines.append("## Resolution")
+            lines.append("")
+            lines.append("- **Predicted outcome**: " + outcome)
+            lines.append("- **Observed outcome**: TBD (cite source-system pull)")
+            lines.append("- **Verdict**: YES / NO / AMBIGUOUS")
+            lines.append("- **Brier score**: TBD")
+            lines.append("")
+        else:
+            lines.append("## Mid-campaign read")
+            lines.append("")
+            lines.append("- **Correlated short signal at this point**: TBD")
+            lines.append("- **vs predicted at this point**: above / below / on")
+            lines.append("- **Action**: continue / amplify / kill")
+            lines.append("")
+        lines.append("## What worked / didn't / open")
+        lines.append("")
+        lines.append("- Worked: (fill)")
+        lines.append("- Didn't: (fill)")
+        lines.append("- Open: (fill)")
+        lines.append("")
+        lines.append("## Substrate updates")
+        lines.append("")
+        lines.append(f"- `clients/{args.client}/positioning/`: (any updates)")
+        lines.append(f"- `clients/{args.client}/voc/processed/`: (any updates)")
+        lines.append(f"- `clients/{args.client}/competitive/`: (any updates)")
+
+        retro_path.write_text("\n".join(lines), encoding="utf-8")
+        sys.stderr.write(f"\n[campaign-strategy] wrote {args.mode}: {retro_path}\n")
+        print(str(retro_path))
+        return 0
+
+    return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+"""lift-test-design, design a holdout / geo / synthetic-control / pre-post test.
+
+Computes sample size, MDE, power, audience-holdout shape, randomization protocol,
+validity window. Writes test spec + measurement contract that opens a goal.
+Refuses without baseline + canonical positioning + metric-tree.yaml.
+
+Per the incrementality-not-attribution + measurement-correlated-short-signals
+patterns, the spec carries the full math, names the corroborating signals, and
+declares a contradiction position on short-feedback-vs-long-term-holdouts (fast
+loop vs long-window holdout) with the conditioning evidence.
+
+Surfaces: paid-ads, email, retention, abm, content, onboarding.
+Modes: geo-holdout, audience-holdout, psa-control, synthetic-control,
+       switchback, pre-post.
+
+Usage:
+    lift-test-design --client <client> --surface <surface> --mode <mode> \\
+        --metric <metric-id-from-tree> \\
+        --baseline <weekly-rate-or-count> --quarter <YYYY-Q[1-4]> \\
+        [--mde-pct <float>] [--alpha <float>] [--power <float>] \\
+        [--treatment-share <float>] [--predicted-p <float>]
+
+Exit codes:
+    0, design + contract written
+    1, written with warnings
+    3, refused (substrate gap)
+    4, invalid args
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+
+VALID_SURFACES = {"paid-ads", "email", "retention", "abm", "content", "onboarding"}
+VALID_MODES = {"geo-holdout", "audience-holdout", "psa-control", "synthetic-control",
+               "switchback", "pre-post"}
+
+# Surface-mode fit map. "good" / "fair" / "poor".
+SURFACE_MODE_FIT: dict[tuple[str, str], str] = {
+    # paid-ads
+    ("paid-ads", "geo-holdout"): "good",
+    ("paid-ads", "audience-holdout"): "fair",
+    ("paid-ads", "psa-control"): "good",
+    ("paid-ads", "synthetic-control"): "fair",
+    ("paid-ads", "switchback"): "poor",
+    ("paid-ads", "pre-post"): "fair",
+    # email
+    ("email", "geo-holdout"): "poor",
+    ("email", "audience-holdout"): "good",
+    ("email", "psa-control"): "poor",
+    ("email", "synthetic-control"): "fair",
+    ("email", "switchback"): "fair",
+    ("email", "pre-post"): "fair",
+    # retention (in-product nudge)
+    ("retention", "geo-holdout"): "poor",
+    ("retention", "audience-holdout"): "good",
+    ("retention", "psa-control"): "poor",
+    ("retention", "synthetic-control"): "fair",
+    ("retention", "switchback"): "good",
+    ("retention", "pre-post"): "fair",
+    # abm
+    ("abm", "geo-holdout"): "fair",
+    ("abm", "audience-holdout"): "good",
+    ("abm", "psa-control"): "poor",
+    ("abm", "synthetic-control"): "good",
+    ("abm", "switchback"): "poor",
+    ("abm", "pre-post"): "fair",
+    # content
+    ("content", "geo-holdout"): "fair",
+    ("content", "audience-holdout"): "fair",
+    ("content", "psa-control"): "poor",
+    ("content", "synthetic-control"): "good",
+    ("content", "switchback"): "poor",
+    ("content", "pre-post"): "good",
+    # onboarding
+    ("onboarding", "geo-holdout"): "poor",
+    ("onboarding", "audience-holdout"): "good",
+    ("onboarding", "psa-control"): "poor",
+    ("onboarding", "synthetic-control"): "fair",
+    ("onboarding", "switchback"): "fair",
+    ("onboarding", "pre-post"): "good",
+}
+
+
+# --- z-score inverse CDF (zero-dep, Beasley-Springer-Moro) -----------------
+
+def z_inv(p: float) -> float:
+    if p <= 0.0 or p >= 1.0:
+        raise ValueError(f"p must be in (0,1), got {p}")
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    plow = 0.02425
+    phigh = 1 - plow
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    q = p - 0.5
+    r = q * q
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
+           (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+
+
+def compute_test_window(*, baseline: float, mde_pct: float, alpha: float,
+                        power: float, treatment_share: float) -> dict:
+    """Compute weeks needed for two-sample conversion-delta detection.
+
+    Math:
+      delta_weekly  = baseline * (mde_pct / 100)
+      var_per_week  = baseline (Poisson approx for total counts)
+      imbalance     = 1 / (4 * p * (1-p))  (= 1.0 at 50/50 split)
+      var_adjusted  = var_per_week * imbalance
+      weeks         = ceil((z_a + z_b)^2 * var_adjusted / delta_weekly^2)
+    """
+    if mde_pct <= 0:
+        raise ValueError("mde_pct must be > 0")
+    if not (0 < treatment_share < 1):
+        raise ValueError("treatment_share must be in (0,1)")
+
+    z_alpha = z_inv(1 - alpha / 2)
+    z_power = z_inv(power)
+
+    delta_weekly = baseline * (mde_pct / 100.0)
+    if delta_weekly <= 0:
+        raise ValueError("delta_weekly must be > 0; check baseline + mde inputs")
+
+    imbalance_factor = 1.0 / (4.0 * treatment_share * (1.0 - treatment_share))
+    var_adjusted = baseline * imbalance_factor
+
+    weeks_float = ((z_alpha + z_power) ** 2) * var_adjusted / (delta_weekly ** 2)
+    weeks = max(1, int(math.ceil(weeks_float)))
+    return {
+        "weeks": weeks,
+        "z_alpha": round(z_alpha, 4),
+        "z_power": round(z_power, 4),
+        "delta_weekly": round(delta_weekly, 2),
+        "var_adjusted": round(var_adjusted, 2),
+        "imbalance_factor": round(imbalance_factor, 3),
+        "weeks_float": round(weeks_float, 2),
+    }
+
+
+def quarter_end_date(quarter: str) -> datetime:
+    m = re.match(r"^(\d{4})-Q([1-4])$", quarter.strip())
+    if not m:
+        raise ValueError(f"quarter must be YYYY-Q[1-4], got {quarter!r}")
+    year, q = int(m.group(1)), int(m.group(2))
+    end_month = q * 3
+    end_day = 31 if end_month in (3, 12) else 30 if end_month in (6, 9) else 31
+    return datetime(year, end_month, end_day, tzinfo=timezone.utc)
+
+
+# --- minimal yaml ---------------------------------------------------------
+
+def load_yaml(path: Path) -> dict | None:
+    try:
+        import yaml  # type: ignore
+        return yaml.safe_load(path.read_text())
+    except ImportError:
+        pass
+    return _parse_minimal_yaml(path.read_text())
+
+
+def _parse_minimal_yaml(text: str) -> dict:
+    root: dict = {}
+    stack: list[tuple[int, dict | list]] = [(-1, root)]
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = re.sub(r"(\s)#.*$", r"\1", raw).rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            value_part = stripped[2:].strip()
+            if isinstance(parent, list):
+                if ":" in value_part and not value_part.endswith(":"):
+                    k, _, v = value_part.partition(":")
+                    new_map = {k.strip(): _scalar(v.strip())}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+                elif value_part:
+                    parent.append(_scalar(value_part))
+                else:
+                    new_map = {}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+            i += 1
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if not val:
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines):
+                    next_line = lines[j]
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent > indent and next_line.strip().startswith("- "):
+                        new_list: list = []
+                        if isinstance(parent, dict):
+                            parent[key] = new_list
+                        stack.append((indent, new_list))
+                    else:
+                        new_map: dict = {}
+                        if isinstance(parent, dict):
+                            parent[key] = new_map
+                        stack.append((indent, new_map))
+            else:
+                if isinstance(parent, dict):
+                    parent[key] = _scalar(val)
+        i += 1
+    return root
+
+
+def _scalar(v: str):
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    if v.startswith("'") and v.endswith("'"):
+        return v[1:-1]
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    if v.lower() in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    if re.fullmatch(r"-?\d+\.\d+", v):
+        return float(v)
+    return v
+
+
+# --- helpers --------------------------------------------------------------
+
+def refuse(reason: str, detail: str = "") -> int:
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    return 3
+
+
+def find_metric_in_tree(tree_yaml: dict, metric_id: str) -> dict | None:
+    if not tree_yaml:
+        return None
+    ns = tree_yaml.get("north_star")
+    if isinstance(ns, dict) and ns.get("id") == metric_id:
+        return {**ns, "node_kind": "north-star", "parent_id": None}
+    inputs = tree_yaml.get("inputs") or []
+    for inp in inputs:
+        if inp.get("id") == metric_id:
+            return {**inp, "node_kind": "input", "parent_id": ns.get("id") if isinstance(ns, dict) else None}
+        for s in inp.get("supporting") or []:
+            if s.get("id") == metric_id:
+                return {**s, "node_kind": "supporting", "parent_id": inp.get("id")}
+        for l in inp.get("leaves") or []:
+            if l.get("id") == metric_id:
+                return {**l, "node_kind": "leaf", "parent_id": inp.get("id")}
+    return None
+
+
+def all_metric_ids(tree_yaml: dict) -> list[str]:
+    if not tree_yaml:
+        return []
+    out: list[str] = []
+    ns = tree_yaml.get("north_star")
+    if isinstance(ns, dict) and ns.get("id"):
+        out.append(ns["id"])
+    for inp in tree_yaml.get("inputs") or []:
+        if inp.get("id"):
+            out.append(inp["id"])
+        for s in inp.get("supporting") or []:
+            if s.get("id"):
+                out.append(s["id"])
+        for l in inp.get("leaves") or []:
+            if l.get("id"):
+                out.append(l["id"])
+    return out
+
+
+def pick_loop_position(weeks: int, surface: str, mode: str) -> tuple[str, str]:
+    """Pick contradiction position for short-feedback-vs-long-term-holdouts.
+
+    Heuristic:
+      - weeks <= 4 + mode in {pre-post, audience-holdout} + surface in {email, retention} =>
+        Position A (Abrams short-loop): the 30-day window is enough; act fast and validate later.
+      - weeks >= 8 + mode in {geo-holdout, synthetic-control} =>
+        Position B (Verna long-holdout): the long window is the point; resist the urge to read early.
+      - mid-band => Position A with explicit "if MDE gets met early, hold the window anyway" plan.
+    """
+    if weeks <= 4 and mode in {"pre-post", "audience-holdout"} and surface in {"email", "retention", "onboarding"}:
+        return (
+            "A (Abrams short-loop)",
+            f"Test window is {weeks} weeks on a fast-loop surface ({surface}); the cost of waiting "
+            f"is the cost of not acting on signals already visible. Take the read at week-end, "
+            f"act on it, schedule a long-window holdout for confirmation in next quarter."
+        )
+    if weeks >= 8 and mode in {"geo-holdout", "synthetic-control"}:
+        return (
+            "B (Verna long-holdout)",
+            f"Test window is {weeks} weeks on a long-loop surface ({surface}); the long horizon is "
+            f"the point. Per Abrams' 30-40% evaporation finding, short-window wins on this surface "
+            f"often disappear by year-end. Resist the urge to read early; the discipline is the value."
+        )
+    return (
+        "Mixed (read at week-end, hold the window)",
+        f"Test window is {weeks} weeks; surface={surface}, mode={mode}. Run the test for the full "
+        f"window; if MDE clears at midpoint, log the early read but do not stop the test."
+    )
+
+
+# --- preflight ------------------------------------------------------------
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/")
+    if not (client_root / "positioning").is_dir() and not (client_root / "positioning.md").is_file():
+        fails.append(f"positioning layer missing: clients/{client}/positioning/")
+    if not (client_root / "analytics" / "metric-tree.yaml").is_file():
+        fails.append(f"metric-tree.yaml missing: clients/{client}/analytics/metric-tree.yaml")
+    return len(fails) == 0, fails
+
+
+# --- renderers ------------------------------------------------------------
+
+def render_test_design(*, client: str, surface: str, mode: str, metric: dict,
+                       baseline: float, mde_pct: float, alpha: float, power: float,
+                       treatment_share: float, window_calc: dict, end_date: str,
+                       quarter: str, today: str,
+                       contradiction_pick: tuple[str, str],
+                       fit_rating: str, warnings: list[str]) -> str:
+    test_id = f"{client}-lift-{surface}-{metric['id']}-{mode}-{today}"
+    weeks = window_calc["weeks"]
+    expected_lift = baseline * weeks * (mde_pct / 100.0)
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"test_id: {test_id}")
+    lines.append(f"client: {client}")
+    lines.append(f"surface: {surface}")
+    lines.append(f"mode: {mode}")
+    lines.append(f"quarter: {quarter}")
+    lines.append("metric:")
+    lines.append(f"  id: {metric['id']}")
+    lines.append(f"  name: {metric.get('name', '')}")
+    lines.append(f"  parent_id: {metric.get('parent_id')}")
+    lines.append(f"  source_system: {metric.get('source_system', '')}")
+    lines.append(f"  cadence: {metric.get('cadence', '')}")
+    lines.append("baseline:")
+    lines.append(f"  weekly_value: {baseline}")
+    lines.append("test_parameters:")
+    lines.append(f"  mde_pct: {mde_pct}")
+    lines.append(f"  alpha: {alpha}")
+    lines.append(f"  power: {power}")
+    lines.append(f"  treatment_share: {treatment_share}")
+    lines.append("calculated_window:")
+    lines.append(f"  weeks: {weeks}")
+    lines.append(f"  end_date: {end_date}")
+    lines.append("substrate_layers_read: [icp, positioning, metric-tree]")
+    lines.append("patterns_grounded: [incrementality-not-attribution, measurement-correlated-short-signals, goalpost-discipline-vs-metric-drift]")
+    lines.append("contradictions_aware: [short-feedback-vs-long-term-holdouts]")
+    lines.append(f"contradiction_positions: {contradiction_pick[0]!r}")
+    lines.append("position_rationale: |")
+    for ln in contradiction_pick[1].splitlines():
+        lines.append(f"  {ln}")
+    lines.append("produced_by: lift-test-design")
+    lines.append(f"surface_mode_fit: {fit_rating}")
+    if warnings:
+        lines.append("warnings:")
+        for w in warnings:
+            lines.append(f"  - {w}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Lift test, {client} | {surface} | {metric['name']} | {mode} | {today}")
+    lines.append("")
+
+    lines.append("## Hypothesis")
+    lines.append("")
+    if mode == "geo-holdout":
+        lines.append(
+            f"`{surface}` activity contributes incrementally to `{metric['name']}` (id `{metric['id']}`) "
+            f"above the no-activity counterfactual when measured via geographic holdout. Per the "
+            f"`incrementality-not-attribution` pattern, attribution figures from the platform overstate "
+            f"contribution; the geo-holdout test surfaces the actual incremental rate. Prior: incremental "
+            f"effect is between 30% and 80% of platform-reported effect."
+        )
+    elif mode == "audience-holdout":
+        lines.append(
+            f"`{surface}` activity drives incremental change in `{metric['name']}` when applied to a "
+            f"randomized treatment audience versus a held-out control. The audience-holdout isolates the "
+            f"surface's effect from organic activity. Prior expectation: detectable lift at MDE."
+        )
+    elif mode == "psa-control":
+        lines.append(
+            f"`{surface}` creative drives incremental change in `{metric['name']}` versus a non-promotional "
+            "PSA control. The platform-managed lift study (Google Conversion Lift / Meta Test and Learn / "
+            "LinkedIn Brand Lift) reports the treatment-vs-control delta directly."
+        )
+    elif mode == "synthetic-control":
+        lines.append(
+            f"`{surface}` activity drives incremental change in `{metric['name']}`. Synthetic control "
+            "constructs a weighted combination of similar untreated cohorts (segments, geos, accounts) to "
+            "approximate the counterfactual. The treatment-vs-synthetic-control delta is the lift estimate."
+        )
+    elif mode == "switchback":
+        lines.append(
+            f"`{surface}` activity drives incremental change in `{metric['name']}`. The switchback design "
+            "alternates treatment and control on a defined cadence (per-day or per-week), comparing "
+            "metric performance across alternations. Best for surfaces where exposure is reversible "
+            "and persistence effects are short."
+        )
+    else:  # pre-post
+        lines.append(
+            f"`{surface}` activity drives change in `{metric['name']}` versus the pre-period baseline. "
+            "Per `measurement-correlated-short-signals`, when a randomized control is impractical, "
+            "pre-post is the next-best read; the spec carries seasonality and parallel-campaign caveats."
+        )
+    lines.append("")
+    lines.append("Source for the prior: `knowledge/patterns/incrementality-not-attribution.md`.")
+    lines.append("")
+
+    lines.append("## Test design")
+    lines.append("")
+    lines.append(f"**Surface:** `{surface}`. **Mode:** `{mode}`. **Surface-mode fit:** {fit_rating}.")
+    lines.append("")
+    if mode == "geo-holdout":
+        lines.append("**Treatment-vs-control selection:**")
+        lines.append("- Match markets on three axes: population, baseline metric volume, organic-search index for the category.")
+        lines.append(f"- Treatment share: {round(treatment_share * 100, 1)}% of matched markets.")
+        lines.append("- Use the most-recent 12 weeks to compute the match score; pick pairs with sub-15% per-axis variance.")
+        lines.append("- Randomization seed: today's date as integer; record in artifact.")
+        lines.append("")
+        lines.append("**Treatment intervention:** turn the surface activity off in treatment markets for the duration of the window.")
+        lines.append("**Control intervention:** leave the surface running at current allocation.")
+    elif mode == "audience-holdout":
+        lines.append("**Treatment-vs-control selection:**")
+        lines.append(f"- Random {round(treatment_share * 100, 1)}% / {round((1 - treatment_share) * 100, 1)}% split of the eligible audience at the user-id or account-id level.")
+        lines.append("- Stratify the split on at least one ICP axis (segment, plan tier, tenure) so treatment and control are balanced.")
+        lines.append("- Hash-mod assignment is deterministic; record the seed in the artifact.")
+        lines.append("")
+        lines.append("**Treatment intervention:** apply the surface activity to the treatment audience.")
+        lines.append("**Control intervention:** suppress the surface activity for the control audience for the duration of the window.")
+    elif mode == "psa-control":
+        lines.append("**Treatment-vs-control selection:** platform-managed (Google Conversion Lift / Meta Test and Learn / LinkedIn Brand Lift). The platform randomly assigns users to treatment (actual creative) or control (PSA / no impression). Treatment share is platform-controlled.")
+        lines.append("")
+        lines.append("**Treatment intervention:** actual creative.")
+        lines.append("**Control intervention:** PSA or non-promotional variant.")
+    elif mode == "synthetic-control":
+        lines.append("**Treatment-vs-control selection:** synthetic control constructed from similar untreated cohorts.")
+        lines.append("- Source pool: untreated geos / segments / accounts with comparable pre-period metrics.")
+        lines.append("- Weights: pick weights minimizing pre-period RMSE between treatment and weighted-control.")
+        lines.append("- Validate: pre-period fit must be tight; otherwise the synthetic counterfactual is unreliable.")
+        lines.append("")
+        lines.append("**Treatment intervention:** apply surface activity to named cohort.")
+        lines.append("**Control intervention:** none in the cohort; the weighted untreated pool is the counterfactual.")
+    elif mode == "switchback":
+        lines.append("**Treatment-vs-control selection:** alternating treatment and control across the audience over time.")
+        lines.append("- Cadence: alternate per-day or per-week.")
+        lines.append("- Each alternation is a unit; the variance of the metric across alternations becomes the test statistic.")
+        lines.append("- Persistence: confirm the surface's effect does not persist across alternations longer than the cadence (else the design is biased).")
+    else:  # pre-post
+        lines.append("**Treatment-vs-control selection:** pre-period (no surface activity or baseline allocation) vs post-period (surface activity active).")
+        lines.append("- Pre-period length: 12 weeks (default; longer if seasonality is high).")
+        lines.append("- Post-period length: see calculated window below.")
+        lines.append("- Caveats: parallel campaigns, seasonality, brand events all confound. The spec names them in the Risks section.")
+    lines.append("")
+
+    lines.append("## Sample size + window calculation")
+    lines.append("")
+    lines.append("**Inputs:**")
+    lines.append(f"- Baseline weekly value: **{baseline}**")
+    lines.append(f"- Minimum detectable effect (MDE): **{mde_pct}%**")
+    lines.append(f"- Significance (alpha): **{alpha}**, two-tailed → z = {window_calc['z_alpha']:.4f}")
+    lines.append(f"- Power: **{power}** → z = {window_calc['z_power']:.4f}")
+    lines.append(f"- Treatment share: **{treatment_share}** → imbalance factor {window_calc['imbalance_factor']}")
+    lines.append("")
+    lines.append("**Formula** (Poisson approximation for two-sample delta):")
+    lines.append("")
+    lines.append("```")
+    lines.append("delta_weekly  = baseline * (mde_pct / 100)")
+    lines.append("var_adjusted  = baseline / (4 * treatment_share * (1 - treatment_share))")
+    lines.append("weeks         = ceil((z_alpha + z_power)^2 * var_adjusted / delta_weekly^2)")
+    lines.append("```")
+    lines.append("")
+    lines.append("**Computed:**")
+    lines.append(f"- delta_weekly = {window_calc['delta_weekly']}")
+    lines.append(f"- var_adjusted = {window_calc['var_adjusted']}")
+    lines.append(f"- weeks_float = {window_calc['weeks_float']}")
+    lines.append(f"- **window: {window_calc['weeks']} weeks** (rounded up)")
+    lines.append(f"- end_date: **{end_date}**")
+    lines.append("")
+    lines.append(f"Expected total lift across the window if MDE is met: ~{round(expected_lift, 1)} units.")
+    lines.append("")
+
+    lines.append("## Measurement plan")
+    lines.append("")
+    lines.append(f"**Conversion / metric event:** `{metric.get('name', '')}` (id `{metric['id']}`).")
+    lines.append("")
+    lines.append(f"**Source system:** `{metric.get('source_system', 'n/a')}`. Per `goalpost-discipline-vs-metric-drift`, the source-system query is locked at this open; mid-test changes count as overrides.")
+    lines.append("")
+    if mode in ("geo-holdout", "audience-holdout"):
+        lines.append("**Join key:** market identifier (DMA / region) for geo, user_id / account_id for audience.")
+    elif mode == "psa-control":
+        lines.append("**Join key:** platform-internal user_id; the platform reports the treatment-vs-control delta.")
+    elif mode == "synthetic-control":
+        lines.append("**Join key:** cohort identifier; weights live in the synthetic-control fit object.")
+    elif mode == "switchback":
+        lines.append("**Join key:** alternation period identifier; the test statistic is the per-alternation difference.")
+    else:
+        lines.append("**Join key:** pre-period vs post-period; cohort definition must match across periods.")
+    lines.append("")
+    lines.append("**Daily monitoring dashboard:** 7-day rolling treatment-vs-control delta. Pause the test if the delta inverts by 2x baseline std-dev for 5+ consecutive days (treatment underperforms control); usually means contamination.")
+    lines.append("")
+
+    lines.append("## Contradiction navigation, short-feedback-vs-long-term-holdouts")
+    lines.append("")
+    lines.append(f"[contradiction:short-feedback-vs-long-term-holdouts] picked Position {contradiction_pick[0]} because:")
+    lines.append("")
+    lines.append(contradiction_pick[1])
+    lines.append("")
+
+    lines.append("## Risks and assumptions")
+    lines.append("")
+    lines.append("1. **Parallel campaigns:** any new email, content, or sales outbound launching during the window contaminates the read. Freeze cross-channel calendar; if a launch is unavoidable, re-baseline both arms at the midpoint.")
+    lines.append("2. **Seasonality:** windows that span quarter-end, holidays, or known high-variance periods produce noisier deltas. Prefer mid-quarter windows.")
+    lines.append("3. **Brand events:** PR, fundraising, product launches affect both arms at different magnitudes. Log any such event; resolve AMBIGUOUS if a major event lands inside the window.")
+    if mode == "geo-holdout":
+        lines.append("4. **Cross-market spillover:** national-targeted campaigns may serve in 'off' markets. Confirm market exclusion at campaign level; sample 50 treatment-market sessions to verify no impressions logged.")
+        lines.append("5. **Match quality:** matched-market pairs that diverge >20% on baseline during the pre-period invalidate the comparison. Re-pair if pre-period variance trips the threshold.")
+    elif mode == "audience-holdout":
+        lines.append("4. **Spillover via shared accounts:** if treatment and control users share a workspace, treatment-arm activity may carry over. Account-level rather than user-level assignment for shared-workspace products.")
+        lines.append("5. **Suppression visibility:** the control audience must not realize they are being held out. If the suppression is visible (e.g., a missing email banner), behavior changes and contaminates the read.")
+    elif mode == "synthetic-control":
+        lines.append("4. **Pre-period fit:** if the weighted control's pre-period RMSE exceeds 1 standard deviation of the treatment cohort's pre-period mean, the synthetic counterfactual is unreliable. Resolve AMBIGUOUS.")
+    lines.append("")
+
+    lines.append("## Decision rules")
+    lines.append("")
+    lines.append(f"- **YES** (lift >= {mde_pct}% confirmed): scale this surface activity by 25% next quarter. Update the model calibration in `clients/{client}/analytics/lift-tests/_history.md` so future allocation decisions use the measured lift, not platform attribution.")
+    lines.append("- **NO** (no lift detected): cap activity at current or reduce by 25%; schedule a second test in next quarter. Do not zero the surface without a confirming second test.")
+    lines.append("- **AMBIGUOUS** (window contaminated, signal too weak, fit too poor): re-run with a clean window; allocation stays at status quo until clean data lands.")
+    lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- ICP: `clients/{client}/icp/icp.md`")
+    lines.append(f"- Positioning: `clients/{client}/positioning/positioning.md`")
+    lines.append(f"- Metric tree: `clients/{client}/analytics/metric-tree.yaml` (node `{metric['id']}`, parent `{metric.get('parent_id')}`)")
+    lines.append(f"- Sources: `clients/{client}/analytics/sources.yaml`")
+    lines.append("- Pattern: `knowledge/patterns/incrementality-not-attribution.md`")
+    lines.append("- Pattern: `knowledge/patterns/measurement-correlated-short-signals.md`")
+    lines.append("- Pattern: `knowledge/patterns/goalpost-discipline-vs-metric-drift.md`")
+    lines.append("- Contradiction: `knowledge/contradictions/short-feedback-vs-long-term-holdouts.md`")
+    lines.append("")
+
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `skills/ad-incrementality-test` (paid-ads specialization).")
+    lines.append("- `skills/attribution-model-design` (model the test calibrates).")
+    lines.append("- `skills/score-goal` (resolves the measurement contract this skill emits).")
+    lines.append("- `routines/lift-test-rhythm.md` (quarterly cadence).")
+    lines.append("")
+
+    if warnings:
+        lines.append("## Warnings")
+        lines.append("")
+        for w in warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_measurement_contract(*, client: str, surface: str, mode: str, metric: dict,
+                                baseline: float, mde_pct: float, weeks: int, end_date: str,
+                                today: str, predicted_p: float, quarter: str,
+                                contradiction_pick: tuple[str, str]) -> str:
+    goal_id = f"{client}-lift-{surface}-{metric['id']}-{quarter}"
+    expected_lift = baseline * weeks * (mde_pct / 100.0)
+    annual_lift_proxy = expected_lift * 4  # quarterly extrapolation
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"goal_id: {goal_id}")
+    lines.append(f"client: {client}")
+    lines.append(f"opened_at: {today}")
+    lines.append("status: proposed")
+    lines.append(f"taste_type: incrementality")
+    lines.append(f"resolution_date: {end_date}")
+    lines.append(f"predicted_p_threshold_met: {predicted_p}")
+    lines.append("substrate_layers_cited: [icp, positioning, metric-tree]")
+    lines.append("patterns_applied: [incrementality-not-attribution, measurement-correlated-short-signals, goalpost-discipline-vs-metric-drift]")
+    lines.append("contradictions_aware: [short-feedback-vs-long-term-holdouts]")
+    lines.append(f"contradiction_positions: {contradiction_pick[0]!r}")
+    lines.append("produced_by: lift-test-design")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Measurement contract, {goal_id}")
+    lines.append("")
+    lines.append("## Hypothesis")
+    lines.append("")
+    lines.append(f"Incremental change in `{metric.get('name', metric['id'])}` driven by `{surface}` activity is "
+                 f"at least `{mde_pct}%` of baseline weekly value, measured via {mode} over a {weeks}-week window. "
+                 "Per the `incrementality-not-attribution` pattern, attribution-based estimates are hypotheses; "
+                 "this test resolves the actual incremental contribution.")
+    lines.append("")
+    lines.append("## Predicted outcome")
+    lines.append("")
+    lines.append(f"By {end_date}, the test resolves with measured lift >= {mde_pct}% of weekly baseline "
+                 f"({baseline} units) for cohort defined per ICP and metric-tree node `{metric['id']}`.")
+    lines.append("")
+    lines.append("## Revenue lever")
+    lines.append("")
+    lines.append("```yaml")
+    lines.append("lever_type: incrementality-validated-allocation")
+    lines.append(f"annual_revenue_impact_usd: range \"{int(annual_lift_proxy * 0.5)}-{int(annual_lift_proxy * 2)}\"")
+    lines.append("calculation: |")
+    lines.append(f"  Baseline weekly value = {baseline}; window = {weeks} weeks.")
+    lines.append(f"  Expected lift across window if MDE met = {round(expected_lift, 1)} units.")
+    lines.append(f"  Annual extrapolation across 4 windows = {round(annual_lift_proxy, 1)} units.")
+    lines.append("  Range above is 0.5x-2x to acknowledge calibration uncertainty.")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Measurement design")
+    lines.append("")
+    lines.append("```")
+    lines.append(f"Source: {metric.get('source_system', 'n/a')}.")
+    lines.append(f"Method: {mode} comparison of treatment vs control over {weeks} weeks.")
+    lines.append(f"Cohort: ICP-aligned per clients/{client}/icp/icp.md.")
+    lines.append("Ambiguous case: parallel launch, brand event, or treatment-control variance > 20% in")
+    lines.append("    pre-period invalidates the comparison; resolve AMBIGUOUS and re-pair / re-run.")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Kill criterion")
+    lines.append("")
+    lines.append("Treatment-vs-control delta inverts (treatment underperforms control) by 2x baseline std-dev "
+                 "for 5 consecutive days. Pause the test, log contamination, do not extrapolate.")
+    lines.append("")
+    lines.append("## Resolution")
+    lines.append("")
+    lines.append(f"Resolves on {end_date}. Verdict: YES if lift >= MDE; NO if not; AMBIGUOUS if data quality fails.")
+    lines.append("")
+    lines.append("Brier score = (predicted_p_threshold_met - indicator)^2.")
+    lines.append("")
+    lines.append("## Substrate update on resolution")
+    lines.append("")
+    lines.append(f"- If YES: update calibration in `clients/{client}/analytics/lift-tests/_history.md`; surface scales 25%.")
+    lines.append("- If NO: surface caps or reduces 25%; schedule corroborating test next quarter.")
+    lines.append("- If AMBIGUOUS: re-run with cleaner window.")
+    return "\n".join(lines)
+
+
+# --- main -----------------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="lift-test-design")
+    p.add_argument("--client", required=True)
+    p.add_argument("--surface", required=True, choices=sorted(VALID_SURFACES))
+    p.add_argument("--mode", required=True, choices=sorted(VALID_MODES))
+    p.add_argument("--metric", required=True, help="metric id from metric-tree.yaml")
+    p.add_argument("--baseline", type=float, required=True, help="baseline weekly rate or count")
+    p.add_argument("--quarter", required=True, help="YYYY-Q[1-4]")
+    p.add_argument("--mde-pct", type=float, default=15.0)
+    p.add_argument("--alpha", type=float, default=0.10)
+    p.add_argument("--power", type=float, default=0.80)
+    p.add_argument("--treatment-share", type=float, default=0.50)
+    p.add_argument("--predicted-p", type=float, default=0.50)
+    args = p.parse_args()
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_dt = datetime.now(timezone.utc)
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        return 3
+
+    if args.baseline <= 0:
+        return refuse("missing-baseline", f"--baseline must be > 0, got {args.baseline}")
+
+    tree_path = SUBSTRATE_ROOT / "clients" / args.client / "analytics" / "metric-tree.yaml"
+    tree_yaml = load_yaml(tree_path) or {}
+    metric = find_metric_in_tree(tree_yaml, args.metric)
+    if metric is None:
+        ids = all_metric_ids(tree_yaml)
+        return refuse(
+            "metric-not-in-tree",
+            f"metric id {args.metric!r} is not in metric-tree.yaml. "
+            f"Known ids: {ids}. Run metric-tree-design to add the metric, or pick from the list.",
+        )
+
+    warnings: list[str] = []
+    if args.mde_pct < 5.0:
+        warnings.append(
+            f"mde-too-tight: MDE of {args.mde_pct}% is below the 5% practical floor. "
+            "Per `measurement-correlated-short-signals`, prefer 10-15% as a default starting point; "
+            "tighter MDE means longer windows and more confounding."
+        )
+
+    fit_rating = SURFACE_MODE_FIT.get((args.surface, args.mode), "unknown")
+    if fit_rating == "poor":
+        warnings.append(
+            f"mode-surface-mismatch: mode `{args.mode}` is rated `poor` for surface `{args.surface}`. "
+            "Reconsider mode; see surface-mode fit table in skill docs."
+        )
+
+    try:
+        window_calc = compute_test_window(
+            baseline=args.baseline,
+            mde_pct=args.mde_pct,
+            alpha=args.alpha,
+            power=args.power,
+            treatment_share=args.treatment_share,
+        )
+    except ValueError as e:
+        return refuse("invalid-test-parameters", str(e))
+
+    if window_calc["weeks"] > 12:
+        warnings.append(
+            f"window-too-long: calculated window is {window_calc['weeks']} weeks. "
+            "Per `measurement-correlated-short-signals`, prefer pre-post or correlated short signals "
+            "over very long windows; long windows are vulnerable to seasonality."
+        )
+
+    try:
+        q_end = quarter_end_date(args.quarter)
+    except ValueError as e:
+        return refuse("invalid-quarter", str(e))
+
+    test_end = today_dt + timedelta(weeks=window_calc["weeks"])
+    if test_end > q_end:
+        warnings.append(
+            f"window-extends-past-quarter: test would end {test_end.strftime('%Y-%m-%d')}, "
+            f"after {args.quarter} ends ({q_end.strftime('%Y-%m-%d')}). "
+            "Consider running in next quarter or reducing MDE."
+        )
+    end_date = test_end.strftime("%Y-%m-%d")
+
+    contradiction_pick = pick_loop_position(window_calc["weeks"], args.surface, args.mode)
+
+    out_dir = SUBSTRATE_ROOT / "clients" / args.client / "analytics" / "lift-tests"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    design_path = out_dir / f"{args.surface}-{args.metric}-{args.mode}-{today}.md"
+
+    design_md = render_test_design(
+        client=args.client,
+        surface=args.surface,
+        mode=args.mode,
+        metric=metric,
+        baseline=args.baseline,
+        mde_pct=args.mde_pct,
+        alpha=args.alpha,
+        power=args.power,
+        treatment_share=args.treatment_share,
+        window_calc=window_calc,
+        end_date=end_date,
+        quarter=args.quarter,
+        today=today,
+        contradiction_pick=contradiction_pick,
+        fit_rating=fit_rating,
+        warnings=warnings,
+    )
+    design_path.write_text(design_md, encoding="utf-8")
+
+    contract_dir = SUBSTRATE_ROOT / "goals" / "measurement-contracts"
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    contract_path = contract_dir / f"{args.client}-lift-{args.surface}-{args.metric}-{args.quarter}.md"
+    contract_md = render_measurement_contract(
+        client=args.client,
+        surface=args.surface,
+        mode=args.mode,
+        metric=metric,
+        baseline=args.baseline,
+        mde_pct=args.mde_pct,
+        weeks=window_calc["weeks"],
+        end_date=end_date,
+        today=today,
+        predicted_p=args.predicted_p,
+        quarter=args.quarter,
+        contradiction_pick=contradiction_pick,
+    )
+    contract_path.write_text(contract_md, encoding="utf-8")
+
+    print(f"[lift-test-design] design: {design_path}", file=sys.stderr)
+    print(f"[lift-test-design] contract: {contract_path}", file=sys.stderr)
+    print(f"  surface: {args.surface} mode: {args.mode} metric: {args.metric}", file=sys.stderr)
+    print(f"  window: {window_calc['weeks']} weeks  end: {end_date}", file=sys.stderr)
+    print(f"  surface-mode fit: {fit_rating}", file=sys.stderr)
+    print(f"  contradiction-position: {contradiction_pick[0]}", file=sys.stderr)
+    for w in warnings:
+        print(f"  warn: {w}", file=sys.stderr)
+
+    print(str(design_path))
+    return 1 if warnings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,663 @@
+#!/usr/bin/env bash
+# messaging-matrix — substrate skill runtime (v2.0)
+#
+# Builds persona × use-case matrix from substrate; validates against
+# allowed/banned claims and voice rules. Refuses on missing VoC, missing
+# positioning, or invalid cell. Outputs md + yaml + drift-log.
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+MODE="build"
+PERSONAS=""
+USE_CASES=""
+AUDIT_DIR=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)      CLIENT="$2"; shift 2 ;;
+    --mode)        MODE="$2"; shift 2 ;;
+    --personas)    PERSONAS="$2"; shift 2 ;;
+    --use-cases)   USE_CASES="$2"; shift 2 ;;
+    --audit-dir)   AUDIT_DIR="$2"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+messaging-matrix — persona × use-case messaging grid
+
+Usage:
+  messaging-matrix --client <client> [--mode build|audit-channel]
+                   [--personas <p1,p2,p3>] [--use-cases <u1,u2,u3>]
+                   [--audit-dir <path>]
+
+Reads positioning, icp, voc/findings, product-knowledge, competitive,
+strategy/narrative, brand-voice substrate.
+
+Writes clients/<client>/messaging/matrix-<date>.md + .yaml.
+
+See skills/messaging-matrix/SKILL.md for full spec.
+EOF
+      exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+if [ -z "$CLIENT" ]; then
+  echo "ERR: --client required" >&2
+  exit 4
+fi
+
+skill_preflight "messaging-matrix" "$CLIENT" || exit 3
+
+MSG_DIR="$SUBSTRATE_ROOT/clients/$CLIENT/messaging"
+mkdir -p "$MSG_DIR"
+
+exec /usr/bin/env python3 - "$SUBSTRATE_ROOT" "$CLIENT" "$MODE" "$PERSONAS" "$USE_CASES" "$AUDIT_DIR" <<'PYEOF'
+import json
+import os
+import re
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+(SR, CLIENT, MODE, PERSONAS_S, USE_CASES_S, AUDIT_DIR) = sys.argv[1:7]
+SUBSTRATE_ROOT = Path(SR)
+CLIENT_ROOT = SUBSTRATE_ROOT / "clients" / CLIENT
+MSG_DIR = CLIENT_ROOT / "messaging"
+MSG_DIR.mkdir(parents=True, exist_ok=True)
+TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+# Voice gate constants from substrate brand-voice rules
+KILL_LIST = {
+    "orchestration", "seamless", "strategic", "leverage", "transform", "holistic",
+    "synergy", "bespoke", "unlock", "robust", "cutting-edge", "world-class",
+    "best-in-class", "next-generation",
+}
+EM_DASH_PATTERN = re.compile(r"[—–]")
+THROAT_CLEARING = re.compile(r"^\s*(it is important to|in today'?s|in the world of|in this article|let's dive)", re.IGNORECASE)
+
+
+def refuse(reason, detail=""):
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    sys.exit(3)
+
+
+def find_first(*patterns):
+    for pat in patterns:
+        for p in sorted(CLIENT_ROOT.glob(pat), reverse=True):
+            if p.is_file():
+                return p
+    return None
+
+
+def load_positioning():
+    p = find_first("positioning/positioning-canonical-statement*.md")
+    if not p:
+        refuse("missing-positioning", f"clients/{CLIENT}/positioning/positioning-canonical-statement*.md required")
+    text = p.read_text(encoding="utf-8")
+    canonical = ""
+    in_block = False
+    for line in text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(canonical|the position|statement|positioning)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block and s.startswith("#"):
+            in_block = False
+        if in_block and s:
+            canonical = s.lstrip("*").strip()
+            if canonical:
+                break
+    return {
+        "path": str(p.relative_to(SUBSTRATE_ROOT)),
+        "canonical": canonical or "",
+    }
+
+
+def load_allowed_banned():
+    allowed_path = find_first("positioning/allowed-claims.md")
+    banned_path = find_first("positioning/banned-claims.md")
+    allowed = []
+    banned = []
+    if allowed_path:
+        for ln in allowed_path.read_text(encoding="utf-8").splitlines():
+            s = ln.strip()
+            if s.startswith("- "):
+                allowed.append(s[2:].strip())
+    if banned_path:
+        for ln in banned_path.read_text(encoding="utf-8").splitlines():
+            s = ln.strip()
+            if s.startswith("- "):
+                banned.append(s[2:].strip())
+    return {
+        "allowed": allowed,
+        "banned": banned,
+        "allowed_path": str(allowed_path.relative_to(SUBSTRATE_ROOT)) if allowed_path else None,
+        "banned_path": str(banned_path.relative_to(SUBSTRATE_ROOT)) if banned_path else None,
+    }
+
+
+def load_icp_top_personas():
+    p = find_first("icp/icp-cut-*.json")
+    if not p:
+        return None, None
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None, None
+    top = payload.get("top_segments", [])
+    personas = []
+    for seg in top[:3]:
+        ind = seg.get("industry", "unknown")
+        size = seg.get("size_band", "unknown")
+        personas.append(f"{ind}/{size}")
+    return personas, str(p.relative_to(SUBSTRATE_ROOT))
+
+
+def load_voc_findings():
+    p = find_first("voc/findings/*.json")
+    if not p:
+        return None, None
+    try:
+        return json.loads(p.read_text(encoding="utf-8")), str(p.relative_to(SUBSTRATE_ROOT))
+    except Exception:
+        return None, None
+
+
+def load_value_pillars():
+    p = find_first("product-knowledge/value-pillars.md")
+    if not p:
+        return [], None
+    pillars = []
+    for ln in p.read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if re.match(r"^[-*]\s+\*\*", s) or re.match(r"^##+\s+\d?\.?\s*\w", s):
+            # heading-style pillar — extract the bold or first phrase
+            m = re.match(r"^[-*]\s+\*\*([^*]+)\*\*", s)
+            if m:
+                pillars.append(m.group(1).strip())
+                continue
+            m = re.match(r"^##+\s+\d?\.?\s*(.+)", s)
+            if m:
+                pillars.append(m.group(1).strip())
+                continue
+        m = re.match(r"^[-*]\s+(.+)$", s)
+        if m and len(s) < 120:
+            pillars.append(m.group(1).strip())
+    return pillars[:8], str(p.relative_to(SUBSTRATE_ROOT))
+
+
+def load_status_quo():
+    p = find_first("competitive/status-quo.md")
+    if not p:
+        return None
+    return str(p.relative_to(SUBSTRATE_ROOT))
+
+
+def load_narrative():
+    p = find_first("strategy/narrative-*.md")
+    if not p:
+        return None
+    return str(p.relative_to(SUBSTRATE_ROOT))
+
+
+def load_brand_voice():
+    p = find_first("brand-voice/*.md", "brand-voice.md")
+    return str(p.relative_to(SUBSTRATE_ROOT)) if p else None
+
+
+def voice_gate(text):
+    flags = []
+    if EM_DASH_PATTERN.search(text):
+        flags.append("em-dash present")
+    lower = text.lower()
+    for kw in KILL_LIST:
+        if re.search(r"\b" + re.escape(kw) + r"\b", lower):
+            flags.append(f"kill-list word: {kw}")
+    if THROAT_CLEARING.search(text):
+        flags.append("throat-clearing opener")
+    return flags
+
+
+def allowed_check(text, allowed):
+    """If allowed list is present, the text must overlap at least one allowed phrase
+    on a load-bearing 4+-char word.
+    """
+    if not allowed:
+        return None
+    lower = text.lower()
+    for phrase in allowed:
+        for w in re.findall(r"[a-z]{4,}", phrase.lower()):
+            if w in lower:
+                return None
+    return f"no allowed-claim term matched in '{text[:80]}'"
+
+
+def banned_check(text, banned):
+    if not banned:
+        return None
+    lower = text.lower()
+    for phrase in banned:
+        if phrase.lower() in lower:
+            return f"banned-claim term '{phrase}' present"
+        for w in re.findall(r"[a-z]{4,}", phrase.lower()):
+            if w in lower and len(phrase) <= 30:
+                # match any 4+-char content word from a banned phrase
+                return f"banned-claim term overlap '{w}' (from '{phrase}')"
+    return None
+
+
+def top_jtbd(voc, n=3):
+    if not voc:
+        return []
+    items = (voc.get("themes", {}) or {}).get("jtbd", {})
+    if not items:
+        return []
+    ranked = sorted(items.items(), key=lambda x: -x[1].get("count", 0))[:n]
+    return [k for k, _ in ranked]
+
+
+def top_objections(voc, n=3):
+    if not voc:
+        return []
+    items = (voc.get("themes", {}) or {}).get("objections", {})
+    return sorted(items.items(), key=lambda x: -x[1].get("count", 0))[:n]
+
+
+def top_value_words(voc, n=3):
+    if not voc:
+        return []
+    items = (voc.get("themes", {}) or {}).get("value-words", {})
+    return sorted(items.items(), key=lambda x: -x[1].get("count", 0))[:n]
+
+
+def build_cell(persona, use_case, voc, voc_path, positioning, value_pillars, sq_path,
+               narrative_path, allowed_banned):
+    objections = top_objections(voc, n=3)
+    value_words = top_value_words(voc, n=3)
+
+    # pain_verbatim: first objection sample
+    pain_verbatim = ""
+    pain_source = None
+    if objections:
+        hook, rec = objections[0]
+        samples = rec.get("samples", [])
+        pain_verbatim = (samples[0] if samples else hook)[:160]
+        pain_source = voc_path
+
+    # proof_point: first value-words sample
+    proof_point = ""
+    proof_source = None
+    if value_words:
+        hook, rec = value_words[0]
+        samples = rec.get("samples", [])
+        proof_point = (samples[0] if samples else hook)[:160]
+        proof_source = voc_path
+
+    # new_game_hook: derived from positioning category + use-case
+    canonical = positioning["canonical"] or ""
+    new_game_hook = ""
+    cat_match = re.search(r"\bis the ([A-Za-z][\w\s-]+?) that", canonical, re.IGNORECASE)
+    if cat_match:
+        cat = cat_match.group(1).strip()
+        new_game_hook = f"For {persona}: {cat} for {use_case}."
+    else:
+        new_game_hook = f"For {persona}: {use_case}."
+
+    # value pillars: top 3 from product-knowledge
+    pillars = value_pillars[:3]
+
+    # cta: a sane default; operator overrides per channel
+    cta = "Book a 20-minute walkthrough"
+
+    cell = {
+        "persona": persona,
+        "use_case": use_case,
+        "hook": new_game_hook,
+        "pain_verbatim": pain_verbatim,
+        "pain_source": pain_source,
+        "trigger": objections[0][0] if objections else "",
+        "current_path": sq_path or "",
+        "value_pillars": pillars,
+        "proof_point": proof_point,
+        "proof_source": proof_source,
+        "cta": cta,
+        "narrative_source": narrative_path,
+        "positioning_source": positioning["path"],
+    }
+
+    # validation
+    flags = []
+    # 1. pain_verbatim must trace to a real source
+    if not pain_verbatim or not pain_source:
+        flags.append("pain_verbatim unsourced (refusing)")
+    # 2. value pillars max 3
+    if len(pillars) > 3:
+        flags.append(f"value_pillars exceeds 3 ({len(pillars)})")
+    # 3. allowed-claim regex
+    text_for_allowed = " ".join([new_game_hook, proof_point, " ".join(pillars)])
+    bad_allowed = allowed_check(text_for_allowed, allowed_banned["allowed"])
+    if bad_allowed:
+        flags.append(f"allowed-claims fail: {bad_allowed}")
+    # 4. banned-claims regex
+    bad_banned = banned_check(text_for_allowed, allowed_banned["banned"])
+    if bad_banned:
+        flags.append(bad_banned)
+    # 5. voice gate
+    vflags = voice_gate(new_game_hook + " " + proof_point)
+    flags.extend(f"voice-gate: {f}" for f in vflags)
+    cell["validation_flags"] = flags
+    return cell
+
+
+def write_yaml(cells, path):
+    """Write a tiny inline YAML representation. Avoids dependency on pyyaml."""
+    lines = ["# messaging-matrix output", f"client: {CLIENT}", f"generated_at: {TODAY}", "cells:"]
+    for c in cells:
+        lines.append(f"  - persona: \"{c['persona']}\"")
+        lines.append(f"    use_case: \"{_yaml_escape(c['use_case'])}\"")
+        lines.append(f"    hook: \"{_yaml_escape(c['hook'])}\"")
+        lines.append(f"    pain_verbatim: \"{_yaml_escape(c['pain_verbatim'])}\"")
+        lines.append(f"    pain_source: \"{c.get('pain_source') or ''}\"")
+        lines.append(f"    trigger: \"{_yaml_escape(c['trigger'])}\"")
+        lines.append(f"    current_path: \"{c.get('current_path') or ''}\"")
+        lines.append("    value_pillars:")
+        for vp in c["value_pillars"]:
+            lines.append(f"      - \"{_yaml_escape(vp)}\"")
+        lines.append(f"    proof_point: \"{_yaml_escape(c['proof_point'])}\"")
+        lines.append(f"    proof_source: \"{c.get('proof_source') or ''}\"")
+        lines.append(f"    cta: \"{_yaml_escape(c['cta'])}\"")
+        lines.append("    validation_flags:")
+        for fl in c.get("validation_flags", []) or []:
+            lines.append(f"      - \"{_yaml_escape(fl)}\"")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _yaml_escape(s):
+    if s is None:
+        return ""
+    s = str(s).replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ")
+    return s
+
+
+def render_md(cells, refs):
+    parts = []
+    parts.append("---")
+    parts.append(f"title: messaging matrix, {CLIENT}, {TODAY}")
+    parts.append("status: active")
+    parts.append(f"last_updated: {TODAY}")
+    parts.append("produced_by: messaging-matrix")
+    parts.append("patterns_grounded: [narrative-as-strategy, raskin-narrative-five-act, buyer-mindset-not-product-features, jtbd-as-buyer-mental-model, tf-idf-themes-from-customer-language, copywriting-craft-fundamentals]")
+    parts.append(f"client: {CLIENT}")
+    parts.append("---")
+    parts.append("")
+    parts.append(f"# Messaging matrix, {CLIENT}, {TODAY}")
+    parts.append("")
+    parts.append("Persona × use-case grid composed from substrate. Each cell carries hook, pain (verbatim), proof point (verbatim), value pillars, and CTA. Per `knowledge/patterns/tf-idf-themes-from-customer-language.md`, paraphrasing kills resonance; the matrix favours verbatim language over rewrite.")
+    parts.append("")
+    parts.append("## Substrate sources")
+    parts.append("")
+    parts.append(f"- Positioning: `{refs['positioning']}`")
+    if refs["icp_path"]:
+        parts.append(f"- ICP cut: `{refs['icp_path']}`")
+    if refs["voc_path"]:
+        parts.append(f"- VoC findings: `{refs['voc_path']}`")
+    if refs["value_pillars_path"]:
+        parts.append(f"- Value pillars: `{refs['value_pillars_path']}`")
+    if refs["sq_path"]:
+        parts.append(f"- Status-quo: `{refs['sq_path']}`")
+    if refs["narrative_path"]:
+        parts.append(f"- Narrative: `{refs['narrative_path']}`")
+    if refs["brand_voice_path"]:
+        parts.append(f"- Brand voice: `{refs['brand_voice_path']}`")
+    if refs["allowed_path"]:
+        parts.append(f"- Allowed claims: `{refs['allowed_path']}`")
+    if refs["banned_path"]:
+        parts.append(f"- Banned claims: `{refs['banned_path']}`")
+    parts.append("")
+
+    # The matrix table
+    parts.append("## Matrix")
+    parts.append("")
+    parts.append("| Persona | Use case | Hook | Pain (verbatim) | Value pillars | Proof point (verbatim) | CTA |")
+    parts.append("|---|---|---|---|---|---|---|")
+    for c in cells:
+        pain = c["pain_verbatim"][:100].replace("|", "/")
+        proof = c["proof_point"][:100].replace("|", "/")
+        pillars = "; ".join(p[:60] for p in c["value_pillars"])
+        parts.append(
+            f"| {c['persona']} | {c['use_case'][:60]} | {c['hook'][:80]} | {pain} | {pillars} | {proof} | {c['cta']} |"
+        )
+    parts.append("")
+
+    # Per-cell detail
+    parts.append("## Per-cell detail")
+    parts.append("")
+    for i, c in enumerate(cells, 1):
+        parts.append(f"### Cell {i}: {c['persona']} × {c['use_case']}")
+        parts.append("")
+        parts.append(f"- **Hook:** {c['hook']}")
+        parts.append(f"- **Trigger:** `{c['trigger']}`")
+        parts.append(f"- **Pain (verbatim):** {c['pain_verbatim']}")
+        if c.get("pain_source"):
+            parts.append(f"  - Source: `{c['pain_source']}`")
+        parts.append(f"- **Current path (status quo):** {c['current_path'] or '_undefined_'}")
+        parts.append(f"- **Value pillars:**")
+        for vp in c["value_pillars"]:
+            parts.append(f"  - {vp}")
+        parts.append(f"- **Proof point (verbatim):** {c['proof_point']}")
+        if c.get("proof_source"):
+            parts.append(f"  - Source: `{c['proof_source']}`")
+        parts.append(f"- **CTA:** {c['cta']}")
+        if c.get("validation_flags"):
+            parts.append("- **Validation flags:**")
+            for fl in c["validation_flags"]:
+                parts.append(f"  - {fl}")
+        parts.append("")
+
+    # Channel adaptation guidance
+    parts.append("## Channel adaptation rules")
+    parts.append("")
+    parts.append("The matrix is the canonical message. Channels adapt form, not substance:")
+    parts.append("")
+    parts.append("- **Landing page**: full cell. Hook becomes hero; pain + proof become above-fold body; value pillars become the three feature blocks; CTA becomes the form.")
+    parts.append("- **Outbound email**: hook only as subject; pain (verbatim) as opener; proof as second paragraph; CTA in last line.")
+    parts.append("- **Paid ad**: hook + 1 value pillar + CTA. Proof goes on the LP, not the ad.")
+    parts.append("- **Sales pitch (deck)**: pain (Slide 1) → status quo (Slide 2) → new game hook (Slide 3) → value pillars (Slide 4-6) → proof (Slide 7) → CTA (Slide 8).")
+    parts.append("- **Help docs / onboarding**: skip the pain-statement; lead with the use-case + value pillar relevant to the user's task.")
+    parts.append("")
+
+    parts.append("## Patterns and contradictions")
+    parts.append("")
+    parts.append("- `knowledge/patterns/jtbd-as-buyer-mental-model.md` (use-case axis = JTBD)")
+    parts.append("- `knowledge/patterns/tf-idf-themes-from-customer-language.md` (verbatim discipline)")
+    parts.append("- `knowledge/patterns/raskin-narrative-five-act.md` (hook lands Act 1 + Act 5)")
+    parts.append("- `knowledge/patterns/copywriting-craft-fundamentals.md` (voice gate)")
+    parts.append("- `knowledge/patterns/buyer-mindset-not-product-features.md` (matrix axis is buyer-mindset, not product-feature)")
+    return "\n".join(parts)
+
+
+def render_drift_log(audit_dir, cells, audit_findings):
+    parts = []
+    parts.append("---")
+    parts.append(f"title: messaging-matrix drift log, {CLIENT}, {TODAY}")
+    parts.append(f"audit_dir: {audit_dir}")
+    parts.append(f"client: {CLIENT}")
+    parts.append("produced_by: messaging-matrix")
+    parts.append("---")
+    parts.append("")
+    parts.append(f"# Messaging-matrix drift log, {CLIENT}, {TODAY}")
+    parts.append("")
+    parts.append(f"Audited directory: `{audit_dir}`. Files scanned: {audit_findings['files_scanned']}.")
+    parts.append("")
+    parts.append("## Findings")
+    parts.append("")
+    if not audit_findings["divergences"]:
+        parts.append("_No divergences detected. Matrix is consistent across audited surfaces._")
+    else:
+        parts.append("| File | Cell | Divergence |")
+        parts.append("|---|---|---|")
+        for d in audit_findings["divergences"]:
+            parts.append(f"| `{d['file']}` | `{d['cell']}` | {d['issue']} |")
+    parts.append("")
+    parts.append("## Action")
+    parts.append("")
+    if audit_findings["divergences"]:
+        parts.append(f"- Refresh the matrix and update the divergent surface. Run `messaging-matrix --client {CLIENT} --mode build` after any positioning or VoC update.")
+    else:
+        parts.append("- No action required this cycle.")
+    return "\n".join(parts)
+
+
+def audit_channel(matrix_yaml_path, audit_dir):
+    """Walk audit_dir; flag any file whose copy contains banned terms or
+    diverges from the canonical hook/proof.
+    """
+    audit_root = Path(audit_dir)
+    if not audit_root.exists():
+        refuse("missing-audit-dir", f"{audit_dir} not found")
+
+    # Read the most recent matrix yaml (lazy parse for hook + proof verbatim)
+    matrices = sorted(MSG_DIR.glob("matrix-*.yaml"), reverse=True)
+    if not matrices:
+        refuse("no-matrix", f"no matrix-*.yaml under clients/{CLIENT}/messaging/; run --mode build first")
+    matrix_text = matrices[0].read_text(encoding="utf-8")
+    canonical_hooks = []
+    canonical_proofs = []
+    for m in re.finditer(r'hook: "([^"]+)"', matrix_text):
+        canonical_hooks.append(m.group(1))
+    for m in re.finditer(r'proof_point: "([^"]+)"', matrix_text):
+        canonical_proofs.append(m.group(1))
+
+    files_scanned = 0
+    divergences = []
+    for p in audit_root.rglob("*.md"):
+        files_scanned += 1
+        text = p.read_text(encoding="utf-8")
+        # Check whether any canonical hook key-phrase appears
+        hook_present = any(any(w in text.lower() for w in re.findall(r"[a-z]{5,}", h.lower())[:3]) for h in canonical_hooks if h)
+        if canonical_hooks and not hook_present:
+            divergences.append({
+                "file": str(p.relative_to(SUBSTRATE_ROOT)),
+                "cell": "any",
+                "issue": "no canonical hook anchor terms found",
+            })
+        # Banned terms
+        ab = load_allowed_banned()
+        bb = banned_check(text, ab["banned"])
+        if bb:
+            divergences.append({
+                "file": str(p.relative_to(SUBSTRATE_ROOT)),
+                "cell": "any",
+                "issue": bb,
+            })
+        # Voice gate
+        for vf in voice_gate(text[:5000]):
+            divergences.append({
+                "file": str(p.relative_to(SUBSTRATE_ROOT)),
+                "cell": "any",
+                "issue": f"voice-gate: {vf}",
+            })
+
+    return {"files_scanned": files_scanned, "divergences": divergences}
+
+
+def main():
+    positioning = load_positioning()
+    icp_personas, icp_path = load_icp_top_personas()
+    voc, voc_path = load_voc_findings()
+    value_pillars, value_pillars_path = load_value_pillars()
+    sq_path = load_status_quo()
+    narrative_path = load_narrative()
+    brand_voice_path = load_brand_voice()
+    allowed_banned = load_allowed_banned()
+
+    # Refuse if VoC missing
+    if not voc:
+        refuse(
+            "missing-voc-data",
+            f"clients/{CLIENT}/voc/findings/*.json required. "
+            "Run `frontline-contact` first; the matrix's pain + proof cells need verbatim language.",
+        )
+
+    if MODE == "audit-channel":
+        if not AUDIT_DIR:
+            refuse("missing-audit-dir-arg", "--audit-dir required for audit-channel mode")
+        ay = audit_channel(MSG_DIR, AUDIT_DIR)
+        drift_md = render_drift_log(AUDIT_DIR, [], ay)
+        out_path = MSG_DIR / f"drift-log-{TODAY}.md"
+        out_path.write_text(drift_md, encoding="utf-8")
+        print(f"[messaging-matrix] drift log: {out_path}")
+        if ay["divergences"]:
+            print(f"  found {len(ay['divergences'])} divergences", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
+
+    # build mode
+    personas_list = [s.strip() for s in PERSONAS_S.split(",") if s.strip()] if PERSONAS_S else (icp_personas or ["unknown"])
+    if not USE_CASES_S:
+        use_cases_list = top_jtbd(voc, n=3)
+        if not use_cases_list:
+            refuse(
+                "missing-use-cases",
+                "voc/findings/*.json has no jtbd themes; pass --use-cases or run frontline-contact with more transcripts",
+            )
+    else:
+        use_cases_list = [s.strip() for s in USE_CASES_S.split(",") if s.strip()]
+
+    cells = []
+    for persona in personas_list:
+        for use_case in use_cases_list:
+            cell = build_cell(
+                persona, use_case, voc, voc_path, positioning,
+                value_pillars, sq_path, narrative_path, allowed_banned,
+            )
+            cells.append(cell)
+
+    # Refuse if any cell lacks pain_verbatim source
+    bad = [c for c in cells if not c["pain_verbatim"] or not c["pain_source"]]
+    if bad:
+        refuse(
+            "missing-voc-data",
+            f"{len(bad)} cell(s) lack a pain_verbatim source. Cannot ship a matrix where pain is unsourced.",
+        )
+
+    md = render_md(cells, {
+        "positioning": positioning["path"],
+        "icp_path": icp_path,
+        "voc_path": voc_path,
+        "value_pillars_path": value_pillars_path,
+        "sq_path": sq_path,
+        "narrative_path": narrative_path,
+        "brand_voice_path": brand_voice_path,
+        "allowed_path": allowed_banned["allowed_path"],
+        "banned_path": allowed_banned["banned_path"],
+    })
+    md_path = MSG_DIR / f"matrix-{TODAY}.md"
+    md_path.write_text(md, encoding="utf-8")
+
+    yaml_path = MSG_DIR / f"matrix-{TODAY}.yaml"
+    write_yaml(cells, yaml_path)
+
+    print(f"[messaging-matrix] markdown: {md_path}")
+    print(f"[messaging-matrix] yaml:     {yaml_path}")
+
+    flagged = [c for c in cells if c.get("validation_flags")]
+    if flagged:
+        print(
+            f"[messaging-matrix] WARN: {len(flagged)} cell(s) have validation flags; operator review required.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    sys.exit(0)
+
+
+main()
+PYEOF

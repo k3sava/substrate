@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""launch-plan — full launch plan composer.
+
+Reads substrate (positioning, product-knowledge, voc, competitive, messaging) and
+emits a structured launch plan with sub-files per phase. The plan composes
+research preview + closed beta + frontier program + launch day + post-launch
+holdout into a single ledger, gated by tier (T1/T2/T3) per pat_launch-as-coordinated-distribution.
+
+Refuses without:
+  - clients/<client>/positioning/ (canonical positioning required)
+  - --launch + --launch-date + --audience + --tier (for plan mode)
+
+Modes:
+  plan           top-level launch plan + sub-files
+  preview        write/update the preview-cohort.md file
+  ship           render launch-day kit (channel-by-channel checklist)
+  holdout        write the post-launch measurement holdout design
+  retrospective  resolve the measurement contract; write retrospective.md
+
+Patterns applied:
+  - launch-as-coordinated-distribution (Raskin + Dunford + Rachitsky + Stinson)
+  - research-preview-and-cadence (Cat Wu + Aparna Chennapragada + Asha Sharma)
+  - narrative-as-strategy
+  - distribution-as-moat
+  - agents-mapped-to-jtbd
+
+Contradictions navigated:
+  - short-feedback-vs-long-term-holdouts: tier + reversibility decide
+  - build-quietly-vs-distribution-first: PMF stage decides
+
+Exit codes:
+  0  artifact written
+  1  artifact written with warnings (missing optional substrate)
+  3  refused (substrate gap, missing positioning, missing args)
+  4  invalid args
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+os.environ["SUBSTRATE_ROOT"] = str(SUBSTRATE_ROOT)
+os.environ.setdefault("FLYWHEEL_ROOT", str(SUBSTRATE_ROOT))
+
+
+TIER_DEFAULTS = {
+    "T1": {
+        "preview_cohort_size": (5, 15),
+        "preview_window_weeks": 8,
+        "beta_window_weeks": 4,
+        "frontier_artifacts_min": 3,
+        "channels": ["press", "social", "ads", "email", "community", "partners", "owned-blog"],
+        "primary_window_days": 90,
+        "retention_window_days": 180,
+        "feedback_shape": "long-term-holdout",
+    },
+    "T2": {
+        "preview_cohort_size": (3, 5),
+        "preview_window_weeks": 4,
+        "beta_window_weeks": 2,
+        "frontier_artifacts_min": 0,
+        "channels": ["owned-blog", "email", "social"],
+        "primary_window_days": 30,
+        "retention_window_days": 60,
+        "feedback_shape": "short-feedback",
+    },
+    "T3": {
+        "preview_cohort_size": (0, 2),
+        "preview_window_weeks": 1,
+        "beta_window_weeks": 0,
+        "frontier_artifacts_min": 0,
+        "channels": ["changelog", "in-app", "feature-flag"],
+        "primary_window_days": 14,
+        "retention_window_days": 30,
+        "feedback_shape": "short-feedback",
+    },
+}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def find_positioning(client_root: Path) -> Path | None:
+    """Find the canonical positioning artifact for the client."""
+    for candidate in ["positioning/positioning-canonical-statement.md",
+                      "positioning/canonical.md",
+                      "positioning.md"]:
+        p = client_root / candidate
+        if p.is_file():
+            return p
+    pos_dir = client_root / "positioning"
+    if pos_dir.is_dir():
+        canon_files = sorted(pos_dir.glob("*canonical*.md"), reverse=True)
+        if canon_files:
+            return canon_files[0]
+        # Fall back to any .md file in positioning/
+        any_md = sorted(pos_dir.glob("*.md"), reverse=True)
+        if any_md:
+            return any_md[0]
+    sub_dir = client_root / "substrate"
+    if sub_dir.is_dir():
+        canon_files = sorted(sub_dir.glob("positioning-canonical-statement-*.md"), reverse=True)
+        if canon_files:
+            return canon_files[0]
+    return None
+
+
+def find_product_knowledge(client_root: Path) -> list[Path]:
+    """Find product-knowledge files for the launch."""
+    pk_dir = client_root / "product-knowledge"
+    if pk_dir.is_dir():
+        return sorted(pk_dir.glob("*.md"))
+    return []
+
+
+def detect_pmf_stage(client_root: Path) -> str:
+    """Heuristic: look for clients/<client>/strategy/pmf-stage.md or BRIEF.md mentioning stage.
+
+    Returns one of: pre-pmf, post-pmf, unknown. Used by the build-quietly contradiction.
+    """
+    for path in [client_root / "strategy" / "pmf-stage.md",
+                 client_root / "BRIEF.md",
+                 client_root / "00-INDEX.md"]:
+        if path.is_file():
+            text = path.read_text(encoding="utf-8").lower()
+            if "post-pmf" in text or "post pmf" in text or "product-market fit achieved" in text:
+                return "post-pmf"
+            if "pre-pmf" in text or "pre pmf" in text or "pre-product-market-fit" in text:
+                return "pre-pmf"
+    return "unknown"
+
+
+def detect_reversibility(launch_id: str) -> str:
+    """Heuristic: launch ids containing 'pricing', 'positioning', 'rebrand', 'category' are
+    one-way. Others default to reversible.
+    """
+    one_way_signals = ["pricing", "positioning", "rebrand", "category", "platform-shift", "permanent"]
+    li_lower = launch_id.lower()
+    if any(sig in li_lower for sig in one_way_signals):
+        return "one-way"
+    return "reversible"
+
+
+def render_plan(*,
+                client: str,
+                launch: str,
+                launch_date: str,
+                audience: str,
+                tier: str,
+                pmf_stage: str,
+                reversibility: str,
+                positioning_path: Path | None,
+                pk_paths: list[Path],
+                today: str) -> str:
+    cfg = TIER_DEFAULTS[tier]
+    launch_dt = datetime.strptime(launch_date, "%Y-%m-%d")
+    preview_start_dt = launch_dt - timedelta(weeks=cfg["preview_window_weeks"])
+    beta_start_dt = launch_dt - timedelta(weeks=cfg["beta_window_weeks"])
+    primary_resolve_dt = launch_dt + timedelta(days=cfg["primary_window_days"])
+    retention_resolve_dt = launch_dt + timedelta(days=cfg["retention_window_days"])
+
+    cohort_min, cohort_max = cfg["preview_cohort_size"]
+
+    # Pick contradiction position
+    if reversibility == "one-way" or tier == "T1":
+        feedback_position = "Position B (long-term holdout)"
+        feedback_rationale = (
+            f"Tier {tier} + reversibility={reversibility}. The launch is a category-shaping bet, "
+            "not a small-cohort reversible iteration. The 90-day primary window plus the "
+            f"{cfg['retention_window_days']}-day retention window are required to disambiguate "
+            "the launch's effect from baseline trend."
+        )
+    else:
+        feedback_position = "Position A (short feedback)"
+        feedback_rationale = (
+            f"Tier {tier} + reversibility=reversible. The launch is reversible inside the live "
+            f"product. A 1-2 week feedback loop with the {cohort_max}-buyer cohort is sharper "
+            "than a long-window holdout that adds latency without signal magnitude."
+        )
+
+    if pmf_stage == "pre-pmf":
+        build_quietly_position = "Position A (build quietly)"
+        build_quietly_rationale = (
+            "PMF stage: pre-pmf. Per the build-quietly-vs-distribution-first contradiction "
+            "(per Cat Wu's research-preview discipline), the right shape pre-PMF is research preview "
+            "as the entire motion. No coordinated public launch yet. The launch plan below is "
+            "scoped to a pre-PMF research-preview sequence; the public coordinated phase activates only "
+            "post-PMF."
+        )
+    else:
+        build_quietly_position = "Position B (distribution-first)"
+        build_quietly_rationale = (
+            f"PMF stage: {pmf_stage}. Per pat_distribution-as-moat and pat_launch-as-coordinated-distribution, "
+            "the post-PMF launch ships as a coordinated multi-channel sequence; the moat is distribution, not "
+            "the feature itself, and the launch is the moment the distribution compounds."
+        )
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: launch-plan")
+    lines.append("produced_by: launch-plan")
+    lines.append(f"client: {client}")
+    lines.append(f"launch: {launch}")
+    lines.append(f"launch_date: {launch_date}")
+    lines.append(f"audience: {audience}")
+    lines.append(f"tier: {tier}")
+    lines.append(f"pmf_stage: {pmf_stage}")
+    lines.append(f"reversibility: {reversibility}")
+    lines.append(f"authored_at: {today}")
+    lines.append("substrate_layers_cited: [positioning, product-knowledge, voc, competitive, messaging]")
+    lines.append("patterns_applied: [launch-as-coordinated-distribution, research-preview-and-cadence, narrative-as-strategy, distribution-as-moat, agents-mapped-to-jtbd]")
+    lines.append("contradiction_positions:")
+    lines.append(f"  short-feedback-vs-long-term-holdouts: {feedback_position}")
+    lines.append(f"  build-quietly-vs-distribution-first: {build_quietly_position}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Launch plan — {client} | {launch} | {launch_date} (T{tier[1]})")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"A coordinated {tier} launch sequence for `{launch}` shipping {launch_date} to "
+                 f"the `{audience}` cohort. Phased through preview ({preview_start_dt.strftime('%Y-%m-%d')}) "
+                 f"→ beta ({beta_start_dt.strftime('%Y-%m-%d')}) → launch ({launch_date}) → primary "
+                 f"resolution ({primary_resolve_dt.strftime('%Y-%m-%d')}) → retention resolution "
+                 f"({retention_resolve_dt.strftime('%Y-%m-%d')}). Tier discipline drives cohort size, "
+                 f"channel mix, and measurement window per pat_launch-as-coordinated-distribution.")
+    lines.append("")
+    lines.append("## Contradiction navigation")
+    lines.append("")
+    lines.append(f"### short-feedback-vs-long-term-holdouts → {feedback_position}")
+    lines.append("")
+    lines.append(feedback_rationale)
+    lines.append("")
+    lines.append(f"### build-quietly-vs-distribution-first → {build_quietly_position}")
+    lines.append("")
+    lines.append(build_quietly_rationale)
+    lines.append("")
+    lines.append("## Substrate citations (load-bearing)")
+    lines.append("")
+    if positioning_path:
+        rel = positioning_path.relative_to(SUBSTRATE_ROOT) if str(positioning_path).startswith(str(SUBSTRATE_ROOT)) else positioning_path
+        lines.append(f"- **Canonical positioning**: `{rel}` — every launch asset cites this.")
+    else:
+        lines.append("- **Canonical positioning**: MISSING. The plan refuses to ship without this. Run "
+                     f"positioning-forge --diagnose --client {client} first.")
+    if pk_paths:
+        lines.append(f"- **Product knowledge**: {len(pk_paths)} file(s) under `clients/{client}/product-knowledge/`")
+        for p in pk_paths[:5]:
+            lines.append(f"  - `{p.relative_to(SUBSTRATE_ROOT)}`")
+        if len(pk_paths) > 5:
+            lines.append(f"  - … and {len(pk_paths) - 5} more")
+    else:
+        lines.append("- **Product knowledge**: MISSING (warn). Populate before shipping the frontier-program assets.")
+    lines.append("")
+    lines.append("## Tier discipline (per pat_launch-as-coordinated-distribution)")
+    lines.append("")
+    lines.append(f"This is a **{tier}** launch.")
+    lines.append("")
+    lines.append("| Dimension | Value (this launch) | Tier rule |")
+    lines.append("|---|---|---|")
+    lines.append(f"| Preview cohort size | {cohort_min}-{cohort_max} buyers | T1: 5-15; T2: 3-5; T3: 0-2 |")
+    lines.append(f"| Preview window | {cfg['preview_window_weeks']} weeks | T1: 8w; T2: 4w; T3: 1w |")
+    lines.append(f"| Beta window | {cfg['beta_window_weeks']} weeks | T1: 4w; T2: 2w; T3: 0w |")
+    lines.append(f"| Frontier artifacts (named customers) | ≥{cfg['frontier_artifacts_min']} | T1: ≥3; T2/T3: 0 |")
+    lines.append(f"| Channel mix | {', '.join(cfg['channels'])} | T1: multi; T2: single hero; T3: changelog |")
+    lines.append(f"| Primary measurement window | {cfg['primary_window_days']} days | T1: 90d; T2: 30d; T3: 14d |")
+    lines.append(f"| Retention measurement window | {cfg['retention_window_days']} days | T1: 180d; T2: 60d; T3: 30d |")
+    lines.append("")
+    lines.append("## Phase structure")
+    lines.append("")
+    lines.append("### Phase 1 — Research preview (T-N weeks)")
+    lines.append("")
+    lines.append(f"**Window**: {preview_start_dt.strftime('%Y-%m-%d')} → {beta_start_dt.strftime('%Y-%m-%d')}")
+    lines.append("")
+    lines.append(f"**Cohort**: {cohort_min}-{cohort_max} pinned customers / experts in `{audience}`. Reach via warm intros only "
+                 "(no cold outreach for preview). Sourced from VoC corpus + closed-won + advisor circle.")
+    lines.append("")
+    lines.append("**Artifacts collected**:")
+    lines.append("- 60-min interview per buyer; recorded; transcript stored under `voc/raw-interviews/launches/<launch>/`.")
+    lines.append("- Narrative iteration: take buyer language directly into the spine; refuse marketer-imagined buyer language.")
+    lines.append("- Product iteration: defects + missing surfaces flagged to engineering; closed via JIRA / Linear loop.")
+    lines.append("- Pinned-quote consent: each buyer agrees in writing to be quoted in launch-day artifacts (T1 only).")
+    lines.append("")
+    lines.append(f"**Output**: `clients/{client}/launches/{launch}/preview-cohort.md`")
+    lines.append("")
+    if tier in ("T1", "T2"):
+        lines.append("### Phase 2 — Closed beta (T-week)")
+        lines.append("")
+        lines.append(f"**Window**: {beta_start_dt.strftime('%Y-%m-%d')} → {launch_date}")
+        lines.append("")
+        lines.append("**Cohort expansion**: 25-100 buyers (T1) or 10-25 buyers (T2) inside `" + audience + "`. "
+                     "Instrumentation lit; signal cadence open. Daily standup with PM + eng + PMM.")
+        lines.append("")
+        lines.append("**Goals**: cohort retention curve healthy by week 2, conversion-to-paid "
+                     "(if applicable) above the pre-beta baseline, NPS or buyer-satisfaction signal "
+                     "ungrounded but trending positive.")
+        lines.append("")
+    if tier == "T1":
+        lines.append("### Phase 3 — Frontier program (T-day, T1 only)")
+        lines.append("")
+        lines.append(f"**Window**: {(launch_dt - timedelta(days=14)).strftime('%Y-%m-%d')} → {launch_date}")
+        lines.append("")
+        lines.append("**Frontier customers** (named, written commitment): 3-5 lighthouse accounts who "
+                     "commit to a public launch-day artifact. Each artifact:")
+        lines.append("- Customer-attributed quote (with name + role + company, written consent).")
+        lines.append("- Outcome metric the customer is willing to publish.")
+        lines.append("- Written case study (1 page, drafted by PMM, customer-approved).")
+        lines.append("- Optional: 60-second video clip; logo for social/web; testimonial for press kit.")
+        lines.append("")
+        lines.append(f"**Output**: `clients/{client}/launches/{launch}/frontier-artifacts/`")
+        lines.append("")
+    lines.append("### Phase 4 — Launch day")
+    lines.append("")
+    lines.append(f"**Date**: {launch_date}")
+    lines.append("")
+    lines.append("**Narrative spine**: published in the canonical launch post. Every channel adaptation "
+                 "below traces back to this single spine; per pat_narrative-as-strategy, two channels "
+                 "telling two different stories means the launch is no longer a launch.")
+    lines.append("")
+    lines.append("**Channel coordination** (sequenced, not simultaneous; staggered for amplification):")
+    lines.append("")
+    lines.append("| Time | Channel | Asset | Owner |")
+    lines.append("|---|---|---|---|")
+    if tier == "T1":
+        lines.append("| T-2h | community | private Slack/Discord pre-announcement to closed-beta cohort | community lead |")
+        lines.append("| T+0 | owned-blog | hero post with narrative spine + frontier customer quotes | PMM lead |")
+        lines.append("| T+0 | press | embargoed press release lifts; named outlets respond | comms lead |")
+        lines.append("| T+1h | social | LinkedIn long-form + Twitter thread + YouTube video | social lead |")
+        lines.append("| T+2h | email | launch announcement to all-customer + waitlist + prospects | lifecycle |")
+        lines.append("| T+3h | ads | paid social + paid search variants live | growth |")
+        lines.append("| T+1d | partners | partner co-marketing posts + integrations launches | partnerships |")
+    elif tier == "T2":
+        lines.append("| T+0 | owned-blog | hero post with narrative spine | PMM lead |")
+        lines.append("| T+1h | social | LinkedIn post + Twitter thread | social lead |")
+        lines.append("| T+2h | email | launch announcement to all-customer | lifecycle |")
+    else:
+        lines.append("| T+0 | changelog | feature-flag rollout + changelog entry | product owner |")
+        lines.append("| T+0 | in-app | in-app announcement + walkthrough trigger | product owner |")
+    lines.append("")
+    lines.append("**Refusal gates**:")
+    lines.append("- Refuse any launch-day asset that doesn't cite the canonical positioning. "
+                 "(Per Dunford: a launch is positioning instantiated.)")
+    if tier == "T1":
+        lines.append("- Refuse any T1 launch-day asset that doesn't cite at least one frontier-program customer artifact.")
+    lines.append("- Refuse any claim that exceeds product-knowledge.")
+    lines.append("")
+    lines.append("### Phase 5 — Post-launch holdout (T+N weeks)")
+    lines.append("")
+    lines.append(f"**Primary window**: {launch_date} → {primary_resolve_dt.strftime('%Y-%m-%d')} ({cfg['primary_window_days']} days)")
+    lines.append(f"**Retention window**: {launch_date} → {retention_resolve_dt.strftime('%Y-%m-%d')} ({cfg['retention_window_days']} days)")
+    lines.append("")
+    lines.append(f"Per the contradiction navigation above, this launch uses **{feedback_position}**: "
+                 f"{feedback_rationale.lower()}")
+    lines.append("")
+    lines.append(f"**Output**: `clients/{client}/launches/{launch}/measurement-contract.md` "
+                 "(written via --mode holdout).")
+    lines.append("")
+    lines.append("## Channel adaptations (drafted from messaging-matrix)")
+    lines.append("")
+    lines.append("Per pat_distribution-as-moat: tag each channel as algorithm-rented vs earned; the "
+                 "moat compounds in earned channels.")
+    lines.append("")
+    lines.append("| Channel | Type | Asset link | Algorithm-rented? |")
+    lines.append("|---|---|---|---|")
+    for ch in cfg["channels"]:
+        rented = "yes" if ch in ("ads", "social") else "no"
+        lines.append(f"| {ch} | distribution | `clients/{client}/launches/{launch}/assets/{ch}.md` | {rented} |")
+    lines.append("")
+    lines.append(f"Algorithm-rented share: {sum(1 for ch in cfg['channels'] if ch in ('ads', 'social'))}/{len(cfg['channels'])}. "
+                 "Per pat_distribution-as-moat, every dollar in algorithm channels makes the platform richer; "
+                 "compounding earned channels is the launch's long-tail.")
+    lines.append("")
+    lines.append("## 30-60-90 measurement plan")
+    lines.append("")
+    lines.append("| Day | Measurement | Source | Predicted outcome |")
+    lines.append("|---|---|---|---|")
+    lines.append(f"| 30 | Awareness lift in `{audience}` | branded search + organic traffic + social mentions | (fill predicted lift) |")
+    lines.append(f"| 60 | Conversion / activation rate in `{audience}` | product analytics + CRM | (fill predicted rate) |")
+    lines.append(f"| 90 | Revenue impact | billing system | (fill predicted ARR) |")
+    lines.append(f"| 180 (T1 only) | Retention curve at week-12 | product analytics | (fill predicted curve) |")
+    lines.append("")
+    lines.append(f"**Output**: `clients/{client}/launches/{launch}/30-60-90.md`")
+    lines.append("")
+    lines.append("## Calibrated prediction (the falsifiable bet)")
+    lines.append("")
+    lines.append("The launch opens a goal in `goals/ledger.md` with the following shape (run "
+                 f"--mode holdout to write the contract). Operator predicts probability of hitting the outcome; "
+                 "Brier-scored at resolution.")
+    lines.append("")
+    lines.append("- **Predicted outcome**: TBD — fill from substrate + competitive context.")
+    lines.append("- **Predicted probability of hitting outcome**: TBD")
+    lines.append("- **Kill criterion**: TBD — what signal would cause early termination.")
+    lines.append("- **Resolution date**: " + primary_resolve_dt.strftime('%Y-%m-%d'))
+    lines.append("")
+    lines.append("## Open questions")
+    lines.append("")
+    lines.append("- Which 5-15 buyers (T1) make the preview cohort? Source: VoC corpus + advisor circle + closed-won. "
+                 "Decision needed by " + (preview_start_dt - timedelta(days=7)).strftime('%Y-%m-%d') + ".")
+    if tier == "T1":
+        lines.append("- Which 3-5 frontier customers commit to launch-day artifacts? Decision needed by "
+                     + (launch_dt - timedelta(days=21)).strftime('%Y-%m-%d') + ".")
+    lines.append("- Which competitor is the primary displacement target on launch day? Source: "
+                 f"`clients/{client}/competitive/`. The narrative spine should name the displacement explicitly.")
+    lines.append("- What is the predicted lift on the primary metric? Without it, the launch is theater (per "
+                 "PRINCIPLES.md rule 2). Fill before " + launch_date + ".")
+    lines.append("")
+    lines.append("## Retrospective trigger")
+    lines.append("")
+    lines.append(f"At {primary_resolve_dt.strftime('%Y-%m-%d')} (primary resolution), run "
+                 f"`launch-plan --mode retrospective --client {client} --launch {launch}`. "
+                 "Resolves the measurement contract, scores the prediction, updates substrate with what the "
+                 "resolution taught.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/launch-as-coordinated-distribution.md`")
+    lines.append("- `knowledge/patterns/research-preview-and-cadence.md`")
+    lines.append("- `knowledge/patterns/narrative-as-strategy.md`")
+    lines.append("- `knowledge/patterns/distribution-as-moat.md`")
+    lines.append(f"- `clients/{client}/launches/{launch}/preview-cohort.md`")
+    lines.append(f"- `clients/{client}/launches/{launch}/measurement-contract.md`")
+    if tier == "T1":
+        lines.append(f"- `clients/{client}/launches/{launch}/frontier-artifacts/`")
+
+    return "\n".join(lines)
+
+
+def render_preview_cohort(client: str, launch: str, audience: str, tier: str, today: str) -> str:
+    cfg = TIER_DEFAULTS[tier]
+    cohort_min, cohort_max = cfg["preview_cohort_size"]
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: preview-cohort")
+    lines.append("produced_by: launch-plan")
+    lines.append(f"client: {client}")
+    lines.append(f"launch: {launch}")
+    lines.append(f"tier: {tier}")
+    lines.append(f"audience: {audience}")
+    lines.append(f"authored_at: {today}")
+    lines.append("substrate_layers_cited: [voc, positioning, product-knowledge]")
+    lines.append("patterns_applied: [launch-as-coordinated-distribution, research-preview-and-cadence]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Preview cohort — {client} | {launch}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"A {cohort_min}-{cohort_max} pinned-buyer cohort sourced from `{audience}`. Each buyer participates "
+                 "in a 60-min interview, gives consent for quotes (if T1), and gives consent for the product "
+                 "team to instrument their account during the preview window.")
+    lines.append("")
+    lines.append("## Sourcing")
+    lines.append("")
+    lines.append("Sources, in priority order (per pat_research-preview-and-cadence + pat_frontline-as-pmm-substrate):")
+    lines.append("")
+    lines.append("1. Closed-won deals in the audience (best fit; warmest intros).")
+    lines.append("2. VoC corpus contributors (already engaged with the team).")
+    lines.append("3. Advisors / customer council members.")
+    lines.append("4. Frontline-flagged users (the 3S content from sales/success/support).")
+    lines.append("")
+    lines.append("Cold outbound is refused for preview cohort. The buyer must already trust the team enough "
+                 "to commit 60 minutes of interview time + product instrumentation consent.")
+    lines.append("")
+    lines.append(f"## Cohort roster (target {cohort_min}-{cohort_max})")
+    lines.append("")
+    lines.append("| Name | Role | Company | Source | Interview date | Consent (quote) | Consent (instrumentation) |")
+    lines.append("|---|---|---|---|---|---|---|")
+    for i in range(cohort_max):
+        lines.append(f"| TBD-{i+1} | TBD | TBD | TBD | TBD | TBD | TBD |")
+    lines.append("")
+    lines.append("## Interview structure (60 minutes)")
+    lines.append("")
+    lines.append("Per pat_rapport-surfaces-what-research-cannot + pat_diagnose-before-execute:")
+    lines.append("")
+    lines.append("- 0-10m: rapport. Open with the buyer's current state, not the launch.")
+    lines.append("- 10-25m: discovery. What's the job they're trying to do? What's frustrating them? What have they tried?")
+    lines.append("- 25-45m: walkthrough. Show the launching feature in their context; collect reactions.")
+    lines.append("- 45-55m: objections. What would stop them from using this? What questions do they have?")
+    lines.append("- 55-60m: close. Consent confirmation; quote consent (if applicable); next steps.")
+    lines.append("")
+    lines.append("**Refusal**: do not lead the witness. Per the buyer-not-marketer rule (PRINCIPLES.md rule 3), "
+                 "the interview is discovery, not a sales pitch.")
+    lines.append("")
+    lines.append("## Outputs")
+    lines.append("")
+    lines.append(f"- Recordings under `clients/{client}/voc/raw-interviews/launches/{launch}/`")
+    lines.append(f"- Quote bank under `clients/{client}/voc/processed/launches/{launch}/quotes.md`")
+    lines.append(f"- Narrative iterations under `clients/{client}/launches/{launch}/narrative-iterations.md`")
+    lines.append(f"- Product feedback into Linear / JIRA, tagged `launch-{launch}-preview`")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/research-preview-and-cadence.md`")
+    lines.append("- `knowledge/patterns/rapport-surfaces-what-research-cannot.md`")
+    lines.append(f"- `clients/{client}/launches/{launch}/plan.md`")
+    return "\n".join(lines)
+
+
+def render_measurement_contract(client: str, launch: str, audience: str, tier: str,
+                                launch_date: str, today: str) -> str:
+    cfg = TIER_DEFAULTS[tier]
+    launch_dt = datetime.strptime(launch_date, "%Y-%m-%d")
+    primary_resolve_dt = launch_dt + timedelta(days=cfg["primary_window_days"])
+    retention_resolve_dt = launch_dt + timedelta(days=cfg["retention_window_days"])
+    feedback_shape = cfg["feedback_shape"]
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"goal_id: {client}-launch-{launch}")
+    lines.append(f"client: {client}")
+    lines.append(f"opener: launch-plan")
+    lines.append(f"opened_at: {today}")
+    lines.append("status: proposed")
+    lines.append("taste_type: launch")
+    lines.append(f"resolution_date: {primary_resolve_dt.strftime('%Y-%m-%d')}")
+    lines.append(f"retention_resolution_date: {retention_resolve_dt.strftime('%Y-%m-%d')}")
+    lines.append(f"tier: {tier}")
+    lines.append(f"audience: {audience}")
+    lines.append("substrate_layers_cited: [positioning, product-knowledge, voc, competitive]")
+    lines.append("patterns_applied: [launch-as-coordinated-distribution, research-preview-and-cadence]")
+    lines.append(f"contradiction_positions: {{ short-feedback-vs-long-term-holdouts: '{feedback_shape}' }}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Measurement contract — {client} launch {launch}")
+    lines.append("")
+    lines.append("## Hypothesis")
+    lines.append("")
+    lines.append(f"Shipping `{launch}` to the `{audience}` cohort on {launch_date} produces a measurable lift on "
+                 f"the primary outcome metric within {cfg['primary_window_days']} days, with retention healthy "
+                 f"at week-{cfg['retention_window_days'] // 7}.")
+    lines.append("")
+    lines.append("Source for the prediction: positioning + product-knowledge + VoC + competitive. "
+                 "Without all four, the prediction is weakly grounded.")
+    lines.append("")
+    lines.append("## Predicted outcomes (falsifiable)")
+    lines.append("")
+    lines.append("Fill before launch day:")
+    lines.append("")
+    lines.append("| Metric | Direction | Threshold | Window | Source-system |")
+    lines.append("|---|---|---|---|---|")
+    lines.append("| (primary) | (up / down) | (delta) | " + f"{cfg['primary_window_days']}d" + " | (analytics / CRM / billing) |")
+    lines.append("| (secondary) | (up / down) | (delta) | " + f"{cfg['primary_window_days']}d" + " | (named system) |")
+    lines.append("| (retention) | (up / flat) | (curve shape) | " + f"{cfg['retention_window_days']}d" + " | (analytics) |")
+    lines.append("")
+    lines.append("## Predicted probability of hitting threshold (P)")
+    lines.append("")
+    lines.append("Operator's calibrated prediction: P = (fill, 0-1). Brier scored at resolution.")
+    lines.append("")
+    lines.append("## Kill criterion (early termination)")
+    lines.append("")
+    lines.append("If any of the following fire in the first 14 days, the launch is paused and routed to "
+                 "diagnostic:")
+    lines.append("")
+    lines.append("- Conversion-to-paid (if applicable) drops more than 30% from baseline.")
+    lines.append("- A frontier-customer artifact is rescinded (T1 only).")
+    lines.append("- A regulatory or compliance issue surfaces.")
+    lines.append("- Net Promoter or buyer-satisfaction dips more than 15pp from baseline.")
+    lines.append("")
+    lines.append("## Resolution")
+    lines.append(f"Resolves at {primary_resolve_dt.strftime('%Y-%m-%d')}. Verdict:")
+    lines.append("")
+    lines.append("- **YES**: predicted outcome hit the threshold within the window. Update positioning + competitive "
+                 "with what the launch confirmed.")
+    lines.append("- **NO**: predicted outcome missed. Update substrate with the disconfirming evidence; route to "
+                 "discovery on which load-bearing assumption was wrong.")
+    lines.append("- **AMBIGUOUS**: data quality fails (missing instrumentation, kill-criterion fire, etc.). "
+                 "Mark and reopen with sharper measurement.")
+    lines.append("")
+    lines.append("Brier score: (P - indicator)^2 where indicator = 1 if YES, 0 if NO. Feeds the calibration ledger.")
+    lines.append("")
+    lines.append("## Substrate update on resolution")
+    lines.append("")
+    lines.append("- If YES: confirm the launch-day positioning in `clients/" + client + "/positioning/`. Update "
+                 f"`clients/{client}/competitive/` if the launch shifted the competitive map.")
+    lines.append("- If NO: tag the failure mode in `clients/" + client + "/launches/" + launch + "/retrospective.md`. "
+                 "Open follow-up goals against the corrected hypothesis.")
+    lines.append("- If AMBIGUOUS: name the data gap; do not autoresolve; reopen with sharper design.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append(f"- `clients/{client}/launches/{launch}/plan.md`")
+    lines.append(f"- `clients/{client}/launches/{launch}/30-60-90.md`")
+    lines.append("- `goals/ledger.md` (run `bin/substrate open-goal --contract ...` to register)")
+    lines.append("- `knowledge/patterns/launch-as-coordinated-distribution.md`")
+    return "\n".join(lines)
+
+
+def render_30_60_90(client: str, launch: str, launch_date: str, tier: str, today: str) -> str:
+    cfg = TIER_DEFAULTS[tier]
+    launch_dt = datetime.strptime(launch_date, "%Y-%m-%d")
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: launch-30-60-90")
+    lines.append("produced_by: launch-plan")
+    lines.append(f"client: {client}")
+    lines.append(f"launch: {launch}")
+    lines.append(f"tier: {tier}")
+    lines.append(f"authored_at: {today}")
+    lines.append("substrate_layers_cited: [positioning, voc]")
+    lines.append("patterns_applied: [launch-as-coordinated-distribution, research-preview-and-cadence]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# 30-60-90 plan — {client} | {launch} | {tier}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append("Per pat_launch-as-coordinated-distribution: a launch is not a moment; it is a campaign with "
+                 "stages. The 30/60/90 plan keeps the post-launch motion intentional, with a measurement read at each milestone.")
+    lines.append("")
+    milestones = [
+        (30, "Awareness + adoption"),
+        (60, "Activation + conversion"),
+        (90, "Revenue + retention"),
+    ]
+    if tier == "T1":
+        milestones.append((180, "Retention curve resolution"))
+    for days, label in milestones:
+        m_date = (launch_dt + timedelta(days=days)).strftime("%Y-%m-%d")
+        lines.append(f"## T+{days} ({m_date}) — {label}")
+        lines.append("")
+        lines.append(f"**Read**: did we move the metric vs the predicted threshold?")
+        lines.append("")
+        lines.append("**Actions if YES** (on track):")
+        lines.append("- Continue cadence; double down on highest-performing channels.")
+        lines.append("- Capture customer artifacts that emerged during the window.")
+        lines.append("")
+        lines.append("**Actions if NO** (off track):")
+        lines.append("- Diagnose first; do not pivot to a new asset until the cause is named.")
+        lines.append("- Pull a frontline diagnostic call (3-5 buyers in the cohort) to surface the gap.")
+        lines.append("- Update positioning or messaging if the cause is narrative drift; ship correction within 7 days.")
+        lines.append("")
+        lines.append("**Actions if AMBIGUOUS** (data quality fails):")
+        lines.append("- Mark the gap; route to RevOps; do not call YES or NO without resolved instrumentation.")
+        lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append(f"- `clients/{client}/launches/{launch}/measurement-contract.md`")
+    lines.append("- `knowledge/patterns/launch-as-coordinated-distribution.md`")
+    return "\n".join(lines)
+
+
+def render_retrospective(client: str, launch: str, launch_date: str, tier: str, today: str) -> str:
+    cfg = TIER_DEFAULTS[tier]
+    launch_dt = datetime.strptime(launch_date, "%Y-%m-%d")
+    days_since = (datetime.strptime(today, "%Y-%m-%d") - launch_dt).days
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: launch-retrospective")
+    lines.append("produced_by: launch-plan")
+    lines.append(f"client: {client}")
+    lines.append(f"launch: {launch}")
+    lines.append(f"tier: {tier}")
+    lines.append(f"launch_date: {launch_date}")
+    lines.append(f"resolved_at: {today}")
+    lines.append(f"days_since_launch: {days_since}")
+    lines.append("substrate_layers_cited: [positioning, product-knowledge, voc, competitive]")
+    lines.append("patterns_applied: [launch-as-coordinated-distribution]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Retrospective — {client} | {launch}")
+    lines.append("")
+    lines.append("## Resolution")
+    lines.append("")
+    lines.append("- **Predicted outcome**: TBD (cite from measurement-contract.md)")
+    lines.append("- **Observed outcome**: TBD (cite source-system pull)")
+    lines.append("- **Verdict**: YES / NO / AMBIGUOUS")
+    lines.append("- **Brier score**: TBD")
+    lines.append("")
+    lines.append("## What worked")
+    lines.append("")
+    lines.append("- (fill)")
+    lines.append("")
+    lines.append("## What didn't work")
+    lines.append("")
+    lines.append("- (fill)")
+    lines.append("")
+    lines.append("## What we got wrong (load-bearing)")
+    lines.append("")
+    lines.append("Per PRINCIPLES.md rule 2: honest losses count as much as wins; both update the tracker.")
+    lines.append("")
+    lines.append("- (fill: which load-bearing assumption was wrong; how do we know)")
+    lines.append("")
+    lines.append("## Substrate updates")
+    lines.append("")
+    lines.append("- `clients/" + client + "/positioning/`: (any updates)")
+    lines.append("- `clients/" + client + "/competitive/`: (any updates)")
+    lines.append("- `clients/" + client + "/voc/processed/`: (any updates)")
+    lines.append("")
+    lines.append("## Open follow-up goals")
+    lines.append("")
+    lines.append("- (fill: what should we open next)")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append(f"- `clients/{client}/launches/{launch}/plan.md`")
+    lines.append(f"- `clients/{client}/launches/{launch}/measurement-contract.md`")
+    lines.append("- `knowledge/patterns/launch-as-coordinated-distribution.md`")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="launch-plan — full launch sequence composer")
+    p.add_argument("--client", required=True)
+    p.add_argument("--launch", required=False, help="launch slug, e.g. voice-ai-agent-2026-q3")
+    p.add_argument("--launch-date", required=False, help="YYYY-MM-DD")
+    p.add_argument("--audience", required=False, help="pinned ICP audience")
+    p.add_argument("--tier", choices=["T1", "T2", "T3"], required=False)
+    p.add_argument("--mode", default="plan",
+                   choices=["plan", "preview", "ship", "holdout", "retrospective"])
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        return refuse(
+            f"client root missing: clients/{args.client}/",
+            f"run: bin/substrate-bootstrap-prospect {args.client}",
+        )
+
+    # Refusal: positioning required
+    positioning_path = find_positioning(client_root)
+    if not positioning_path:
+        return refuse(
+            "missing-positioning",
+            f"no canonical positioning at clients/{args.client}/positioning/. "
+            f"Run positioning-forge --diagnose --client {args.client} first.",
+        )
+
+    # Refusal: launch + launch_date + audience + tier required for plan mode
+    if args.mode in ("plan", "preview", "ship", "holdout"):
+        for arg_name in ("launch", "launch_date", "audience"):
+            if not getattr(args, arg_name):
+                return refuse(
+                    f"missing-{arg_name.replace('_', '-')}",
+                    f"--{arg_name.replace('_', '-')} required for --mode {args.mode}",
+                )
+    if args.mode == "plan" and not args.tier:
+        return refuse("missing-tier",
+                      "--tier T1|T2|T3 required for --mode plan; tier discipline drives every other constraint.")
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if args.launch_date:
+        try:
+            datetime.strptime(args.launch_date, "%Y-%m-%d")
+        except ValueError:
+            return refuse("invalid-launch-date", f"--launch-date must be YYYY-MM-DD, got: {args.launch_date}")
+
+    out_dir = Path(args.out) if args.out else (client_root / "launches" / (args.launch or "no-launch-id"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pk_paths = find_product_knowledge(client_root)
+    pmf_stage = detect_pmf_stage(client_root)
+    reversibility = detect_reversibility(args.launch or "") if args.launch else "reversible"
+
+    if args.mode == "plan":
+        plan_path = out_dir / "plan.md"
+        plan_path.write_text(render_plan(
+            client=args.client,
+            launch=args.launch,
+            launch_date=args.launch_date,
+            audience=args.audience,
+            tier=args.tier,
+            pmf_stage=pmf_stage,
+            reversibility=reversibility,
+            positioning_path=positioning_path,
+            pk_paths=pk_paths,
+            today=today,
+        ), encoding="utf-8")
+
+        # Preview cohort + measurement contract + 30-60-90 written alongside
+        preview_path = out_dir / "preview-cohort.md"
+        preview_path.write_text(render_preview_cohort(
+            args.client, args.launch, args.audience, args.tier, today
+        ), encoding="utf-8")
+
+        contract_path = out_dir / "measurement-contract.md"
+        contract_path.write_text(render_measurement_contract(
+            args.client, args.launch, args.audience, args.tier, args.launch_date, today
+        ), encoding="utf-8")
+
+        plan_30_60_90 = out_dir / "30-60-90.md"
+        plan_30_60_90.write_text(render_30_60_90(
+            args.client, args.launch, args.launch_date, args.tier, today
+        ), encoding="utf-8")
+
+        # T1: ensure frontier-artifacts/ exists
+        if args.tier == "T1":
+            (out_dir / "frontier-artifacts").mkdir(exist_ok=True)
+
+        sys.stderr.write(f"\n[launch-plan] tier={args.tier} mode=plan\n")
+        sys.stderr.write(f"  plan:        {plan_path}\n")
+        sys.stderr.write(f"  preview:     {preview_path}\n")
+        sys.stderr.write(f"  contract:    {contract_path}\n")
+        sys.stderr.write(f"  30-60-90:    {plan_30_60_90}\n")
+        if args.tier == "T1":
+            sys.stderr.write(f"  frontier dir: {out_dir / 'frontier-artifacts'}/\n")
+        print(str(plan_path))
+        if not pk_paths:
+            sys.stderr.write("\n  warning: no product-knowledge files found; populate before frontier-program assets ship.\n")
+            return 1
+        return 0
+
+    if args.mode == "preview":
+        preview_path = out_dir / "preview-cohort.md"
+        preview_path.write_text(render_preview_cohort(
+            args.client, args.launch, args.audience, args.tier or "T2", today
+        ), encoding="utf-8")
+        sys.stderr.write(f"\n[launch-plan] wrote preview cohort: {preview_path}\n")
+        print(str(preview_path))
+        return 0
+
+    if args.mode == "holdout":
+        contract_path = out_dir / "measurement-contract.md"
+        contract_path.write_text(render_measurement_contract(
+            args.client, args.launch, args.audience, args.tier or "T2", args.launch_date, today
+        ), encoding="utf-8")
+        sys.stderr.write(f"\n[launch-plan] wrote measurement contract: {contract_path}\n")
+        print(str(contract_path))
+        return 0
+
+    if args.mode == "ship":
+        # Render the 30-60-90 + a kit summary
+        plan_30_60_90 = out_dir / "30-60-90.md"
+        plan_30_60_90.write_text(render_30_60_90(
+            args.client, args.launch, args.launch_date, args.tier or "T2", today
+        ), encoding="utf-8")
+        sys.stderr.write(f"\n[launch-plan] wrote 30-60-90 plan: {plan_30_60_90}\n")
+        print(str(plan_30_60_90))
+        return 0
+
+    if args.mode == "retrospective":
+        if not args.launch:
+            return refuse("missing-launch", "--launch required for --mode retrospective")
+        # Try to load existing plan to get launch_date if not supplied
+        plan_path = out_dir / "plan.md"
+        if plan_path.is_file() and not args.launch_date:
+            text = plan_path.read_text(encoding="utf-8")
+            m = re.search(r"^launch_date:\s*(\d{4}-\d{2}-\d{2})$", text, re.MULTILINE)
+            if m:
+                args.launch_date = m.group(1)
+        if not args.launch_date:
+            return refuse("missing-launch-date", "--launch-date required (or store in plan.md frontmatter)")
+        retro_path = out_dir / "retrospective.md"
+        retro_path.write_text(render_retrospective(
+            args.client, args.launch, args.launch_date, args.tier or "T2", today
+        ), encoding="utf-8")
+        sys.stderr.write(f"\n[launch-plan] wrote retrospective: {retro_path}\n")
+        print(str(retro_path))
+        return 0
+
+    return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())

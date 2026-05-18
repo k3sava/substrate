@@ -1,0 +1,576 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Substrate · context-first operating system for GTM</title>
+<meta name="description" content="An open-source, context-first operating system for go-to-market. Every function, every metric, every surface, from first principles. Substrate makes the shared context the load-bearing layer, alongside goals you can score and skills that refuse bad input." />
+<meta name="author" content="Kesava Mandiga" />
+<meta name="robots" content="index,follow,max-snippet:-1,max-image-preview:large,max-video-preview:-1" />
+<meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#0A0E14" media="(prefers-color-scheme: dark)" />
+<link rel="canonical" href="https://substrate.iamkesava.com/" />
+
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="Substrate" />
+<meta property="og:title" content="Substrate · context-first operating system for GTM" />
+<meta property="og:description" content="Every function. Every metric. Every surface. From first principles." />
+<meta property="og:url" content="https://substrate.iamkesava.com/" />
+
+<meta property="og:image" content="https://substrate.iamkesava.com/og.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="Substrate: a context-first operating system for GTM" />
+<meta property="og:locale" content="en_US" />
+
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Substrate" />
+<meta name="twitter:description" content="A context-first operating system for GTM. Every function. Every metric. Every surface. From first principles." />
+<meta name="twitter:image" content="https://substrate.iamkesava.com/og.png" />
+<meta name="twitter:image:alt" content="Substrate: a context-first operating system for GTM" />
+
+<link rel="alternate" type="text/plain" href="/llms.txt" title="Substrate · LLM-readable summary" />
+<link rel="alternate" type="application/xml" href="/sitemap.xml" title="Substrate · sitemap" />
+<link rel="service-doc" href="https://substrate.iamkesava.com/llms.txt" />
+<link rel="api-catalog" href="https://substrate.iamkesava.com/.well-known/api-catalog" />
+<link rel="describedby" href="https://substrate.iamkesava.com/.well-known/agent-permissions.json" />
+<link rel="me" href="https://github.com/k3sava" />
+<link rel="me" href="https://www.linkedin.com/in/k3sava" />
+<link rel="me" href="https://iamkesava.com/" />
+<link rel="author" href="https://iamkesava.com/" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="style.css?v=4" />
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "WebSite",
+      "@id": "https://substrate.iamkesava.com/#website",
+      "url": "https://substrate.iamkesava.com/",
+      "name": "Substrate",
+      "description": "Open-source context-first operating system for go-to-market. Every function, every metric, every surface, from first principles.",
+      "inLanguage": "en",
+      "publisher": { "@id": "https://substrate.iamkesava.com/#author" },
+      "license": "https://opensource.org/licenses/MIT"
+    },
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://substrate.iamkesava.com/#software",
+      "name": "Substrate",
+      "alternateName": ["substrate", "substrate-os"],
+      "description": "An open-source context-first operating system for GTM. Eight layers (context, skills, goals, routines, ux, calibration, principles, reconciliation). Field-tested across PMM, content marketing, performance and growth, SEO/AEO/GEO, sales, success, support, product, and leadership/RevOps. AI is not the multiplier; the context AI reads is.",
+      "url": "https://substrate.iamkesava.com/",
+      "applicationCategory": "BusinessApplication",
+      "applicationSubCategory": "Marketing Operating System",
+      "operatingSystem": "Cross-platform",
+      "license": "https://opensource.org/licenses/MIT",
+      "softwareVersion": "1.1.0",
+      "codeRepository": "https://github.com/k3sava/substrate",
+      "downloadUrl": "https://github.com/k3sava/substrate",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "author": { "@id": "https://substrate.iamkesava.com/#author" },
+      "publisher": { "@id": "https://substrate.iamkesava.com/#author" },
+      "keywords": "GTM operating system, context-first, AI-native PMM, calibrated bets, Brier score, measurement contract, voice-of-customer gate, AEO, GEO, open source, MIT, marketing operating system, product marketing operating system, GTM substrate, AI-native go-to-market"
+    },
+    {
+      "@type": "Person",
+      "@id": "https://substrate.iamkesava.com/#author",
+      "name": "Kesava Mandiga",
+      "url": "https://github.com/k3sava",
+      "sameAs": [
+        "https://github.com/k3sava",
+        "https://www.linkedin.com/in/k3sava",
+        "https://iamkesava.com"
+      ],
+      "jobTitle": "Operator and PMM consultant",
+      "description": "Twenty-year operator across support, sales, ops, social, content, and product marketing. Author of Substrate."
+    },
+    {
+      "@type": "HowTo",
+      "@id": "https://substrate.iamkesava.com/#quickstart",
+      "name": "Quick start: install and run Substrate",
+      "description": "Clone Substrate, add bin to PATH, set up your first client, and run the pre-publish gate before shipping.",
+      "totalTime": "PT10M",
+      "step": [
+        { "@type": "HowToStep", "position": 1, "name": "Clone the repo and add bin to PATH", "text": "git clone https://github.com/k3sava/substrate.git; cd substrate; export PATH=\"$PWD/bin:$PATH\"" },
+        { "@type": "HowToStep", "position": 2, "name": "List available skills", "text": "substrate --list" },
+        { "@type": "HowToStep", "position": 3, "name": "Set up your first client", "text": "mkdir -p clients/<your-product>; cp -r templates/client-bootstrap/* clients/<your-product>/" },
+        { "@type": "HowToStep", "position": 4, "name": "Read the brief and write canonical positioning", "text": "$EDITOR clients/<your-product>/BRIEF.md; $EDITOR clients/<your-product>/01-position.md" },
+        { "@type": "HowToStep", "position": 5, "name": "Run the gate before shipping any draft", "text": "substrate pre-publish-check <draft.md> --client <your-product>" }
+      ]
+    },
+    {
+      "@type": "FAQPage",
+      "@id": "https://substrate.iamkesava.com/#faq",
+      "mainEntity": [
+        { "@type": "Question", "name": "What is Substrate?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Substrate is an open-source operating system for go-to-market. It turns one human into a marketing machine. Context becomes data, not docs. Goals become predictions, not targets. Skills become gates, not tools. The system handles the routine, citation, voice, claim-verify, drift detection, freshness. The human handles the call: what's worth saying, what's worth shipping, what real value means. MIT licensed. Author: Kesava Mandiga." } },
+        { "@type": "Question", "name": "What does Substrate do, concretely?",
+          "acceptedAnswer": { "@type": "Answer", "text": "One operator with Substrate ships what a six-person GTM team used to ship: cleaner, calibrated, with receipts. Positioning that cites itself. Sales narrative that holds up under audit. Pages, sequences, playbooks, and AEO content all reading from the same canonical layer. The pre-publish gate refuses to ship if a cited context path is missing, stale, or unverifiable." } },
+        { "@type": "Question", "name": "Who is Substrate for?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Small teams. Lean. Forward-looking. Customer-obsessed. One operator running GTM end-to-end, or five operators in lockstep, with every human doing higher-value work. Not for the org chart that needs six approvals to change a comma." } },
+        { "@type": "Question", "name": "What is the metric Substrate optimizes for?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Revenue per operator. Not pipeline this quarter. Not MQLs. Not assets shipped. The whole picture, including brand, retention, and expansion: what each human in the loop actually moves the business by." } },
+        { "@type": "Question", "name": "What is the role of taste in Substrate?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Taste is the part only humans can do. Substrate handles the floor; humans handle the ceiling. The system never decides what is worth saying or shipping; that is the operator's call. Substrate clears the runway so the operator's taste produces more business outcomes per hour, not fewer." } },
+        { "@type": "Question", "name": "Is Substrate AI-native?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. The thesis is simple: AI is not the multiplier; the context AI reads is. The same operator, with the same model, plus shared context, produces materially better work. Substrate makes that context first-class, citable, and gated." } },
+        { "@type": "Question", "name": "How does Substrate handle measurement and attribution?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Measurement is the first step in planning, not a way to find outcomes after execution. Goals open with a measurement contract (metric, direction, threshold, window, cohort, baseline citation, predicted confidence). Goals close with a Brier score. Authority follows accuracy, not the org chart. Source-system pulls beat operator reports beat inferred guesses." } },
+        { "@type": "Question", "name": "Is Substrate open source?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. MIT licensed. Source at https://github.com/k3sava/substrate. Open-sourced so anyone can learn to build and implement AI-native systems for any business, and so we can teach each other how to make them work better." } },
+        { "@type": "Question", "name": "How do I try Substrate?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Three commands: git clone https://github.com/k3sava/substrate; substrate --list; substrate pre-publish-check <draft.md>. Three minutes to your first gated draft. Read PRINCIPLES.md when you're ready." } },
+        { "@type": "Question", "name": "Who built Substrate and why?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Kesava Mandiga. Twenty-year operator across support, sales, ops, social, content, and product marketing. Built Substrate across the last few roles, open-sourced it after leaving full-time work in May 2026. Available for consulting engagements with small teams ready to act on the work." } }
+      ]
+    }
+  ]
+}
+</script>
+</head>
+<body>
+<a class="skip" href="#deck">skip to content</a>
+
+<header>
+  <a class="logo" href="/">
+    <span class="logo-mark"></span>
+    <span class="logo-name">Substrate</span>
+  </a>
+  <span class="meta-pill">
+    <span class="meta-k">v</span><span class="meta-v">1.1.0</span>
+    <span class="dot"></span>
+    <span class="meta-k">license</span><span class="meta-v">MIT</span>
+    <span class="dot"></span>
+    <span class="meta-k">status</span><span class="meta-v ok">live</span>
+  </span>
+  <nav class="hd-r">
+    <a class="primary" href="https://github.com/k3sava/substrate">github →</a>
+  </nav>
+</header>
+
+<main id="deck" class="deck" tabindex="0" aria-label="Substrate · slide deck. Use arrow keys to navigate.">
+
+  <article class="card card-hero" id="c0" data-card="0">
+    <div class="card-rail"><span class="rail-num">00</span><span class="rail-tag">hero</span></div>
+    <div class="card-body">
+      <p class="kicker">a context-first operating system for go-to-market</p>
+      <h1>
+        One human.<br/>
+        A <span class="accent">marketing machine.</span>
+      </h1>
+      <p class="big">
+        Substrate, an operating system for the work.<br/>
+        Built for small teams. MIT licensed.
+      </p>
+      <p class="cta-row">
+        <a class="btn-primary" href="https://github.com/k3sava/substrate">read the source</a>
+        <a class="btn-ghost" href="#" data-talk>let's talk</a>
+      </p>
+    </div>
+  </article>
+
+  <article class="card" id="c1" data-card="1">
+    <div class="card-rail"><span class="rail-num">01</span><span class="rail-tag">what it does</span></div>
+    <div class="card-body">
+      <h2>One human, end-to-end.</h2>
+      <p class="big">
+        The output of a six-person GTM team.<br/>
+        Cleaner. Calibrated. With receipts.
+      </p>
+      <p class="med">
+        Positioning grounded in customer language and customer proof.<br/>
+        Not what marketing wishes the customer would say.<br/>
+        Sales narrative that holds up under audit.<br/>
+        Pages, sequences, playbooks, AEO,<br/>
+        all reading from the same canonical layer.
+      </p>
+    </div>
+  </article>
+
+  <article class="card" id="c2" data-card="2">
+    <div class="card-rail"><span class="rail-num">02</span><span class="rail-tag">how it works</span></div>
+    <div class="card-body">
+      <h2>How it works.</h2>
+      <p class="big">
+        Context becomes data, not docs.<br/>
+        Goals become predictions, not targets.<br/>
+        Skills become gates, not tools.
+      </p>
+      <p class="punchline">
+        The system handles the floor.<br/>
+        You handle the call.
+      </p>
+    </div>
+  </article>
+
+  <article class="card" id="c3" data-card="3">
+    <div class="card-rail"><span class="rail-num">03</span><span class="rail-tag">pillars</span></div>
+    <div class="card-body">
+      <h2>What it stands on.</h2>
+      <p class="big">
+        Frontline contact IS the substrate.<br/>
+        Agents mapped to jobs.<br/>
+        Humans hold the checkpoints.<br/>
+        Context is the load-bearing layer.<br/>
+        Narrative is the strategy.<br/>
+        Status quo is the competitor.<br/>
+        Measurement opens the work, not closes it.<br/>
+        Distribution is the moat.
+      </p>
+      <p class="med">
+        Eight pillars. Each cited by 4 to 8 operators<br/>
+        in the codex corpus substrate reads from.<br/>
+        Every skill grounds in a pattern.<br/>
+        Every pattern names the operators behind it.<br/>
+        Nothing is invention.
+      </p>
+      <p class="med dim">
+        The patterns layer: <a href="https://github.com/k3sava/substrate/tree/main/knowledge/patterns">github.com/k3sava/substrate/tree/main/knowledge/patterns</a>.
+      </p>
+    </div>
+  </article>
+
+  <article class="card" id="c4" data-card="4">
+    <div class="card-rail"><span class="rail-num">04</span><span class="rail-tag">the future</span></div>
+    <div class="card-body">
+      <h2>Where the field is going.</h2>
+      <p class="big">
+        AI is abundant. Taste is scarce.<br/>
+        Context is the bottleneck, not capability.<br/>
+        Verification beats generation.<br/>
+        Generalists outperform specialists.
+      </p>
+      <p class="med">
+        Substrate doesn't ship a one-size template.<br/>
+        It draws the right playbook<br/>
+        for <em>your</em> business context<br/>
+        from a corpus of operator-grade research.
+      </p>
+      <p class="punchline">
+        Built for that future.<br/>
+        Already.
+      </p>
+      <p class="med dim">
+        Read the corpus: <a href="https://codex.iamkesava.com/">codex.iamkesava.com</a>.
+      </p>
+    </div>
+  </article>
+
+  <article class="card" id="c5" data-card="5">
+    <div class="card-rail"><span class="rail-num">05</span><span class="rail-tag">taste</span></div>
+    <div class="card-body">
+      <h2>Higher-value work. Only humans.</h2>
+      <p class="big">
+        Creative calls.<br/>
+        Positioning.<br/>
+        Design and UX thinking.<br/>
+        Content strategy.<br/>
+        Customer success.<br/>
+        Critical decisions.
+      </p>
+      <p class="med">
+        What's worth saying.<br/>
+        What's worth shipping.<br/>
+        What "real value" means<br/>
+        in the room you're in.
+      </p>
+      <p class="punchline">
+        Substrate doesn't replace that.<br/>
+        It clears the runway for it.
+      </p>
+    </div>
+  </article>
+
+  <article class="card" id="c6" data-card="6">
+    <div class="card-rail"><span class="rail-num">06</span><span class="rail-tag">who it's for</span></div>
+    <div class="card-body">
+      <h2>Built for small teams.</h2>
+      <p class="big">
+        Lean.<br/>
+        Forward-looking.<br/>
+        Customer-obsessed.
+      </p>
+      <p class="med">
+        One operator end-to-end.<br/>
+        Five operators in lockstep.<br/>
+        Every human in the loop doing higher-value work.
+      </p>
+      <p class="med dim">
+        Not for the org chart that needs<br/>
+        six approvals to change a comma.
+      </p>
+    </div>
+  </article>
+
+  <article class="card" id="c7" data-card="7">
+    <div class="card-rail"><span class="rail-num">07</span><span class="rail-tag">the metric</span></div>
+    <div class="card-body">
+      <h2>Revenue per operator.</h2>
+      <p class="big">
+        Not pipeline this quarter.<br/>
+        Not MQLs counted.<br/>
+        Not assets shipped.
+      </p>
+      <p class="med">
+        Brand. Retention. Expansion.<br/>
+        The whole picture.
+      </p>
+      <p class="punchline">
+        What each human in the loop<br/>
+        actually moves the business by.
+      </p>
+    </div>
+  </article>
+
+  <article class="card" id="c8" data-card="8">
+    <div class="card-rail"><span class="rail-num">08</span><span class="rail-tag">try it</span></div>
+    <div class="card-body">
+      <h2>Three minutes. Three commands.</h2>
+<pre><code class="bash">$ git clone https://github.com/k3sava/substrate
+$ substrate --list
+$ substrate pre-publish-check &lt;draft.md&gt;
+</code></pre>
+      <p class="med">
+        MIT licensed.<br/>
+        Read <code>PRINCIPLES.md</code> when you're ready.
+      </p>
+    </div>
+  </article>
+
+  <article class="card card-final" id="c9" data-card="9">
+    <div class="card-rail"><span class="rail-num">09</span><span class="rail-tag">last word</span></div>
+    <div class="card-body">
+      <h2>Want to run substrate for your team?</h2>
+      <p class="big">
+        Built across the last few roles.<br/>
+        Open-sourced so we can teach each other<br/>
+        how to make AI-native systems work better.
+      </p>
+      <p class="med">
+        Available for engagements with small teams<br/>
+        ready to act on the work.
+      </p>
+      <p class="cta-row">
+        <a class="btn-primary" href="https://github.com/k3sava/substrate/discussions">let's talk</a>
+        <a class="btn-ghost" href="https://github.com/k3sava/substrate">github.com/k3sava/substrate</a>
+      </p>
+    </div>
+  </article>
+
+</main>
+
+<nav class="deck-nav" aria-label="Deck navigation">
+  <button class="nav-btn nav-prev" aria-label="Previous slide">←</button>
+  <span class="nav-counter"><span id="navIdx">01</span> <span class="nav-of">/</span> <span id="navTotal">17</span></span>
+  <button class="nav-btn nav-next" aria-label="Next slide">→</button>
+</nav>
+
+<footer>
+  <div class="ftr-feeds">
+    <a href="/llms.txt">llms.txt</a>
+    <span class="ftr-sep">·</span>
+    <a href="/sitemap.xml">sitemap</a>
+  </div>
+  <div class="ftr-meta">
+    <span>substrate</span>
+    <span class="ftr-sep">·</span>
+    <span class="mono">v1.1.0</span>
+  </div>
+  <nav class="ftr-sister" aria-label="Sister sites">
+    <a href="https://apps.iamkesava.com/">apps</a>
+    <span class="ftr-sep">·</span>
+    <a href="https://tools.iamkesava.com/">tools</a>
+    <span class="ftr-sep">·</span>
+    <a href="https://toys.iamkesava.com/">toys</a>
+    <span class="ftr-sep">·</span>
+    <a href="https://codex.iamkesava.com/">codex</a>
+  </nav>
+  <div class="ftr-credit">
+    made by <a href="https://iamkesava.com" rel="author">kesava</a>
+    <span class="ftr-sep">·</span>
+    <a href="https://github.com/k3sava/substrate" rel="noopener">github</a>
+  </div>
+</footer>
+
+<!-- Talk modal -->
+<div id="talk" class="talk" hidden aria-modal="true" role="dialog" aria-labelledby="talkTitle">
+  <div class="talk-inner">
+    <button class="talk-close" aria-label="Close">×</button>
+    <div class="talk-msgs" id="talkMsgs"></div>
+    <input type="text" id="hp" name="website" tabindex="-1" autocomplete="off" />
+    <div class="talk-stage">
+      <div class="talk-step active" data-step="name">
+        <div class="talk-prompt" id="talkTitle">how do you do?</div>
+        <div class="talk-sub">what's your name?</div>
+        <input type="text" id="inpName" autocomplete="off" spellcheck="false" />
+        <div class="talk-foot">
+          <button class="talk-hint" data-go="msg">hit ↵ to continue</button>
+        </div>
+      </div>
+      <div class="talk-step" data-step="msg">
+        <div class="talk-sub">what's on your mind?</div>
+        <textarea id="inpMsg" spellcheck="false" rows="3"></textarea>
+        <div class="talk-foot">
+          <button class="talk-hint" data-go="email">hit ↵ to continue</button>
+        </div>
+      </div>
+      <div class="talk-step" data-step="email">
+        <div class="talk-sub">and your email?</div>
+        <input type="email" id="inpEmail" autocomplete="off" spellcheck="false" />
+        <div class="talk-foot">
+          <button class="talk-hint" data-send>start a conversation</button>
+        </div>
+      </div>
+      <div class="talk-step" data-step="done">
+        <div class="talk-sub">got it. i'll be in touch.</div>
+        <div class="talk-foot">
+          <button class="talk-hint" data-close>close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  // --- deck navigation ---
+  const deck = document.getElementById('deck');
+  const cards = [...deck.querySelectorAll('.card')];
+  const total = cards.length;
+  document.getElementById('navTotal').textContent = String(total).padStart(2, '0');
+  let idx = 0;
+  let loops = 0;
+
+  function jump(target, animate) {
+    const card = cards[target];
+    if (!card) return;
+    deck.scrollTo({ left: card.offsetLeft, behavior: animate ? 'smooth' : 'instant' });
+  }
+  function setIdx(n, animate) {
+    const wrapped = ((n % total) + total) % total;
+    if (n >= total) loops += 1; // only count forward wraps as loops
+    idx = wrapped;
+    document.getElementById('navIdx').textContent = String(idx + 1).padStart(2, '0');
+    jump(idx, animate);
+    if (loops >= 3) { setTimeout(openTalk, 350); }
+  }
+  document.querySelector('.nav-prev').addEventListener('click', () => setIdx(idx - 1, true));
+  document.querySelector('.nav-next').addEventListener('click', () => setIdx(idx + 1, true));
+  window.addEventListener('keydown', (e) => {
+    if (document.getElementById('talk').hidden === false) return;
+    if (e.target.matches('input, textarea')) return;
+    if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') { e.preventDefault(); setIdx(idx + 1, true); }
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); setIdx(idx - 1, true); }
+    else if (e.key === 'Home') { e.preventDefault(); setIdx(0, true); }
+    else if (e.key === 'End') { e.preventDefault(); setIdx(total - 1, true); }
+  });
+  // detect manual scroll, sync index (no extra loop counts on user scroll)
+  let scrollT;
+  deck.addEventListener('scroll', () => {
+    clearTimeout(scrollT);
+    scrollT = setTimeout(() => {
+      const w = deck.clientWidth;
+      const newIdx = Math.round(deck.scrollLeft / w);
+      if (newIdx !== idx && newIdx >= 0 && newIdx < total) {
+        idx = newIdx;
+        document.getElementById('navIdx').textContent = String(idx + 1).padStart(2, '0');
+      }
+    }, 80);
+  }, { passive: true });
+  // touch swipe (light fallback for browsers without scroll-snap)
+  let tx = 0, ty = 0, sw = false;
+  deck.addEventListener('touchstart', (e) => {
+    if (e.touches.length !== 1) return;
+    tx = e.touches[0].clientX; ty = e.touches[0].clientY; sw = true;
+  }, { passive: true });
+  deck.addEventListener('touchend', (e) => {
+    if (!sw) return; sw = false;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - tx, dy = t.clientY - ty;
+    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+  }, { passive: true });
+
+  // --- talk modal ---
+  const talk = document.getElementById('talk');
+  const talkMsgs = document.getElementById('talkMsgs');
+  function openTalk() {
+    talk.hidden = false;
+    document.body.classList.add('locked');
+    setTimeout(() => document.getElementById('inpName').focus(), 100);
+  }
+  function closeTalk() {
+    talk.hidden = true;
+    document.body.classList.remove('locked');
+    // reset on close so subsequent opens start fresh
+    showStep('name');
+    talkMsgs.innerHTML = '';
+    document.getElementById('inpName').value = '';
+    document.getElementById('inpMsg').value = '';
+    document.getElementById('inpEmail').value = '';
+    loops = 0; // reset trigger so they can keep browsing
+  }
+  function showStep(name) {
+    talk.querySelectorAll('.talk-step').forEach(s => s.classList.toggle('active', s.dataset.step === name));
+  }
+  function addMsg(text, kind) {
+    const d = document.createElement('div');
+    d.className = 'talk-msg ' + (kind || 'sent');
+    d.textContent = text;
+    talkMsgs.appendChild(d);
+  }
+  document.querySelectorAll('[data-talk]').forEach(b => b.addEventListener('click', (e) => { e.preventDefault(); openTalk(); }));
+  document.querySelector('.talk-close').addEventListener('click', closeTalk);
+  talk.addEventListener('click', (e) => { if (e.target === talk) closeTalk(); });
+  document.querySelector('[data-close]').addEventListener('click', closeTalk);
+  window.addEventListener('keydown', (e) => {
+    if (talk.hidden) return;
+    if (e.key === 'Escape') { e.preventDefault(); closeTalk(); }
+  });
+  // step transitions
+  document.querySelector('[data-go="msg"]').addEventListener('click', () => {
+    const v = document.getElementById('inpName').value.trim();
+    if (!v) { document.getElementById('inpName').focus(); return; }
+    addMsg(v, 'sent'); showStep('msg'); setTimeout(() => document.getElementById('inpMsg').focus(), 60);
+  });
+  document.querySelector('[data-go="email"]').addEventListener('click', () => {
+    const v = document.getElementById('inpMsg').value.trim();
+    if (!v) { document.getElementById('inpMsg').focus(); return; }
+    addMsg(v, 'sent'); showStep('email'); setTimeout(() => document.getElementById('inpEmail').focus(), 60);
+  });
+  document.getElementById('inpName').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.querySelector('[data-go="msg"]').click(); } });
+  document.getElementById('inpMsg').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.querySelector('[data-go="email"]').click(); }
+  });
+  document.getElementById('inpEmail').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); document.querySelector('[data-send]').click(); } });
+  // submit
+  document.querySelector('[data-send]').addEventListener('click', async () => {
+    if (document.getElementById('hp').value) return; // honeypot
+    const name = document.getElementById('inpName').value.trim();
+    const msg = document.getElementById('inpMsg').value.trim();
+    const email = document.getElementById('inpEmail').value.trim();
+    const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    if (!emailOk) { document.getElementById('inpEmail').focus(); return; }
+    addMsg(email, 'sent');
+    showStep('done');
+    try {
+      await fetch('https://n8n.iamkesava.com/webhook/contact-form', {
+        method: 'POST', mode: 'no-cors', redirect: 'manual',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name, email, message: msg,
+          timestamp: new Date().toISOString(),
+          page: 'substrate.iamkesava.com'
+        })
+      });
+    } catch (e) { /* no-cors silent */ }
+  });
+})();
+</script>
+</body>
+</html>

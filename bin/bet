@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# `bet` — deprecated CLI alias kept for backwards compatibility.
+#
+# The legacy `bet` verbs (new, preflight, gate, ship, resolve, ledger) belonged
+# to a node-based packet workflow that lived outside this repo. The substrate
+# release moved those flows into the skills system. The dispatcher that
+# replaces this CLI is `bin/substrate`.
+#
+# Mapping:
+#   bet new          -> substrate open-goal --client <slug> ...
+#   bet preflight    -> substrate audience-test <asset>
+#   bet gate         -> substrate pre-publish-check <asset>
+#   bet ship         -> substrate lp-ship <asset>
+#   bet resolve      -> substrate score-goal --client <slug> <goal-id>
+#   bet ledger       -> view goals/ledger.md
+#
+# This stub exits non-zero so legacy automation surfaces the rename loudly.
+
+set -uo pipefail
+
+cat <<'EOF' >&2
+DEPRECATED: `bet` has been replaced by the `substrate` skill dispatcher.
+
+  Old verb           New invocation
+  ----------------   ---------------------------------------
+  bet new            substrate open-goal --client <slug> ...
+  bet preflight      substrate audience-test <asset>
+  bet gate           substrate pre-publish-check <asset>
+  bet ship           substrate lp-ship <asset>
+  bet resolve        substrate score-goal --client <slug> <goal-id>
+  bet ledger         cat goals/ledger.md
+
+Run 'substrate --list' to see registered skills.
+
+If you were depending on the old node-based bet packet engine, it lived in a
+private repo and is not part of substrate. Open an issue if you need that
+path documented or restored.
+EOF
+exit 64

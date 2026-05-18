@@ -1,0 +1,530 @@
+#!/usr/bin/env bash
+# preflight — composite gate that runs every check before an asset can ship
+#
+# Usage: preflight <asset-path> [--client <slug>]
+#
+# Runs in sequence:
+#   1. substrate-citation check (asset frontmatter has substrate_consumed list, files exist)
+#   2. voice-enforce (kill-list, em-dash, throat-clearing)
+#   3. copy-quality (7 LLM-pattern failure modes; ported from v0.5)
+#   4. refusal-pattern (refusal-pattern triggers; ported from v0.5)
+#   5. lp-cro page-type tag (only for LP / hero / compare / displacement / vertical assets)
+#   6. voice-enforce-vale (semantic voice lint beyond bash regex)
+#   7. substrate-cite-check (anti-author-from-memory)
+#   8. claim-verify (cite value matches substrate)
+#   9. pattern-applied (skill outputs evidence the patterns they ground in)
+#  10. contradiction-position-logged (contradictions_aware → conditioned pick)
+#
+# Gates 9 + 10 only fire when the asset frontmatter declares
+# `produced_by: <skill-name>`. Gate 9 is soft-fail by default (warn + log);
+# set STRICT_PATTERN_CHECK=1, or `enforce_patterns: true` in the named skill,
+# to make it a hard fail. Gate 10 is hard-fail (positions on contradictions
+# need rationale, not vibes; PRINCIPLES.md rule 9a).
+#
+# Exit codes:
+#   0 — all gates pass
+#   1 — one or more gates failed
+#   2 — file not found / config error
+#
+# Output:
+#   stderr — per-gate result
+#   stdout — final PASS/FAIL summary
+
+set -uo pipefail
+
+# Backwards-compat: accept FLYWHEEL_ROOT as deprecated alias for SUBSTRATE_ROOT.
+if [ -n "${FLYWHEEL_ROOT:-}" ] && [ -z "${SUBSTRATE_ROOT:-}" ]; then
+  echo "DEPRECATED: FLYWHEEL_ROOT is deprecated; use SUBSTRATE_ROOT." >&2
+  SUBSTRATE_ROOT="$FLYWHEEL_ROOT"
+fi
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+export SUBSTRATE_ROOT
+
+ASSET=""
+CLIENT="${SUBSTRATE_CLIENT:-${CLIENT:-}}"
+
+# Parse args. First positional = asset; --client / --client=slug supported.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)   CLIENT="$2"; shift 2 ;;
+    --client=*) CLIENT="${1#--client=}"; shift ;;
+    -h|--help)
+      sed -n '1,16p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *)
+      if [ -z "$ASSET" ]; then
+        ASSET="$1"
+      fi
+      shift ;;
+  esac
+done
+
+if [ -z "$ASSET" ]; then
+  echo "asset path required" >&2
+  exit 2
+fi
+[ -f "$ASSET" ] || { echo "asset not found: $ASSET" >&2; exit 2; }
+
+# If client wasn't passed, infer from the asset path: clients/<slug>/...
+if [ -z "$CLIENT" ]; then
+  case "$ASSET" in
+    */clients/*/*)
+      CLIENT=$(echo "$ASSET" | sed -E 's@.*/clients/([^/]+)/.*@\1@')
+      ;;
+  esac
+fi
+
+echo "=== preflight: $ASSET ===" >&2
+if [ -n "$CLIENT" ]; then
+  echo "  client: $CLIENT" >&2
+fi
+echo "" >&2
+
+failed_gates=()
+
+# ---------------------------------------------------------------------------
+# Helper: read aliases from per-client YAML files. The YAML format is the one
+# documented in templates/competitors-example.yaml + templates/verticals-example.yaml.
+# We extract slug + alias fragments only; full schema parsing happens in
+# competitive-scout (Python).
+# ---------------------------------------------------------------------------
+
+competitor_aliases=""
+vertical_aliases=""
+
+if [ -n "$CLIENT" ]; then
+  comp_yaml="$SUBSTRATE_ROOT/clients/$CLIENT/competitors.yaml"
+  if [ -f "$comp_yaml" ]; then
+    # Extract competitor slugs (the keys under `competitors:`) and any explicit
+    # `aliases: [a, b, c]` entries. We accept either dict-of-maps or list-of-maps.
+    competitor_aliases=$(awk '
+      /^competitors:/ { in_block=1; next }
+      in_block && /^[a-z_-]+:/ && !/^[[:space:]]/ { in_block=0 }
+      in_block && /^[[:space:]]{2}[a-z0-9_-]+:[[:space:]]*$/ {
+        sub(/^[[:space:]]+/, ""); sub(/:[[:space:]]*$/, ""); print
+      }
+      in_block && /^[[:space:]]+- slug:[[:space:]]*/ {
+        sub(/^[[:space:]]+- slug:[[:space:]]*/, ""); gsub(/["'\'']/, ""); print
+      }
+      in_block && /^[[:space:]]+aliases:[[:space:]]*\[/ {
+        line=$0; sub(/.*\[/, "", line); sub(/\].*/, "", line);
+        n=split(line, parts, /,[[:space:]]*/);
+        for (i=1;i<=n;i++) { gsub(/^[[:space:]]+|[[:space:]]+$|["'\'']/, "", parts[i]); if (parts[i]!="") print parts[i] }
+      }
+    ' "$comp_yaml" | sort -u | tr '\n' '|' | sed 's/|$//')
+  fi
+
+  vert_yaml="$SUBSTRATE_ROOT/clients/$CLIENT/verticals.yaml"
+  if [ -f "$vert_yaml" ]; then
+    vertical_aliases=$(awk '
+      /^verticals:/ { in_block=1; next }
+      in_block && /^[a-z_-]+:/ && !/^[[:space:]]/ { in_block=0 }
+      in_block && /^[[:space:]]+- slug:[[:space:]]*/ {
+        sub(/^[[:space:]]+- slug:[[:space:]]*/, ""); gsub(/["'\'']/, ""); print
+      }
+      in_block && /^[[:space:]]+slug:[[:space:]]*/ {
+        sub(/^[[:space:]]+slug:[[:space:]]*/, ""); gsub(/["'\'']/, ""); print
+      }
+      in_block && /^[[:space:]]+aliases:[[:space:]]*\[/ {
+        line=$0; sub(/.*\[/, "", line); sub(/\].*/, "", line);
+        n=split(line, parts, /,[[:space:]]*/);
+        for (i=1;i<=n;i++) { gsub(/^[[:space:]]+|[[:space:]]+$|["'\'']/, "", parts[i]); if (parts[i]!="") print parts[i] }
+      }
+    ' "$vert_yaml" | sort -u | tr '\n' '|' | sed 's/|$//')
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Gate 1: substrate-citation check
+# ---------------------------------------------------------------------------
+echo "  Gate 1: substrate-cite check" >&2
+
+# Bypass: internal-spec assets (manifest, audit, scaffold, sync-pack, approvals-list,
+# README, decision-brief) don't ship externally and aren't substrate-derived; they're
+# substrate's own infrastructure files. Bypass triggers on either asset_type (when
+# frontmatter has it) OR filename pattern.
+asset_type=$(awk 'BEGIN{infm=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^asset_type:/{sub(/^asset_type:[[:space:]]*/, ""); print; exit}' "$ASSET")
+asset_basename=$(basename "$ASSET")
+bypass=0
+case "$asset_type" in
+  *manifest*|*audit*|*scaffold*|*spec*|*"sync pack"*|*"approvals list"*|*"vertical playbook scaffold set"*|*"internal-spec"*|*"internal_spec"*|*"internal spec"*|*"deliverables index"*|*"talking points"*|*memo*|*email*|*"source audit"*|*"status update"*) bypass=1 ;;
+esac
+case "$asset_basename" in
+  manifest.md|00-README*.md|*-audit-*.md|*-spec-*.md|*-sync-pack-*.md|*-approvals-list-*.md|*-decision-briefs-*.md|*-scaffold-*.md|README.md|*-manifest-*.md|*-pack-*.md|00-DELIVERABLES-INDEX*.md|SOURCE-AUDIT*.md|*-talking-points-*.md|*-memo-*.md|*-email-*.md|asana-status-updates*.md|*-customer-comm-*.md|CONSTITUTION.md|DOCTRINE.md|WAKE-UP.md|SPEC.md|PLAN*.md|ORIGIN.md|CLAUDE.md|AGENT*.md|AGENTS.md|SKILL.md|worklog*.md|TEAM-PRINCIPLES.md|team-principles.md)
+    bypass=1
+    ;;
+esac
+# Path-based bypass: internal-spec dirs.
+case "$ASSET" in
+  */knowledge/intel/*|*/intel/*|intel/*) bypass=1 ;;
+  */internal-comms/*) bypass=1 ;;
+  */substrate/*) bypass=1 ;;
+  */raw/*) bypass=1 ;;
+  */bets/*) bypass=1 ;;
+  */goals/*) bypass=1 ;;
+  */signals/*) bypass=1 ;;
+  */personas/*) bypass=1 ;;
+  */research/*|research/*) bypass=1 ;;
+  */shared/*) bypass=1 ;;
+  */runs/*) bypass=1 ;;
+  */routines/*) bypass=1 ;;
+  */workflows/*) bypass=1 ;;
+  */data/*) bypass=1 ;;
+  */docs/*) bypass=1 ;;
+  */handoff/*) bypass=1 ;;
+  */metrics/*) bypass=1 ;;
+  */runbooks/*) bypass=1 ;;
+  */scripts/*) bypass=1 ;;
+  */archive/*|archive/*) bypass=1 ;;
+  */evals/*|evals/*) bypass=1 ;;
+  */skills/*|skills/*) bypass=1 ;;
+  */agents/*|agents/*) bypass=1 ;;
+  */concepts/*) bypass=1 ;;
+  */knowledge/*) bypass=1 ;;
+esac
+if [ "$bypass" -eq 1 ]; then
+    echo "    ✓ substrate-cite BYPASSED (asset_type='$asset_type' filename='$asset_basename' = internal-spec; not substrate-derived)" >&2
+    sc_violations=0
+else
+substrate_listed=$(awk '
+  BEGIN { infm=0; in_list=0 }
+  NR==1 && /^---$/ { infm=1; next }
+  infm && /^---$/ { exit }
+  infm && /^substrate_consumed:/ { in_list=1; next }
+  in_list && /^[a-zA-Z_]+:/ { in_list=0 }
+  in_list && /^[[:space:]]+-[[:space:]]/ { print }
+' "$ASSET" | sed 's/^[[:space:]]*-[[:space:]]*//')
+sc_violations=0
+if [ -z "$substrate_listed" ]; then
+  echo "    ✗ no substrate_consumed list in frontmatter" >&2
+  sc_violations=1
+else
+  while IFS= read -r line; do
+    # Strip trailing annotations: " (...)" parens-comment AND " §..." section-anchor reference
+    file_part=$(echo "$line" | sed -E 's/[[:space:]]*\(.*\)$//; s/[[:space:]]*§.*$//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ -n "$file_part" ]; then
+      # Check file exists somewhere under substrate root.
+      if ! find "$SUBSTRATE_ROOT" -name "$(basename "$file_part")" -type f 2>/dev/null | grep -q .; then
+        echo "    ✗ substrate file not found: $file_part" >&2
+        sc_violations=$((sc_violations + 1))
+      fi
+    fi
+  done <<< "$substrate_listed"
+fi
+fi  # bypass else
+
+if [ "$sc_violations" -eq 0 ]; then
+  echo "    ✓ substrate-cite OK" >&2
+else
+  failed_gates+=("substrate-cite")
+fi
+echo "" >&2
+
+# ---------------------------------------------------------------------------
+# Gate 2: voice-enforce
+# ---------------------------------------------------------------------------
+echo "  Gate 2: voice-enforce" >&2
+if "$SUBSTRATE_ROOT/skills/voice-enforce/bin/voice-enforce" "$ASSET" 2>/dev/null >/dev/null; then
+  echo "    ✓ voice-enforce PASS" >&2
+else
+  echo "    ✗ voice-enforce FAIL (run 'substrate voice-enforce' for details)" >&2
+  failed_gates+=("voice-enforce")
+fi
+echo "" >&2
+
+# ---------------------------------------------------------------------------
+# Gate 3: copy-quality (ported from v0.5/bin/check-copy-quality)
+#
+# 7 LLM-pattern failure modes:
+#   1. unnecessary intensifiers ("really", "very", "quite", "rather")
+#   2. negative parallelisms ("not just X — but Y", "more than just")
+#   3. AI tics ("delve", "tapestry", "embark", "navigate the landscape")
+#   4. corporate filler ("at the end of the day", "moving forward")
+#   5. zombie nouns (utilization vs. using; implementation vs. doing)
+#   6. throat-clearing ("It's worth noting that", "Of course,")
+#   7. cliched openers ("In today's", "In the world of")
+#
+# Bypassed for internal-spec assets (same rules as Gate 1).
+# ---------------------------------------------------------------------------
+echo "  Gate 3: copy-quality" >&2
+if [ "$bypass" -eq 1 ]; then
+  echo "    · copy-quality BYPASSED (internal-spec asset)" >&2
+else
+  cq_body=$(awk '
+    BEGIN { infm=0 }
+    NR==1 && /^---$/ { infm=1; next }
+    infm && /^---$/ { infm=0; next }
+    infm { next }
+    /^# / { next }
+    /^## / { next }
+    { print }
+  ' "$ASSET")
+  cq_violations=0
+  declare -a intensifiers=("really" "very" "quite" "rather" "just so" "extremely")
+  for w in "${intensifiers[@]}"; do
+    n=$(echo "$cq_body" | grep -ciw -- "$w" 2>/dev/null || true)
+    [ -z "$n" ] && n=0
+    if [ "$n" -gt 2 ]; then
+      echo "    ✗ intensifier '$w' overused: $n hits (>2)" >&2
+      cq_violations=$((cq_violations + n - 2))
+    fi
+  done
+  ai_tics=$(echo "$cq_body" | grep -ciE '\b(delve|tapestry|embark|landscape|paradigm|underscore|illuminate)\b' 2>/dev/null || true)
+  [ -z "$ai_tics" ] && ai_tics=0
+  if [ "$ai_tics" -gt 0 ]; then
+    echo "    ✗ AI tics: $ai_tics hit(s) (delve/tapestry/embark/landscape/paradigm/underscore/illuminate)" >&2
+    cq_violations=$((cq_violations + ai_tics))
+  fi
+  filler=$(echo "$cq_body" | grep -ciE 'at the end of the day|moving forward|going forward|to be honest|in conclusion' 2>/dev/null || true)
+  [ -z "$filler" ] && filler=0
+  if [ "$filler" -gt 0 ]; then
+    echo "    ✗ corporate filler: $filler hit(s)" >&2
+    cq_violations=$((cq_violations + filler))
+  fi
+  neg_parallel=$(echo "$cq_body" | grep -cE 'not (just|only|merely)[^.]+(but|—|--)' 2>/dev/null || true)
+  [ -z "$neg_parallel" ] && neg_parallel=0
+  if [ "$neg_parallel" -gt 1 ]; then
+    echo "    ✗ negative parallelism overused: $neg_parallel hit(s) (>1)" >&2
+    cq_violations=$((cq_violations + neg_parallel - 1))
+  fi
+  if [ "$cq_violations" -eq 0 ]; then
+    echo "    ✓ copy-quality PASS" >&2
+  else
+    echo "    ✗ copy-quality FAIL ($cq_violations violations)" >&2
+    failed_gates+=("copy-quality")
+  fi
+fi
+echo "" >&2
+
+# ---------------------------------------------------------------------------
+# Gate 4: refusal-pattern (ported from v0.5/bin/check-refusal-pattern)
+#
+# Refusal triggers — copy that promises what we cannot prove:
+#   - vague "industry-leading" / "best-in-class" without a citation
+#   - aggressive rounding ("100%", "0%") without source
+#   - composite quotes presented as single statements
+#   - open-ended outcomes ("any size team", "every workflow") without scope
+# ---------------------------------------------------------------------------
+echo "  Gate 4: refusal-pattern" >&2
+if [ "$bypass" -eq 1 ]; then
+  echo "    · refusal-pattern BYPASSED (internal-spec asset)" >&2
+else
+  rp_body=$(awk '
+    BEGIN { infm=0 }
+    NR==1 && /^---$/ { infm=1; next }
+    infm && /^---$/ { infm=0; next }
+    infm { next }
+    { print }
+  ' "$ASSET")
+  rp_violations=0
+  rp_brag=$(echo "$rp_body" | grep -ciE 'industry[ -]leading|best[ -]in[ -]class|world[ -]class|cutting[ -]edge|state[ -]of[ -]the[ -]art|next[ -]generation' 2>/dev/null || true)
+  [ -z "$rp_brag" ] && rp_brag=0
+  if [ "$rp_brag" -gt 0 ]; then
+    echo "    ✗ unsubstantiated superlatives: $rp_brag hit(s) (industry-leading / best-in-class / world-class)" >&2
+    rp_violations=$((rp_violations + rp_brag))
+  fi
+  rp_round=$(echo "$rp_body" | grep -cE '\b(100|0)%' 2>/dev/null || true)
+  [ -z "$rp_round" ] && rp_round=0
+  if [ "$rp_round" -gt 0 ]; then
+    echo "    ✗ aggressive rounding: $rp_round hit(s) (100% / 0% — needs citation)" >&2
+    rp_violations=$((rp_violations + rp_round))
+  fi
+  rp_open=$(echo "$rp_body" | grep -ciE 'any size team|every workflow|all stakeholders|every customer' 2>/dev/null || true)
+  [ -z "$rp_open" ] && rp_open=0
+  if [ "$rp_open" -gt 0 ]; then
+    echo "    ✗ open-ended outcomes: $rp_open hit(s) (any size team / every workflow / all stakeholders)" >&2
+    rp_violations=$((rp_violations + rp_open))
+  fi
+  if [ "$rp_violations" -eq 0 ]; then
+    echo "    ✓ refusal-pattern PASS" >&2
+  else
+    echo "    ✗ refusal-pattern FAIL ($rp_violations violations)" >&2
+    failed_gates+=("refusal-pattern")
+  fi
+fi
+echo "" >&2
+
+# ---------------------------------------------------------------------------
+# Gate 4.5: lp-cro page-type tag.
+#
+# Detects landing-page page-type from filename and per-client YAML aliases.
+# Page-types: lead-capture (default) | displacement | compare | vertical |
+#             hero-only | trial-signup | demo-request
+#
+# We previously hardcoded competitor and vertical aliases. Now the gate reads
+# clients/<client>/competitors.yaml and verticals.yaml. If neither is present,
+# detection falls back to lead-capture (no failure).
+#
+# The lp-cro skill itself was previously referenced as skills/lp-cro/; that
+# module isn't a standalone gate in current substrate. We report the page-type
+# tag for downstream tooling (lp-cro-rubric reads it) and do not fail.
+# ---------------------------------------------------------------------------
+case "$asset_basename" in
+  lp-*|*-displacement-*|*-migration-*|*-compare-*|homepage-copy*|hero-*)
+    echo "  Gate 4.5: lp-cro page-type tag" >&2
+    pt="lead-capture"
+    case "$asset_basename" in
+      *displacement*|*migration*) pt="displacement" ;;
+      *compare*) pt="compare" ;;
+      homepage*|hero-*) pt="hero-only" ;;
+      *trial*) pt="trial-signup" ;;
+      *demo*) pt="demo-request" ;;
+    esac
+    # Per-client overrides: if any competitor alias appears in the filename, mark
+    # as displacement; if any vertical alias appears, mark as vertical. Both
+    # checks no-op when the per-client YAML is absent.
+    if [ -n "$competitor_aliases" ]; then
+      if echo "$asset_basename" | grep -qE -- "-($competitor_aliases)-"; then
+        pt="displacement"
+      fi
+    fi
+    if [ -n "$vertical_aliases" ]; then
+      if echo "$asset_basename" | grep -qE -- "-($vertical_aliases)-"; then
+        pt="vertical"
+      fi
+    fi
+    echo "    · page-type tag: $pt" >&2
+    if [ -n "$CLIENT" ] && [ -z "$competitor_aliases" ] && [ -z "$vertical_aliases" ]; then
+      echo "    · note: no clients/$CLIENT/competitors.yaml or verticals.yaml — defaulting to '$pt'" >&2
+      echo "    · see templates/competitors-example.yaml + templates/verticals-example.yaml" >&2
+    fi
+    echo "" >&2
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Gate 5: voice-enforce-vale (semantic voice lint beyond bash regex)
+# ---------------------------------------------------------------------------
+echo "  Gate 5: voice-enforce-vale" >&2
+if [ -x "$SUBSTRATE_ROOT/skills/voice-enforce-vale/bin/voice-enforce-vale" ] && command -v vale > /dev/null 2>&1; then
+  if "$SUBSTRATE_ROOT/skills/voice-enforce-vale/bin/voice-enforce-vale" "$ASSET" 2>/dev/null >/dev/null; then
+    echo "    ✓ voice-enforce-vale PASS" >&2
+  else
+    echo "    ✗ voice-enforce-vale FAIL — run 'skills/voice-enforce-vale/bin/voice-enforce-vale $ASSET' for details" >&2
+    failed_gates+=("voice-enforce-vale")
+  fi
+else
+  echo "    · voice-enforce-vale skipped (vale not installed or shim not executable)" >&2
+fi
+echo "" >&2
+
+# ---------------------------------------------------------------------------
+# Gate 6: substrate-cite-check (anti-author-from-memory)
+# ---------------------------------------------------------------------------
+echo "  Gate 6: substrate-cite-check" >&2
+if [ -x "$SUBSTRATE_ROOT/skills/substrate-cite-check/bin/substrate-cite-check" ]; then
+  if "$SUBSTRATE_ROOT/skills/substrate-cite-check/bin/substrate-cite-check" "$ASSET" 2>/dev/null >/dev/null; then
+    echo "    ✓ substrate-cite-check PASS" >&2
+  else
+    echo "    ✗ substrate-cite-check FAIL — load-bearing claims lack nearby substrate cite. Run 'skills/substrate-cite-check/bin/substrate-cite-check $ASSET' for the unresolved-claim list." >&2
+    failed_gates+=("substrate-cite-check")
+  fi
+else
+  echo "    · substrate-cite-check skipped (skills/substrate-cite-check/bin not executable)" >&2
+fi
+echo "" >&2
+
+# ---------------------------------------------------------------------------
+# Gate 7: claim-verify (cite value matches substrate)
+# ---------------------------------------------------------------------------
+echo "  Gate 7: claim-verify" >&2
+if [ -x "$SUBSTRATE_ROOT/skills/claim-verify/bin/claim-verify" ]; then
+  if "$SUBSTRATE_ROOT/skills/claim-verify/bin/claim-verify" "$ASSET" 2>/dev/null >/dev/null; then
+    echo "    ✓ claim-verify PASS" >&2
+  else
+    echo "    ✗ claim-verify FAIL — run 'skills/claim-verify/bin/claim-verify $ASSET' for cite-value mismatches." >&2
+    failed_gates+=("claim-verify")
+  fi
+else
+  echo "    · claim-verify skipped (skills/claim-verify/bin not executable)" >&2
+fi
+echo "" >&2
+
+# ---------------------------------------------------------------------------
+# --- Behavioral grounding gates (Gates 9 + 10) ---
+#
+# These run only when the asset declares `produced_by: <skill>` in
+# frontmatter. The asset is then checked against the named skill's
+# `patterns_grounded` (Gate 9) and `contradictions_aware` (Gate 10).
+#
+# Why this gate exists: the preflight library validates that the named
+# pattern files exist, and the prompt emitter feeds the pattern body to the
+# model — but nothing checked the *output*. A skill could pass with output
+# that ignores every pattern it lists. Gates 9 + 10 close that gap by
+# requiring the asset to evidence the patterns and name conditioned
+# positions on contradictions.
+#
+# This is the difference between declarative and behavioral grounding.
+
+produced_by=$(awk 'BEGIN{infm=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^produced_by:/{sub(/^produced_by:[[:space:]]*/, ""); gsub(/^["'\'']|["'\'']$/, ""); sub(/[[:space:]]*#.*$/, ""); sub(/[[:space:]]*$/, ""); print; exit}' "$ASSET")
+
+if [ -n "$produced_by" ]; then
+  skill_md="$SUBSTRATE_ROOT/skills/$produced_by/SKILL.md"
+
+  # Gate 9: pattern-applied
+  echo "  Gate 9: pattern-applied (produced_by=$produced_by)" >&2
+  if [ ! -f "$skill_md" ]; then
+    echo "    · pattern-applied skipped (no SKILL.md at skills/$produced_by/SKILL.md)" >&2
+  elif [ ! -f "$SUBSTRATE_ROOT/bin/lib/skill-pattern-check.sh" ]; then
+    echo "    · pattern-applied skipped (bin/lib/skill-pattern-check.sh missing)" >&2
+  else
+    # shellcheck disable=SC1091
+    . "$SUBSTRATE_ROOT/bin/lib/skill-pattern-check.sh"
+    if pattern_check_all "$ASSET" "$produced_by"; then
+      echo "    ✓ pattern-applied PASS (${#PATTERN_CHECK_EVIDENCED[@]} pattern(s) evidenced)" >&2
+    else
+      missing_str="${PATTERN_CHECK_MISSING[*]:-}"
+      enforce=$(awk 'BEGIN{infm=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^enforce_patterns:/{sub(/^enforce_patterns:[[:space:]]*/, ""); print; exit}' "$skill_md" 2>/dev/null | tr -d ' ')
+      if [ "${STRICT_PATTERN_CHECK:-0}" = "1" ] || [ "$enforce" = "true" ]; then
+        echo "    ✗ pattern-applied FAIL (hard) — patterns missing from output: ${missing_str}" >&2
+        echo "      (STRICT_PATTERN_CHECK=1 or skill SKILL.md has enforce_patterns: true)" >&2
+        failed_gates+=("pattern-applied")
+      else
+        echo "    ⚠ pattern-applied SOFT-FAIL — patterns not evidenced: ${missing_str}" >&2
+        echo "      (set STRICT_PATTERN_CHECK=1 or enforce_patterns: true to hard-fail)" >&2
+      fi
+    fi
+  fi
+  echo "" >&2
+
+  # Gate 10: contradiction-position-logged
+  echo "  Gate 10: contradiction-position-logged (produced_by=$produced_by)" >&2
+  if [ ! -f "$skill_md" ]; then
+    echo "    · contradiction-position-logged skipped (no SKILL.md)" >&2
+  elif [ ! -f "$SUBSTRATE_ROOT/bin/lib/skill-contradiction-check.sh" ]; then
+    echo "    · contradiction-position-logged skipped (bin/lib/skill-contradiction-check.sh missing)" >&2
+  else
+    # Check if this skill has contradictions_aware. If not, skip silently.
+    has_contras=$(awk 'BEGIN{infm=0; got=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^contradictions_aware:[[:space:]]*\[/{if($0 !~ /\[\][[:space:]]*$/){got=1}} infm && /^contradictions_aware:[[:space:]]*$/{got=1} END{print got}' "$skill_md")
+    if [ "$has_contras" = "0" ]; then
+      echo "    · skill declares no contradictions_aware (nothing to enforce)" >&2
+    else
+      # shellcheck disable=SC1091
+      . "$SUBSTRATE_ROOT/bin/lib/skill-contradiction-check.sh"
+      if contradiction_check_all "$ASSET" "$produced_by"; then
+        echo "    ✓ contradiction-position-logged PASS (${#CONTRADICTION_CHECK_PICKED[@]} position(s) named with rationale)" >&2
+      else
+        unconditioned_str="${CONTRADICTION_CHECK_UNCONDITIONED[*]:-}"
+        missing_str="${CONTRADICTION_CHECK_MISSING[*]:-}"
+        echo "    ✗ contradiction-position-logged FAIL — unconditioned: ${unconditioned_str:-<none>}; missing: ${missing_str:-<none>}" >&2
+        echo "      (skills with contradictions_aware MUST name the picked Position AND a conditioning rationale; PRINCIPLES.md rule 9a)" >&2
+        failed_gates+=("contradiction-position-logged")
+      fi
+    fi
+  fi
+  echo "" >&2
+else
+  echo "  Gates 9 + 10 skipped (asset has no 'produced_by' frontmatter; nothing to enforce)" >&2
+  echo "" >&2
+fi
+
+# ---------------------------------------------------------------------------
+# Final summary
+# ---------------------------------------------------------------------------
+if [ "${#failed_gates[@]}" -eq 0 ]; then
+  echo "PASS: $ASSET (all gates passed)"
+  exit 0
+else
+  echo "FAIL: $ASSET (failed gates: ${failed_gates[*]})"
+  exit 1
+fi

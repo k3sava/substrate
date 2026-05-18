@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""dashboard-spec, generate a dashboard spec from metric-tree.yaml + goal ledger.
+
+The spec is BI-tool-agnostic at the spec level (YAML + markdown) and carries
+adapter notes for Amplitude, Looker, Metabase, Tableau, and HubSpot reporting.
+
+Per metric-tree-not-metric-stack: every panel cites a node from metric-tree.yaml.
+Per segment-of-one-vs-cohort-aggregate: every aggregate panel declares a
+drill-path to a segment-of-one view.
+
+Usage:
+    dashboard-spec --client <client> --audience <audience> --decision <decision> \\
+        [--cadence weekly] [--id <slug>] [--export amplitude,looker,metabase]
+
+Outputs:
+    clients/<client>/analytics/dashboards/<id>.yaml
+    clients/<client>/analytics/dashboards/<id>.md
+
+Exit codes:
+    0, dashboard spec written
+    1, written with warnings
+    3, refused (substrate gap, missing metric tree)
+    4, invalid args
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+
+VALID_AUDIENCES = {"exec", "growth", "lifecycle", "sales", "support", "all"}
+VALID_DECISIONS = {
+    "budget-allocation",
+    "retention-watch",
+    "funnel-watch",
+    "attribution-debate",
+    "expansion-pipeline",
+    "narrative-drift",
+}
+VALID_CADENCES = {"real-time", "daily", "weekly", "monthly", "quarterly"}
+VALID_EXPORTS = {"amplitude", "looker", "metabase", "tableau", "hubspot"}
+
+
+# Audience-to-default-panels mapping. Each audience picks panels prioritizing
+# the metrics that audience reads weekly. These are starting templates; the
+# actual node IDs are resolved against metric-tree.yaml at runtime.
+AUDIENCE_PANEL_TEMPLATES = {
+    "exec": [
+        ("north-star", "single-stat", "north-star-current"),
+        ("retention", "cohort-table", "w4-retention-rate"),
+        ("monetization", "timeseries", "monthly-net-revenue-retention"),
+        ("acquisition", "timeseries", "weekly-new-customer-cohorts"),
+        ("monetization", "timeseries", "monthly-revenue-per-customer"),
+    ],
+    "growth": [
+        ("acquisition", "timeseries", "weekly-icp-fit-trial-signups"),
+        ("acquisition", "single-stat", "trial-to-paid-conversion-rate"),
+        ("activation", "funnel", "trial-activation-rate"),
+        ("activation", "timeseries", "first-value-event-completion"),
+        ("retention", "cohort-table", "w4-retention-rate"),
+        ("acquisition", "drill-list", "icp-fit-signup-rate"),
+    ],
+    "lifecycle": [
+        ("activation", "single-stat", "trial-activation-rate"),
+        ("activation", "timeseries", "time-to-activation-median"),
+        ("retention", "cohort-table", "w4-retention-rate"),
+        ("retention", "drill-list", "weekly-engagement-decay"),
+        ("monetization", "timeseries", "expansion-revenue-rate"),
+        ("acquisition", "timeseries", "weekly-icp-fit-trial-signups"),
+    ],
+    "sales": [
+        ("acquisition", "timeseries", "weekly-icp-fit-trial-signups"),
+        ("acquisition", "single-stat", "trial-to-paid-conversion-rate"),
+        ("monetization", "timeseries", "expansion-revenue-rate"),
+        ("retention", "drill-list", "weekly-engagement-decay"),
+    ],
+    "support": [
+        ("retention", "drill-list", "weekly-engagement-decay"),
+        ("activation", "funnel", "onboarding-step-dropoff"),
+        ("retention", "cohort-table", "w4-retention-rate"),
+    ],
+    "all": [],  # placeholder; "all" is normalized to exec template
+}
+
+# Drill-paths per panel kind. Per the segment-of-one-vs-cohort-aggregate pattern,
+# every aggregate panel must declare a drill-path that takes the operator from
+# the aggregate view to the user-record-or-account-level view.
+DRILL_PATHS = {
+    "single-stat": "click-through to the cohort-table panel for the same metric, then to a per-account drill",
+    "timeseries": "click on a date point to filter the per-cohort drill to that signup week",
+    "funnel": "click a step's drop-off to surface the user list that exited at that step",
+    "cohort-table": "click a cell to surface the named cohort's account roster + per-account event timeline",
+    "drill-list": "the panel IS the drill-list; rows link to per-account session-replay or event timeline",
+}
+
+# Adapter snippets per BI tool. The spec is platform-agnostic but emits hints
+# so the operator implementing in Amplitude / Looker / Metabase has a starting
+# point.
+ADAPTER_HINTS = {
+    "amplitude": (
+        "Amplitude implementation: each panel maps to an Amplitude chart. "
+        "single-stat → 'Segmentation' chart with single date range; "
+        "timeseries → 'Segmentation' line chart with daily/weekly grain; "
+        "funnel → 'Funnel Analysis' chart; "
+        "cohort-table → 'Retention Analysis' chart with cohort grain matching metric-tree cadence; "
+        "drill-list → 'User Look-up' tied to the segment definition. "
+        "Use the Amplitude Dashboard with named tabs per panel."
+    ),
+    "looker": (
+        "Looker implementation: each panel maps to a tile in a Looker Dashboard. "
+        "Define a LookML view per metric (the metric-tree.yaml provides the SQL fragment as the source). "
+        "single-stat → 'Single Value' tile; "
+        "timeseries → 'Line' tile with date dimension; "
+        "funnel → custom visualization or 'Funnel' viz; "
+        "cohort-table → 'Cohort' visualization plugin; "
+        "drill-list → 'Table' tile with drill-down enabled."
+    ),
+    "metabase": (
+        "Metabase implementation: each panel is a Question saved into a Dashboard. "
+        "single-stat → 'Number' display; "
+        "timeseries → 'Line' display; "
+        "funnel → use Funnel visualization (Pro) or build with a stacked bar; "
+        "cohort-table → 'Pivot table' display; "
+        "drill-list → 'Table' display with drill-through."
+    ),
+    "tableau": (
+        "Tableau implementation: each panel is a worksheet bound into a Dashboard. "
+        "single-stat → 'Text' or 'Highlight Table'; "
+        "timeseries → 'Line' chart; "
+        "funnel → custom funnel viz or 'Bar' chart with cumulative drop; "
+        "cohort-table → 'Heat Map' across cohort × week; "
+        "drill-list → 'Table' worksheet with action-driven drill-through."
+    ),
+    "hubspot": (
+        "HubSpot Reporting implementation: each panel is a Report on a Dashboard. "
+        "single-stat → 'Single value' visualization; "
+        "timeseries → 'Line' chart; "
+        "funnel → 'Funnel' report (Marketing Hub Enterprise); "
+        "cohort-table → 'Custom Funnel' or 'Pivot' depending on plan; "
+        "drill-list → 'Table' report. "
+        "HubSpot is the right tool for sales / lifecycle audiences; less suited for product-event panels."
+    ),
+}
+
+
+# --- minimal yaml ---------------------------------------------------------
+
+def load_yaml(path: Path) -> dict | None:
+    try:
+        import yaml  # type: ignore
+        return yaml.safe_load(path.read_text())
+    except ImportError:
+        pass
+    return _parse_minimal_yaml(path.read_text())
+
+
+def _parse_minimal_yaml(text: str) -> dict:
+    root: dict = {}
+    stack: list[tuple[int, dict | list]] = [(-1, root)]
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = re.sub(r"(\s)#.*$", r"\1", raw).rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            value_part = stripped[2:].strip()
+            if isinstance(parent, list):
+                if ":" in value_part and not value_part.endswith(":"):
+                    k, _, v = value_part.partition(":")
+                    new_map = {k.strip(): _scalar(v.strip())}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+                elif value_part:
+                    parent.append(_scalar(value_part))
+                else:
+                    new_map = {}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+            i += 1
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if not val:
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines):
+                    next_line = lines[j]
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent > indent and next_line.strip().startswith("- "):
+                        new_list: list = []
+                        if isinstance(parent, dict):
+                            parent[key] = new_list
+                        stack.append((indent, new_list))
+                    else:
+                        new_map: dict = {}
+                        if isinstance(parent, dict):
+                            parent[key] = new_map
+                        stack.append((indent, new_map))
+            else:
+                if isinstance(parent, dict):
+                    parent[key] = _scalar(val)
+        i += 1
+    return root
+
+
+def _scalar(v: str):
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    if v.startswith("'") and v.endswith("'"):
+        return v[1:-1]
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    if v.lower() in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    return v
+
+
+# --- helpers --------------------------------------------------------------
+
+def refuse(reason: str, detail: str = "") -> int:
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    return 3
+
+
+def all_metric_lookup(tree_yaml: dict) -> dict[str, dict]:
+    """Index of every node in the tree by id."""
+    out: dict[str, dict] = {}
+    if not tree_yaml:
+        return out
+    ns = tree_yaml.get("north_star")
+    if isinstance(ns, dict) and ns.get("id"):
+        out[ns["id"]] = {**ns, "node_kind": "north-star", "parent_id": None}
+    for inp in tree_yaml.get("inputs") or []:
+        if inp.get("id"):
+            out[inp["id"]] = {**inp, "node_kind": "input", "parent_id": ns.get("id") if isinstance(ns, dict) else None}
+        for s in inp.get("supporting") or []:
+            if s.get("id"):
+                out[s["id"]] = {**s, "node_kind": "supporting", "parent_id": inp.get("id")}
+        for l in inp.get("leaves") or []:
+            if l.get("id"):
+                out[l["id"]] = {**l, "node_kind": "leaf", "parent_id": inp.get("id")}
+    return out
+
+
+def determine_alert_rule(metric: dict) -> str | None:
+    """Per-node alert rule. Retention and revenue panels get drift alerts."""
+    name = (metric.get("name") or "").lower()
+    parent = (metric.get("parent_id") or "").lower()
+    nid = (metric.get("id") or "").lower()
+    if "retention" in name or "retention" in parent or "retention" in nid:
+        return "alert: cohort retention drops more than 1.5 SD vs trailing-4 cohort baseline"
+    if "revenue" in name or "arr" in name or "nrr" in name or "monetization" in parent:
+        return "alert: weekly delta exceeds 2 SD vs trailing-12-week baseline"
+    if "churn" in name:
+        return "alert: monthly churn rate increases more than 0.5 percentage points MoM"
+    if metric.get("node_kind") == "north-star":
+        return "alert: north-star moves more than 1 SD vs trailing-4 weeks"
+    return None
+
+
+def select_panels_for_audience(audience: str, decision: str, metric_lookup: dict[str, dict],
+                                cadence: str) -> tuple[list[dict], list[str]]:
+    """Return (panels, missing_metric_ids). Each panel is a dict with full data."""
+    if audience == "all":
+        audience = "exec"
+    template = AUDIENCE_PANEL_TEMPLATES.get(audience, [])
+    panels: list[dict] = []
+    missing: list[str] = []
+    for axis_hint, panel_kind, metric_id in template:
+        if metric_id == "north-star-current":
+            # Resolve to actual north-star id from tree.
+            ns_metrics = [m for m in metric_lookup.values() if m.get("node_kind") == "north-star"]
+            if ns_metrics:
+                metric = ns_metrics[0]
+                metric_id = metric["id"]
+            else:
+                missing.append("north-star")
+                continue
+        if metric_id not in metric_lookup:
+            missing.append(metric_id)
+            continue
+        metric = metric_lookup[metric_id]
+        panel_cadence = metric.get("cadence", cadence)
+        drill_path = DRILL_PATHS.get(panel_kind, "no drill defined")
+        alert_rule = determine_alert_rule(metric)
+        panels.append({
+            "id": f"{audience}-{panel_kind}-{metric_id}",
+            "title": metric.get("name", metric_id),
+            "metric_id": metric_id,
+            "panel_kind": panel_kind,
+            "source_system": metric.get("source_system", ""),
+            "query": metric.get("definition", ""),
+            "refresh_cadence": panel_cadence,
+            "drill_path": drill_path,
+            "alert_rule": alert_rule,
+            "axis_hint": axis_hint,
+            "parent_id": metric.get("parent_id"),
+            "node_kind": metric.get("node_kind", "unknown"),
+        })
+    return panels, missing
+
+
+# --- preflight ------------------------------------------------------------
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/")
+    if not (client_root / "positioning").is_dir() and not (client_root / "positioning.md").is_file():
+        fails.append(f"positioning layer missing: clients/{client}/positioning/")
+    if not (client_root / "analytics" / "metric-tree.yaml").is_file():
+        fails.append(f"metric-tree.yaml missing: clients/{client}/analytics/metric-tree.yaml")
+    return len(fails) == 0, fails
+
+
+# --- renderers ------------------------------------------------------------
+
+def render_yaml_spec(panels: list[dict], audience: str, decision: str,
+                     cadence: str, dashboard_id: str, today: str,
+                     adapters: list[str], client: str) -> str:
+    lines: list[str] = []
+    lines.append(f"# dashboard-spec, generated by dashboard-spec on {today}")
+    lines.append(f"# Read by: BI-tool implementer (Amplitude / Looker / Metabase / Tableau / HubSpot).")
+    lines.append("")
+    lines.append(f"dashboard_id: {dashboard_id}")
+    lines.append(f"client: {client}")
+    lines.append(f"audience: {audience}")
+    lines.append(f"decision: {decision}")
+    lines.append(f"cadence: {cadence}")
+    lines.append(f"last_updated: {today}")
+    lines.append("version: 0.1")
+    lines.append("patterns_grounded: [metric-tree-not-metric-stack, segment-of-one-vs-cohort-aggregate]")
+    lines.append("produced_by: dashboard-spec")
+    lines.append("")
+    lines.append("panels:")
+    for p in panels:
+        lines.append(f"  - id: {p['id']}")
+        lines.append(f"    title: {_quote_if(p['title'])}")
+        lines.append(f"    metric_id: {p['metric_id']}")
+        lines.append(f"    panel_kind: {p['panel_kind']}")
+        lines.append(f"    source_system: {_quote_if(p['source_system'])}")
+        lines.append(f"    query: {_quote_if(p['query'])}")
+        lines.append(f"    refresh_cadence: {p['refresh_cadence']}")
+        lines.append(f"    drill_path: {_quote_if(p['drill_path'])}")
+        if p["alert_rule"]:
+            lines.append(f"    alert_rule: {_quote_if(p['alert_rule'])}")
+        else:
+            lines.append("    alert_rule: null")
+        lines.append(f"    axis_hint: {p['axis_hint']}")
+        lines.append(f"    parent_id: {p['parent_id']}")
+        lines.append(f"    node_kind: {p['node_kind']}")
+    lines.append("")
+    lines.append("adapters:")
+    for tool in adapters:
+        if tool in ADAPTER_HINTS:
+            lines.append(f"  {tool}: |")
+            for ln in ADAPTER_HINTS[tool].split(". "):
+                ln_stripped = ln.strip()
+                if not ln_stripped:
+                    continue
+                lines.append(f"    {ln_stripped}.")
+    return "\n".join(lines) + "\n"
+
+
+def _quote_if(s: str) -> str:
+    if not s:
+        return '""'
+    bad = any(c in s for c in [":", "{", "}", "[", "]", ",", "&", "*", "#", "?", "|", ">", "<", "=", "!", "%", "@", "`", '"', "'"])
+    if bad:
+        return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    return s
+
+
+def render_md_spec(panels: list[dict], audience: str, decision: str,
+                   cadence: str, dashboard_id: str, today: str,
+                   adapters: list[str], client: str,
+                   warnings: list[str], missing: list[str]) -> str:
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: dashboard, {audience} | {decision} | {client}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append(f"client: {client}")
+    lines.append(f"dashboard_id: {dashboard_id}")
+    lines.append(f"audience: {audience}")
+    lines.append(f"decision: {decision}")
+    lines.append(f"cadence: {cadence}")
+    lines.append("patterns_grounded: [metric-tree-not-metric-stack, segment-of-one-vs-cohort-aggregate]")
+    lines.append("produced_by: dashboard-spec")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Dashboard spec, {audience} audience | {decision} decision | {today}")
+    lines.append("")
+    lines.append(
+        f"This dashboard exists to support **{decision}** decisions for the **{audience}** audience. "
+        f"Per the `metric-tree-not-metric-stack` pattern, every panel cites a node in `metric-tree.yaml`. "
+        f"Per the `segment-of-one-vs-cohort-aggregate` pattern, every aggregate panel declares a "
+        f"drill-path to a user-record-level view. Aggregate-only dashboards refuse to lock."
+    )
+    lines.append("")
+
+    lines.append("## Panel layout")
+    lines.append("")
+    lines.append("```")
+    # Render a simple grid: 2 columns
+    cols = 2
+    rows: list[list[dict]] = []
+    cur: list[dict] = []
+    for p in panels:
+        cur.append(p)
+        if len(cur) == cols:
+            rows.append(cur)
+            cur = []
+    if cur:
+        rows.append(cur)
+    for row in rows:
+        line = "│ " + " │ ".join(f"{p['title'][:30]:<30}" for p in row) + " │"
+        lines.append(line)
+    lines.append("```")
+    lines.append("")
+
+    lines.append("## Per-panel detail")
+    lines.append("")
+    for p in panels:
+        lines.append(f"### {p['title']}")
+        lines.append("")
+        lines.append(f"- **Panel ID:** `{p['id']}`")
+        lines.append(f"- **Metric ID (from tree):** `{p['metric_id']}` ({p['node_kind']})")
+        lines.append(f"- **Panel kind:** `{p['panel_kind']}`")
+        lines.append(f"- **Source system:** {p['source_system']}")
+        lines.append(f"- **Query:** {p['query']}")
+        lines.append(f"- **Refresh cadence:** {p['refresh_cadence']}")
+        lines.append(f"- **Drill path:** {p['drill_path']}")
+        if p.get("alert_rule"):
+            lines.append(f"- **Alert rule:** {p['alert_rule']}")
+        if p.get("parent_id"):
+            lines.append(f"- **Tree parent:** `{p['parent_id']}`")
+        lines.append("")
+
+    lines.append("## Drill-path manifest")
+    lines.append("")
+    lines.append(
+        "Per `segment-of-one-vs-cohort-aggregate`: every aggregate panel must surface a path to a "
+        "user-record view. The drill-path is the bridge between cohort signal and segment-of-one mechanism."
+    )
+    lines.append("")
+    lines.append("| Panel | Aggregate view | Drill-path destination |")
+    lines.append("|---|---|---|")
+    for p in panels:
+        if p["panel_kind"] == "drill-list":
+            lines.append(f"| {p['title']} | (already segment-of-one) | rows ARE the drill-list |")
+        else:
+            lines.append(f"| {p['title']} | {p['panel_kind']} | {p['drill_path']} |")
+    lines.append("")
+
+    lines.append("## Drift-watch alerts")
+    lines.append("")
+    alerts = [p for p in panels if p.get("alert_rule")]
+    if alerts:
+        lines.append("| Panel | Alert rule |")
+        lines.append("|---|---|")
+        for p in alerts:
+            lines.append(f"| {p['title']} | {p['alert_rule']} |")
+    else:
+        lines.append("_No alert rules configured. Per the spec quality criteria, every retention or revenue "
+                     "panel should carry a drift-watch alert. Add alerts before locking the dashboard._")
+    lines.append("")
+
+    lines.append("## BI-tool adapters")
+    lines.append("")
+    lines.append(
+        "The dashboard spec is platform-agnostic. Pick the tool the team already uses and follow the "
+        "adapter hint."
+    )
+    lines.append("")
+    for tool in adapters:
+        if tool in ADAPTER_HINTS:
+            lines.append(f"### {tool.capitalize()}")
+            lines.append("")
+            lines.append(ADAPTER_HINTS[tool])
+            lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- Metric tree: `clients/{client}/analytics/metric-tree.yaml` (every panel cites a node).")
+    lines.append(f"- ICP: `clients/{client}/icp/icp.md`")
+    lines.append(f"- Positioning: `clients/{client}/positioning/positioning.md`")
+    lines.append(f"- Sources: `clients/{client}/analytics/sources.yaml`")
+    lines.append(f"- Goal ledger: `goals/ledger.md` (when relevant goals are open).")
+    lines.append("- Pattern: `knowledge/patterns/metric-tree-not-metric-stack.md`")
+    lines.append("- Pattern: `knowledge/patterns/segment-of-one-vs-cohort-aggregate.md`")
+    lines.append("")
+
+    if missing:
+        lines.append("## Missing metric-tree nodes")
+        lines.append("")
+        lines.append(
+            "The audience template requested the following metric IDs which are not present in "
+            "`metric-tree.yaml`. Either add them to the tree (run `metric-tree-design --update`) or "
+            "remove the reference from the dashboard."
+        )
+        lines.append("")
+        for m in missing:
+            lines.append(f"- `{m}`")
+        lines.append("")
+
+    if warnings:
+        lines.append("## Warnings")
+        lines.append("")
+        for w in warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append(f"- `routines/analytics-monthly-refresh.md`, validates the dashboard is being read.")
+    lines.append(f"- `skills/lift-test-design --client {client}`, lift tests for any panel showing drift.")
+    lines.append(f"- `skills/event-taxonomy-audit --client {client}`, surfaces undeclared events behind dashboard nulls.")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+# --- main -----------------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="dashboard-spec")
+    p.add_argument("--client", required=True)
+    p.add_argument("--audience", required=True, choices=sorted(VALID_AUDIENCES))
+    p.add_argument("--decision", required=True, choices=sorted(VALID_DECISIONS))
+    p.add_argument("--cadence", default="weekly", choices=sorted(VALID_CADENCES))
+    p.add_argument("--id", default=None, help="dashboard slug (default derived from audience+decision)")
+    p.add_argument("--export", default="all",
+                   help="comma list of bi-tool adapters; default 'all' includes all 5")
+    p.add_argument("--accept-aggregate-only", action="store_true",
+                   help="permit panels without drill-path (logs the gap; default refuses)")
+    args = p.parse_args()
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        return 3
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    dashboard_id = args.id or f"{args.audience}-{args.decision}"
+
+    tree_path = SUBSTRATE_ROOT / "clients" / args.client / "analytics" / "metric-tree.yaml"
+    tree_yaml = load_yaml(tree_path) or {}
+    metric_lookup = all_metric_lookup(tree_yaml)
+    if not metric_lookup:
+        return refuse("missing-metric-tree", f"metric-tree.yaml at {tree_path} has no nodes.")
+
+    panels, missing = select_panels_for_audience(args.audience, args.decision, metric_lookup, args.cadence)
+
+    if not panels:
+        return refuse(
+            "no-panels-resolved",
+            f"audience template for {args.audience!r} requested metrics that are absent from metric-tree.yaml. "
+            f"Missing: {missing}. Run metric-tree-design first.",
+        )
+
+    # Validate per quality criteria
+    warnings: list[str] = []
+    aggregate_no_drill: list[str] = []
+    cadence_mismatch: list[str] = []
+
+    cadence_order = {"real-time": 5, "daily": 4, "weekly": 3, "monthly": 2, "quarterly": 1}
+    db_cad_rank = cadence_order.get(args.cadence, 0)
+
+    for p in panels:
+        kind = p["panel_kind"]
+        if kind != "drill-list" and not p["drill_path"]:
+            aggregate_no_drill.append(p["id"])
+        # per panel cadence must be at least as frequent as dashboard's
+        p_cad = p.get("refresh_cadence", "").strip()
+        p_rank = cadence_order.get(p_cad, 0)
+        if p_rank > 0 and p_rank < db_cad_rank:
+            cadence_mismatch.append(f"{p['id']} (panel: {p_cad}; dashboard: {args.cadence})")
+
+    if aggregate_no_drill and not args.accept_aggregate_only:
+        return refuse(
+            "aggregate-only-violation",
+            f"{len(aggregate_no_drill)} panel(s) have no drill-path: {aggregate_no_drill}. "
+            "Per the segment-of-one-vs-cohort-aggregate pattern, every aggregate panel must declare "
+            "a drill-path. Pass --accept-aggregate-only to log the gap explicitly.",
+        )
+    if aggregate_no_drill:
+        warnings.append(
+            f"aggregate-only-violation accepted: {len(aggregate_no_drill)} panels lack a drill-path; "
+            "operator accepted the gap with --accept-aggregate-only."
+        )
+
+    if cadence_mismatch:
+        return refuse(
+            "cadence-mismatch",
+            "panels with cadence less frequent than dashboard cadence: " + ", ".join(cadence_mismatch),
+        )
+
+    if missing:
+        warnings.append(f"missing-metric-tree-nodes: {missing}")
+
+    # Resolve adapters
+    if args.export == "all":
+        adapters = sorted(VALID_EXPORTS)
+    else:
+        adapters_raw = [t.strip() for t in args.export.split(",") if t.strip()]
+        invalid = [t for t in adapters_raw if t not in VALID_EXPORTS]
+        if invalid:
+            return refuse("invalid-export", f"unknown bi-tool adapters: {invalid}; valid: {sorted(VALID_EXPORTS)}")
+        adapters = adapters_raw
+
+    out_dir = SUBSTRATE_ROOT / "clients" / args.client / "analytics" / "dashboards"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    yaml_path = out_dir / f"{dashboard_id}.yaml"
+    md_path = out_dir / f"{dashboard_id}.md"
+
+    yaml_text = render_yaml_spec(panels, args.audience, args.decision, args.cadence,
+                                  dashboard_id, today, adapters, args.client)
+    md_text = render_md_spec(panels, args.audience, args.decision, args.cadence,
+                              dashboard_id, today, adapters, args.client,
+                              warnings, missing)
+
+    yaml_path.write_text(yaml_text, encoding="utf-8")
+    md_path.write_text(md_text, encoding="utf-8")
+
+    print(f"[dashboard-spec] yaml: {yaml_path}", file=sys.stderr)
+    print(f"[dashboard-spec] md: {md_path}", file=sys.stderr)
+    print(f"  audience: {args.audience}  decision: {args.decision}  cadence: {args.cadence}", file=sys.stderr)
+    print(f"  panels: {len(panels)}  missing: {len(missing)}  warnings: {len(warnings)}", file=sys.stderr)
+    for w in warnings:
+        print(f"  warn: {w}", file=sys.stderr)
+
+    print(str(md_path))
+    return 1 if warnings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

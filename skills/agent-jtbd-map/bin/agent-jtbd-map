@@ -1,0 +1,576 @@
+#!/usr/bin/env bash
+# agent-jtbd-map — substrate skill runtime (v2.0)
+#
+# Reads clients/<client>/product/agents.yaml, validates JTBD form, applies
+# team-shape vs tool-shape per the contradiction conditioning, emits the
+# wiring diagram + checkpoint contract.
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+SCOPE="cross-stack"
+MODE="draft"
+AGENTS_YAML=""
+JTBD_LIST=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)        CLIENT="$2"; shift 2 ;;
+    --scope)         SCOPE="$2"; shift 2 ;;
+    --mode)          MODE="$2"; shift 2 ;;
+    --agents-yaml)   AGENTS_YAML="$2"; shift 2 ;;
+    --jtbd-list)     JTBD_LIST="$2"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+agent-jtbd-map — wire agents to JTBD with checkpoints
+
+Usage:
+  agent-jtbd-map --client <client> [--scope function|stack|cross-stack]
+                 [--mode draft|refresh|audit]
+                 [--agents-yaml <path>] [--jtbd-list <path>]
+
+Reads clients/<client>/product/agents.yaml.
+Writes clients/<client>/strategy/agent-jtbd-map-<date>.md + .json + checkpoint-contract.
+
+See skills/agent-jtbd-map/SKILL.md for full spec.
+EOF
+      exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+if [ -z "$CLIENT" ]; then
+  echo "ERR: --client required" >&2
+  exit 4
+fi
+
+skill_preflight "agent-jtbd-map" "$CLIENT" || exit 3
+
+STRAT_DIR="$SUBSTRATE_ROOT/clients/$CLIENT/strategy"
+mkdir -p "$STRAT_DIR"
+
+exec /usr/bin/env python3 - "$SUBSTRATE_ROOT" "$CLIENT" "$SCOPE" "$MODE" "$AGENTS_YAML" "$JTBD_LIST" <<'PYEOF'
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+(SR, CLIENT, SCOPE, MODE, AGENTS_YAML_ARG, JTBD_LIST_ARG) = sys.argv[1:7]
+SUBSTRATE_ROOT = Path(SR)
+CLIENT_ROOT = SUBSTRATE_ROOT / "clients" / CLIENT
+STRAT_DIR = CLIENT_ROOT / "strategy"
+STRAT_DIR.mkdir(parents=True, exist_ok=True)
+TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def refuse(reason, detail=""):
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    sys.exit(3)
+
+
+# --- minimal YAML parser (handles agents.yaml shape) ---
+
+
+def parse_yaml(text):
+    """Parse a tiny subset of YAML sufficient for the agents.yaml schema."""
+    root = {}
+    stack = [(-1, root)]
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = re.sub(r"(\s)#.*$", r"\1", raw).rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        stripped = line.strip()
+        # list item
+        if stripped.startswith("- "):
+            value_part = stripped[2:].strip()
+            if isinstance(parent, list):
+                if ":" in value_part and not value_part.endswith(":"):
+                    k, _, v = value_part.partition(":")
+                    new_map = {k.strip(): _scalar(v.strip())}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+                elif value_part:
+                    parent.append(_scalar(value_part))
+                else:
+                    new_map = {}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+            i += 1
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if not val:
+                # peek: nested map or list
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines):
+                    nl = lines[j]
+                    next_indent = len(nl) - len(nl.lstrip())
+                    if next_indent > indent and nl.strip().startswith("- "):
+                        nl2 = []
+                        if isinstance(parent, dict):
+                            parent[key] = nl2
+                        stack.append((indent, nl2))
+                    else:
+                        nm = {}
+                        if isinstance(parent, dict):
+                            parent[key] = nm
+                        stack.append((indent, nm))
+                else:
+                    if isinstance(parent, dict):
+                        parent[key] = {}
+            else:
+                if isinstance(parent, dict):
+                    parent[key] = _scalar(val)
+        i += 1
+    return root
+
+
+def _scalar(v):
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    if v.startswith("'") and v.endswith("'"):
+        return v[1:-1]
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    if v.lower() in ("null", "~", ""):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    if re.fullmatch(r"-?\d+\.\d+", v):
+        return float(v)
+    return v
+
+
+# --- Validators ---
+
+JTBD_FORM_RE = re.compile(
+    r"^\s*help me\s+\S+\s+\S+.*?\bwhen\b.*?(\bso\b)?",
+    re.IGNORECASE,
+)
+
+VALID_PERSISTENCE = {"persistent", "ephemeral"}
+VALID_HETEROGENEITY = {"heterogeneous", "homogeneous"}
+VALID_TRUST = ["review-all", "spot-check", "exception-only", "unattended"]
+VALID_LOOP_CLASS = {"tier-1-assistive", "tier-2-autonomous-scoped", "tier-3-system-level"}
+VALID_OPERATING_LOOP = {
+    "CASH-collect", "CASH-automate", "CASH-scale", "CASH-hire",
+    "CCCD-calibrate", "CCCD-develop",
+}
+
+
+def validate_jtbd_form(jtbd):
+    if not jtbd or not isinstance(jtbd, str):
+        return ["jtbd missing"]
+    if not JTBD_FORM_RE.search(jtbd.strip().lower()):
+        return [f"jtbd does not match 'Help me [verb] [object] when [situation]' form: '{jtbd}'"]
+    if len(jtbd.split()) < 6:
+        return [f"jtbd too short ({len(jtbd.split())} words); expand"]
+    return []
+
+
+def pick_shape(persistence, heterogeneity):
+    """Per knowledge/contradictions/agents-as-team-vs-agents-as-tools.md."""
+    if persistence == "persistent" and heterogeneity == "heterogeneous":
+        return "team", (
+            "Heterogeneous, persistent JTBD: agents-as-team (Vo). Named identity, "
+            "scoped context, progressive trust ladder applies."
+        )
+    if persistence == "ephemeral" and heterogeneity == "homogeneous":
+        return "tool", (
+            "Homogeneous, ephemeral, goal-bound: agents-as-tools (Cherny). "
+            "Minimal scaffolding, give the goal, stay out."
+        )
+    if persistence == "persistent" and heterogeneity == "homogeneous":
+        return "team-light", (
+            "Persistent but homogeneous: lean toward team-shape (named identity) "
+            "but resist over-scaffolding. The persistence demands a checkpoint owner; "
+            "the homogeneity allows simpler context."
+        )
+    return "tool-bounded", (
+        "Ephemeral but heterogeneous: lean toward tool-shape with explicit goal "
+        "scoping each invocation. The heterogeneity demands per-task context; "
+        "the ephemerality forbids long-lived state."
+    )
+
+
+def validate_trust_tier(agent):
+    """Refuse upgrade to tier-3 without 60-day evidence; refuse spot-check/exception-only
+    without `last_60d_run_history`."""
+    tier = agent.get("trust_tier_current", "")
+    history = agent.get("last_60d_run_history") or {}
+    if tier == "unattended":
+        runs = (history.get("runs_total") or 0)
+        exception_rate = (history.get("exception_rate_pct") or 100.0)
+        if runs < 100:
+            return [f"trust_tier=unattended requires runs_total>=100 in last_60d_run_history (have {runs})"]
+        if exception_rate >= 1.0:
+            return [f"trust_tier=unattended requires exception_rate_pct<1.0 (have {exception_rate})"]
+    if tier in ("exception-only",) and not history:
+        return ["trust_tier=exception-only requires last_60d_run_history evidence (missing)"]
+    if tier and tier not in VALID_TRUST:
+        return [f"trust_tier_current invalid: '{tier}'; must be one of {VALID_TRUST}"]
+    return []
+
+
+def validate_loop(agent):
+    flags = []
+    lc = agent.get("loop_class")
+    if lc and lc not in VALID_LOOP_CLASS:
+        flags.append(f"loop_class invalid: '{lc}'")
+    op = agent.get("operating_loop")
+    if op and op not in VALID_OPERATING_LOOP:
+        flags.append(f"operating_loop invalid: '{op}'")
+    return flags
+
+
+def validate_checkpoint(agent):
+    cp = agent.get("human_checkpoint")
+    if not cp or not isinstance(cp, str) or len(cp) < 5:
+        return ["human_checkpoint missing or unclear (need named human + review moment)"]
+    if "agent" in cp.lower() or cp.strip().lower() in ("ai", "the system"):
+        return [f"human_checkpoint must name a human, not '{cp}'"]
+    return []
+
+
+def find_agents_yaml(arg):
+    if arg:
+        return Path(arg)
+    return CLIENT_ROOT / "product" / "agents.yaml"
+
+
+def find_jtbd_list(arg):
+    if arg:
+        return Path(arg)
+    return CLIENT_ROOT / "strategy" / "jtbd-list.md"
+
+
+def load_jtbd_list(path):
+    if not path.exists():
+        return []
+    out = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if s.startswith("- "):
+            out.append(s[2:].strip())
+        m = re.match(r"^\d+\.\s+(.+)$", s)
+        if m:
+            out.append(m.group(1).strip())
+    return out
+
+
+def render_md(agents, jtbd_catalog, gaps, contradiction_summary):
+    parts = []
+    parts.append("---")
+    parts.append(f"title: agent JTBD map, {CLIENT}, {TODAY}")
+    parts.append("status: active")
+    parts.append(f"last_updated: {TODAY}")
+    parts.append("produced_by: agent-jtbd-map")
+    parts.append("patterns_grounded: [agents-mapped-to-jtbd, agent-first-gtm, agents-as-product-users, substrate-runs-loop-humans-run-alignment, jtbd-as-buyer-mental-model]")
+    parts.append("contradictions_aware: [agents-as-team-vs-agents-as-tools]")
+    pos_summary = ", ".join(sorted({a["picked_shape"] for a in agents if a.get("picked_shape")}))
+    parts.append(f"contradiction_positions: [agents-as-team-vs-agents-as-tools: per-agent ({pos_summary})]")
+    parts.append(f"position_rationale: \"per the contradiction's conditioning (persistence + heterogeneity), each agent's shape is picked individually. The skill refuses a global default; logged below on each row.\"")
+    parts.append(f"client: {CLIENT}")
+    parts.append(f"scope: {SCOPE}")
+    parts.append(f"agents_total: {len(agents)}")
+    parts.append("---")
+    parts.append("")
+    parts.append(f"# Agent JTBD map, {CLIENT}, {TODAY}")
+    parts.append("")
+    parts.append(f"_Scope: `{SCOPE}`. Agents wired: {len(agents)}._")
+    parts.append("")
+    parts.append("## Wiring diagram")
+    parts.append("")
+    parts.append("| Agent | JTBD | Shape (picked) | Trust tier | Loop class | Operating loop | Human checkpoint | Escalation |")
+    parts.append("|---|---|---|---|---|---|---|---|")
+    for a in agents:
+        flags_marker = " ⚠" if a.get("validation_flags") else ""
+        parts.append(
+            f"| {a['name']}{flags_marker} | {(a.get('jtbd') or '')[:80]} | {a.get('picked_shape', '?')} | "
+            f"{a.get('trust_tier_current', '?')} | {a.get('loop_class', '?')} | "
+            f"{a.get('operating_loop', '?')} | {(a.get('human_checkpoint') or '?')[:60]} | "
+            f"{(a.get('escalation_trigger') or '?')[:60]} |"
+        )
+    parts.append("")
+
+    # Per-agent detail
+    parts.append("## Per-agent detail and shape rationale")
+    parts.append("")
+    for a in agents:
+        parts.append(f"### {a['name']}")
+        parts.append("")
+        parts.append(f"- **JTBD:** {a.get('jtbd', '')}")
+        parts.append(f"- **Persistence:** {a.get('persistence', '?')}; **Heterogeneity:** {a.get('heterogeneity', '?')}")
+        parts.append(f"- **Picked shape:** `{a.get('picked_shape', '?')}`")
+        parts.append(f"  - _Rationale:_ {a.get('shape_rationale', '')}")
+        parts.append(f"- **Trust tier:** {a.get('trust_tier_current', '?')}")
+        parts.append(f"- **Loop class:** {a.get('loop_class', '?')}; **Operating loop:** {a.get('operating_loop', '?')}")
+        parts.append(f"- **Human checkpoint:** {a.get('human_checkpoint', '?')}")
+        parts.append(f"- **Escalation trigger:** {a.get('escalation_trigger', '?')}")
+        history = a.get("last_60d_run_history") or {}
+        if history:
+            parts.append(
+                f"- **Last 60d:** {history.get('runs_total', '?')} runs, "
+                f"{history.get('exceptions', '?')} exceptions, "
+                f"{history.get('exception_rate_pct', '?')}% exception rate"
+            )
+        if a.get("validation_flags"):
+            parts.append("- **Validation flags:**")
+            for fl in a["validation_flags"]:
+                parts.append(f"  - {fl}")
+        parts.append("")
+
+    # JTBD coverage gaps
+    parts.append("## JTBD coverage gaps")
+    parts.append("")
+    if not jtbd_catalog:
+        parts.append("_No `strategy/jtbd-list.md` found; coverage check skipped._")
+    elif gaps["uncovered_jtbd"] or gaps["agents_without_jtbd"]:
+        if gaps["uncovered_jtbd"]:
+            parts.append("**JTBD with no agent assigned:**")
+            parts.append("")
+            for j in gaps["uncovered_jtbd"]:
+                parts.append(f"- {j}")
+            parts.append("")
+        if gaps["agents_without_jtbd"]:
+            parts.append("**Agents without a JTBD in the catalog:**")
+            parts.append("")
+            for a in gaps["agents_without_jtbd"]:
+                parts.append(f"- {a}")
+            parts.append("")
+    else:
+        parts.append("_All JTBD covered; all agents map to a catalog entry._")
+    parts.append("")
+
+    # Contradiction handling summary
+    parts.append("## Contradiction handling: agents-as-team-vs-agents-as-tools")
+    parts.append("")
+    parts.append(contradiction_summary)
+    parts.append("")
+    parts.append("Per-agent shape distribution:")
+    parts.append("")
+    parts.append("| Shape | Count |")
+    parts.append("|---|---:|")
+    from collections import Counter as _C
+    shape_count = _C(a.get("picked_shape", "?") for a in agents)
+    for s, n in shape_count.most_common():
+        parts.append(f"| {s} | {n} |")
+    parts.append("")
+
+    parts.append("## Patterns and contradictions")
+    parts.append("")
+    parts.append("- `knowledge/patterns/agents-mapped-to-jtbd.md`")
+    parts.append("- `knowledge/patterns/agent-first-gtm.md`")
+    parts.append("- `knowledge/patterns/agents-as-product-users.md`")
+    parts.append("- `knowledge/patterns/substrate-runs-loop-humans-run-alignment.md`")
+    parts.append("- `knowledge/patterns/jtbd-as-buyer-mental-model.md`")
+    parts.append("- `knowledge/contradictions/agents-as-team-vs-agents-as-tools.md`")
+    return "\n".join(parts)
+
+
+def render_checkpoint_contract(agents):
+    parts = []
+    parts.append("---")
+    parts.append(f"title: agent JTBD checkpoint contract, {CLIENT}, {TODAY}")
+    parts.append(f"client: {CLIENT}")
+    parts.append("produced_by: agent-jtbd-map")
+    parts.append("---")
+    parts.append("")
+    parts.append(f"# Agent JTBD checkpoint contract, {CLIENT}, {TODAY}")
+    parts.append("")
+    parts.append("Each row below is a contract a named human signs off on. Per `knowledge/patterns/agents-mapped-to-jtbd.md`. The contract is reviewed quarterly; an agent without a contract refuses to advance to the next trust tier.")
+    parts.append("")
+    parts.append("## Contract rows")
+    parts.append("")
+    for a in agents:
+        parts.append(f"### {a['name']}")
+        parts.append("")
+        parts.append(f"- **JTBD owned:** {a.get('jtbd', '?')}")
+        parts.append(f"- **Named human checkpoint:** {a.get('human_checkpoint', '?')}")
+        parts.append(f"- **Review cadence:** {_default_cadence(a)}")
+        parts.append(f"- **Kill-switch trigger:** {a.get('escalation_trigger', '?')}")
+        parts.append(f"- **Trust tier (current):** {a.get('trust_tier_current', '?')}")
+        parts.append(f"- **Trust tier (next, on evidence):** {_next_tier(a)}")
+        parts.append(f"- **Operating loop:** {a.get('operating_loop', '?')}")
+        history = a.get("last_60d_run_history") or {}
+        if history:
+            parts.append(
+                f"- **Evidence (last 60d):** {history.get('runs_total', '?')} runs, "
+                f"{history.get('exception_rate_pct', '?')}% exception rate"
+            )
+        else:
+            parts.append("- **Evidence (last 60d):** _missing — instrument before next tier upgrade_")
+        parts.append("- **Sign-off:** `[ ] reviewed` `[ ] approved`")
+        parts.append("")
+    return "\n".join(parts)
+
+
+def _default_cadence(agent):
+    tier = agent.get("trust_tier_current", "")
+    if tier == "review-all":
+        return "every output reviewed before ship"
+    if tier == "spot-check":
+        return "weekly sample (>=10%) reviewed"
+    if tier == "exception-only":
+        return "agent-flagged outputs reviewed; weekly summary read"
+    if tier == "unattended":
+        return "monthly evidence read; kill-switch monitored real-time"
+    return "set on first review"
+
+
+def _next_tier(agent):
+    tier = agent.get("trust_tier_current", "")
+    try:
+        idx = VALID_TRUST.index(tier)
+    except ValueError:
+        return "?"
+    if idx >= len(VALID_TRUST) - 1:
+        return "max-tier"
+    return VALID_TRUST[idx + 1]
+
+
+def main():
+    agents_path = find_agents_yaml(AGENTS_YAML_ARG)
+    if not agents_path.exists():
+        refuse(
+            "missing-agents-yaml",
+            f"clients/{CLIENT}/product/agents.yaml required (or pass --agents-yaml). "
+            f"See skills/agent-jtbd-map/SKILL.md for the schema.",
+        )
+
+    yaml_text = agents_path.read_text(encoding="utf-8")
+    parsed = parse_yaml(yaml_text)
+    agents = parsed.get("agents") or []
+    if not agents:
+        refuse("missing-agents", f"{agents_path} has no `agents:` list")
+
+    jtbd_path = find_jtbd_list(JTBD_LIST_ARG)
+    jtbd_catalog = load_jtbd_list(jtbd_path)
+
+    # Validate + pick shape per agent
+    for a in agents:
+        flags = []
+        flags.extend(validate_jtbd_form(a.get("jtbd", "")))
+        flags.extend(validate_trust_tier(a))
+        flags.extend(validate_loop(a))
+        flags.extend(validate_checkpoint(a))
+
+        persistence = a.get("persistence")
+        heterogeneity = a.get("heterogeneity")
+        if persistence not in VALID_PERSISTENCE:
+            flags.append(f"persistence invalid: '{persistence}'")
+        if heterogeneity not in VALID_HETEROGENEITY:
+            flags.append(f"heterogeneity invalid: '{heterogeneity}'")
+
+        shape, rationale = pick_shape(persistence, heterogeneity)
+        a["picked_shape"] = shape
+        a["shape_rationale"] = rationale
+        a["validation_flags"] = flags
+
+    # JTBD coverage gaps
+    catalog_set = set(j.lower().strip() for j in jtbd_catalog if j)
+    agent_jtbds = set((a.get("jtbd") or "").lower().strip() for a in agents)
+    uncovered = []
+    for j in jtbd_catalog:
+        if not any(_jtbd_overlap(j.lower(), aj) for aj in agent_jtbds):
+            uncovered.append(j)
+    agents_without = []
+    if catalog_set:
+        for a in agents:
+            aj = (a.get("jtbd") or "").lower()
+            if not any(_jtbd_overlap(aj, c) for c in catalog_set):
+                agents_without.append(a["name"])
+    gaps = {"uncovered_jtbd": uncovered, "agents_without_jtbd": agents_without}
+
+    contradiction_summary = (
+        "Per `knowledge/contradictions/agents-as-team-vs-agents-as-tools.md`, the contradiction "
+        "resolves on persistence + heterogeneity. The skill refuses a global default and picks "
+        "per-agent. Heterogeneous-persistent → team-shape (Vo). Homogeneous-ephemeral → tool-shape "
+        "(Cherny). The mixed cases (`team-light`, `tool-bounded`) are explicit interpolations and "
+        "are logged so the operator can choose to formalise them."
+    )
+
+    md = render_md(agents, jtbd_catalog, gaps, contradiction_summary)
+    md_path = STRAT_DIR / f"agent-jtbd-map-{TODAY}.md"
+    md_path.write_text(md, encoding="utf-8")
+
+    contract_md = render_checkpoint_contract(agents)
+    contract_path = STRAT_DIR / f"agent-jtbd-checkpoint-contract-{TODAY}.md"
+    contract_path.write_text(contract_md, encoding="utf-8")
+
+    json_payload = {
+        "client": CLIENT,
+        "scope": SCOPE,
+        "generated_at": TODAY,
+        "agents_total": len(agents),
+        "agents": [
+            {
+                "name": a.get("name"),
+                "jtbd": a.get("jtbd"),
+                "persistence": a.get("persistence"),
+                "heterogeneity": a.get("heterogeneity"),
+                "picked_shape": a.get("picked_shape"),
+                "shape_rationale": a.get("shape_rationale"),
+                "trust_tier_current": a.get("trust_tier_current"),
+                "loop_class": a.get("loop_class"),
+                "operating_loop": a.get("operating_loop"),
+                "human_checkpoint": a.get("human_checkpoint"),
+                "escalation_trigger": a.get("escalation_trigger"),
+                "last_60d_run_history": a.get("last_60d_run_history"),
+                "validation_flags": a.get("validation_flags", []),
+            }
+            for a in agents
+        ],
+        "jtbd_catalog_size": len(jtbd_catalog),
+        "uncovered_jtbd": uncovered,
+        "agents_without_jtbd": agents_without,
+        "agents_yaml_source": str(agents_path.relative_to(SUBSTRATE_ROOT)),
+        "jtbd_list_source": str(jtbd_path.relative_to(SUBSTRATE_ROOT)) if jtbd_path.exists() else None,
+    }
+    json_path = STRAT_DIR / f"agent-jtbd-map-{TODAY}.json"
+    json_path.write_text(json.dumps(json_payload, indent=2), encoding="utf-8")
+
+    print(f"[agent-jtbd-map] markdown:  {md_path}")
+    print(f"[agent-jtbd-map] json:      {json_path}")
+    print(f"[agent-jtbd-map] contract:  {contract_path}")
+
+    flagged = [a for a in agents if a.get("validation_flags")]
+    if flagged:
+        print(
+            f"[agent-jtbd-map] WARN: {len(flagged)}/{len(agents)} agents have validation flags. "
+            f"Review and update `agents.yaml`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    sys.exit(0)
+
+
+def _jtbd_overlap(a, b):
+    """Loose overlap: share at least 3 content words >= 4 chars."""
+    a_words = {w for w in re.findall(r"[a-z]{4,}", a or "")}
+    b_words = {w for w in re.findall(r"[a-z]{4,}", b or "")}
+    return len(a_words & b_words) >= 3
+
+
+main()
+PYEOF

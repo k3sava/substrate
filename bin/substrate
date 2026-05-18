@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# substrate — top-level dispatcher for skills.
+# Usage: substrate <skill> <args...>
+# List available skills: substrate --list
+#
+# Each skill resolves to skills/<skill>/bin/<skill> if present.
+# Backwards-compat: agents/bin/<skill> is also checked, for legacy wirings.
+#
+# Exit codes pass through from the underlying skill.
+
+set -uo pipefail
+
+# Backwards-compat: if FLYWHEEL_ROOT is set but SUBSTRATE_ROOT isn't, alias and
+# warn. The variable rename happened in v1.2; FLYWHEEL_ROOT still works for one
+# release cycle so existing LaunchAgents and shell rcs don't break overnight.
+if [ -n "${FLYWHEEL_ROOT:-}" ] && [ -z "${SUBSTRATE_ROOT:-}" ]; then
+  echo "DEPRECATED: FLYWHEEL_ROOT is deprecated; use SUBSTRATE_ROOT." >&2
+  SUBSTRATE_ROOT="$FLYWHEEL_ROOT"
+fi
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+# Keep FLYWHEEL_ROOT exported alongside SUBSTRATE_ROOT for the deprecation
+# cycle. Skills can be ported from one to the other without a flag day.
+FLYWHEEL_ROOT="$SUBSTRATE_ROOT"
+export SUBSTRATE_ROOT FLYWHEEL_ROOT
+
+cmd="${1:-}"
+
+case "$cmd" in
+  ""|"--help"|"-h")
+    cat <<EOF
+substrate — skills runtime dispatcher
+
+Usage:
+  substrate <skill> <args...>     run a skill
+  substrate --list                list registered skills
+  substrate --version             show version
+
+Common skills (run 'substrate --list' for the full set):
+  voice-enforce <asset>           gate an asset against brand voice (kill-list, em-dash, throat-clearing)
+  pre-publish-check <asset>       composite gate: substrate-cite + voice + claim-verify + LP-CRO
+  audience-test <asset> [axis]    run synthetic-audience panel against an asset
+  lp-ship <asset>                 ship a landing page (preflight + voice + measurement contract)
+  positioning-forge --diagnose    Dunford 5-step positioning diagnostic
+  competitive-scout               competitive intel sweep -> signals inbox
+  open-goal / score-goal          open or resolve a falsifiable goal on the ledger
+
+Companion CLIs (top-level bin/):
+  substrate-status                operator review queue + cron health
+  substrate-dashboard             regenerate web dashboard
+  substrate-bootstrap-prospect    initialize clients/<prospect>/ scaffold
+
+Environment:
+  SUBSTRATE_ROOT                  substrate repo root (default: derived from script location)
+  FLYWHEEL_ROOT                   deprecated alias for SUBSTRATE_ROOT (still accepted)
+
+EOF
+    exit 0
+    ;;
+  "--list")
+    echo "Registered skills (with bin/ shim):"
+    for d in "$SUBSTRATE_ROOT"/skills/*/; do
+      name=$(basename "$d")
+      if [ -x "$d/bin/$name" ]; then
+        echo "  ✓ $name (wired at skills/$name/bin/$name)"
+      elif [ -d "$d/bin" ] && ls "$d/bin/"* >/dev/null 2>&1; then
+        # Skill ships a bin script under a different name (e.g. audience-test/bin/synthetic-audience-test).
+        # Surface the actual entry point so operators know what runs.
+        actual=$(ls "$d/bin/" 2>/dev/null | head -1)
+        echo "  ~ $name (entrypoint: skills/$name/bin/$actual)"
+      else
+        echo "  · $name (spec only — see SKILL.md)"
+      fi
+    done
+    exit 0
+    ;;
+  "--version")
+    if [ -f "$SUBSTRATE_ROOT/VERSION" ]; then
+      echo "substrate $(cat "$SUBSTRATE_ROOT/VERSION")"
+    else
+      echo "substrate (version file missing)"
+    fi
+    exit 0
+    ;;
+esac
+
+shift
+skill="$cmd"
+skill_bin="$SUBSTRATE_ROOT/skills/$skill/bin/$skill"
+agent_bin="$SUBSTRATE_ROOT/agents/bin/$skill"
+
+# BRIEF.md hard-gate for customer-facing skills.
+# Author-from-memory failure mode: any skill that drafts canonical claims must
+# read BRIEF.md first. Dispatcher enforces; skills can't bypass via direct
+# invocation through `substrate`.
+BRIEF_REQUIRED_SKILLS=" positioning-forge lp-ship narrative-compose audience-test voice-enforce pre-publish-check humanizer claim-verify dunford-value-frame messaging-matrix campaign-strategy launch-plan help-docs design-thinking-content icp-cut narrative-strategy "
+
+# Resolve the active client. Order of precedence:
+#   1. --client <slug> on the command line (most explicit)
+#   2. SUBSTRATE_CLIENT env var (per-shell default)
+#   3. CLIENT env var (legacy alias, kept for one cycle)
+#   4. examples/sample-client (a clean stub shipped with the repo)
+client=""
+client_args=("$@")
+i=0
+while [ $i -lt ${#client_args[@]} ]; do
+  case "${client_args[$i]}" in
+    --client)
+      next=$((i + 1))
+      if [ $next -lt ${#client_args[@]} ]; then
+        client="${client_args[$next]}"
+      fi
+      ;;
+    --client=*)
+      client="${client_args[$i]#--client=}"
+      ;;
+  esac
+  i=$((i + 1))
+done
+client="${client:-${SUBSTRATE_CLIENT:-${CLIENT:-}}}"
+
+if [[ "$BRIEF_REQUIRED_SKILLS" == *" $skill "* ]]; then
+  if [ -z "$client" ]; then
+    echo "WARNING: $skill is BRIEF-gated but no client resolved." >&2
+    echo "  Pass --client <slug>, set SUBSTRATE_CLIENT, or place a BRIEF.md under clients/<slug>/." >&2
+    echo "  Falling back to clients/sample-client/BRIEF.md if present." >&2
+    client="sample-client"
+  fi
+  brief="$SUBSTRATE_ROOT/clients/$client/BRIEF.md"
+  if [ ! -f "$brief" ]; then
+    echo "REFUSED: $skill requires clients/$client/BRIEF.md (missing)." >&2
+    echo "Reason: customer-facing skills must read BRIEF.md before drafting." >&2
+    echo "Fix: regenerate BRIEF.md from canonical context, then re-run." >&2
+    echo "      bin/substrate-bootstrap-prospect $client    # creates the scaffold" >&2
+    exit 65
+  fi
+  # Decay check: BRIEF.md must be ≤ 14 days old (matches the freshness window).
+  if find "$brief" -mtime +14 2>/dev/null | grep -q .; then
+    age_days=$(( ( $(date +%s) - $(stat -f %m "$brief") ) / 86400 ))
+    echo "REFUSED: clients/$client/BRIEF.md is stale (${age_days}d > 14d)." >&2
+    echo "Fix: refresh BRIEF.md from current context, then re-run $skill." >&2
+    echo "Override (not recommended): SUBSTRATE_BRIEF_OVERRIDE=1 substrate $skill ..." >&2
+    if [ "${SUBSTRATE_BRIEF_OVERRIDE:-${FLYWHEEL_BRIEF_OVERRIDE:-0}}" != "1" ]; then
+      exit 66
+    fi
+    echo "  (proceeding under SUBSTRATE_BRIEF_OVERRIDE=1)" >&2
+  fi
+  export SUBSTRATE_BRIEF_PATH="$brief"
+  # Legacy alias for skills that still read FLYWHEEL_BRIEF_PATH.
+  export FLYWHEEL_BRIEF_PATH="$brief"
+  export SUBSTRATE_CLIENT="$client"
+fi
+
+if [ -x "$skill_bin" ]; then
+  exec "$skill_bin" "$@"
+fi
+
+# Also check agents/bin/ (signal-analyst, preflight-gate, etc.)
+if [ -x "$agent_bin" ]; then
+  exec "$agent_bin" "$@"
+fi
+
+# Some skills ship a single bin script with a non-matching name
+# (e.g. skills/audience-test/bin/synthetic-audience-test). Try the first
+# executable we find under the skill's bin/ directory.
+skill_dir="$SUBSTRATE_ROOT/skills/$skill"
+if [ -d "$skill_dir/bin" ]; then
+  for candidate in "$skill_dir/bin/"*; do
+    if [ -x "$candidate" ]; then
+      exec "$candidate" "$@"
+    fi
+  done
+fi
+
+# Skill not yet wired: surface SKILL.md if it exists, else error.
+spec="$skill_dir/SKILL.md"
+if [ -f "$spec" ]; then
+  echo "skill '$skill' has spec but no runtime yet." >&2
+  echo "spec at: $spec" >&2
+  exit 64
+fi
+
+echo "unknown skill: $skill" >&2
+echo "run 'substrate --list' to see registered skills" >&2
+exit 64

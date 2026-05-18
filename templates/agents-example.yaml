@@ -1,0 +1,66 @@
+# Example agents.yaml — input to skills/agent-jtbd-map.
+#
+# Drop this at clients/<client>/product/agents.yaml after editing.
+# Per knowledge/patterns/agents-mapped-to-jtbd.md, every agent must:
+#   1. Have a JTBD in the form: "Help me [verb] [object] when [situation]"
+#   2. Declare persistence + heterogeneity (used to pick team-shape vs tool-shape)
+#   3. Name a human checkpoint
+#   4. Declare escalation_trigger and current trust tier
+# Without these fields the skill refuses.
+
+agents:
+  - name: "Inbound Triage Agent"
+    jtbd: "Help me classify inbound leads when 50+ arrive per day so I can prioritize founder-time on tier-1 leads"
+    persistence: "persistent"
+    heterogeneity: "heterogeneous"
+    trust_tier_current: "spot-check"
+    human_checkpoint: "Sales Manager (per-shift review)"
+    escalation_trigger: "deal value > $25k OR no positioning anchor matched"
+    loop_class: "tier-2-autonomous-scoped"
+    operating_loop: "CASH-automate"
+    last_60d_run_history:
+      runs_total: 4200
+      exceptions: 7
+      exception_rate_pct: 0.17
+
+  - name: "Comparison-Page Generator"
+    jtbd: "Help me draft a comparison page when an SDR receives a 'how do you compare to X' question so I can ship within an hour"
+    persistence: "ephemeral"
+    heterogeneity: "homogeneous"
+    trust_tier_current: "review-all"
+    human_checkpoint: "PMM lead (full review before publish)"
+    escalation_trigger: "named-competitor not in clients/<client>/competitive/ ledger"
+    loop_class: "tier-1-assistive"
+    operating_loop: "CASH-collect"
+    last_60d_run_history:
+      runs_total: 32
+      exceptions: 4
+      exception_rate_pct: 12.5
+
+  - name: "Renewal Risk Scout"
+    jtbd: "Help me detect renewal-risk signals when an account's usage drops 30% week-over-week so I can reach out before notice"
+    persistence: "persistent"
+    heterogeneity: "homogeneous"
+    trust_tier_current: "exception-only"
+    human_checkpoint: "CSM owning the account (review weekly digest)"
+    escalation_trigger: "ARR > $50k AND drop > 50%"
+    loop_class: "tier-2-autonomous-scoped"
+    operating_loop: "CCCD-calibrate"
+    last_60d_run_history:
+      runs_total: 1280
+      exceptions: 3
+      exception_rate_pct: 0.23
+
+  - name: "Knowledge-Base Auditor"
+    jtbd: "Help me find stale help-doc claims when product docs go more than 60 days without update so I can refresh before customers hit them"
+    persistence: "persistent"
+    heterogeneity: "heterogeneous"
+    trust_tier_current: "review-all"
+    human_checkpoint: "Help-Docs lead (weekly audit batch)"
+    escalation_trigger: "doc references a deprecated API endpoint"
+    loop_class: "tier-1-assistive"
+    operating_loop: "CCCD-develop"
+    last_60d_run_history:
+      runs_total: 240
+      exceptions: 18
+      exception_rate_pct: 7.5

@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""activation-funnel-audit, diagnose signup -> first-value -> retained-week-N.
+
+Reads a real events CSV, tests candidate value events for retention-curve
+divergence, names the activation event, and writes a structured funnel
+artifact under clients/<client>/retention/.
+
+Usage:
+    activation-funnel-audit --client <client> --events <path> \
+        [--candidate-events e1,e2,...] [--window-hours 24] [--retention-week 2]
+
+Exit codes:
+    0, funnel written
+    3, preflight refusal (substrate gap, missing CSV, no defensible candidate)
+    4, invalid args
+    5, config error (SUBSTRATE_ROOT not set)
+
+This is a real runtime. It parses the CSV, segments cohorts, computes
+retention curves per candidate, ranks them by divergence at the chosen
+retention week, and either names the activation event or refuses.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from statistics import median
+
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+# Standard event taxonomy. The skill treats anything in DEFAULT_VALUE_CANDIDATES
+# as a candidate activation event when --candidate-events is not given.
+ONBOARDING_EVENTS = {"signup", "onboarding_started", "onboarding_completed", "login"}
+DEFAULT_VALUE_CANDIDATES = [
+    "first_value_event",
+    "invited_teammate",
+    "integration_added",
+    "session_active",
+    "upgrade_initiated",
+    "paid_started",
+    "seat_added",
+]
+
+MIN_COHORT_SIZE = 30  # Reforge minimum-cohort guidance
+MIN_DIVERGENCE_POINTS = 10  # absolute pp gap at retention-week N
+
+
+def parse_ts(value: str) -> datetime | None:
+    """Parse ISO-8601 timestamps; return None if unparseable."""
+    if not value:
+        return None
+    s = value.strip()
+    # Handle both Z-suffix and +00:00 forms
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        # Try plain datetime then assume UTC
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def load_events(path: Path) -> tuple[list[dict], int, set[str]]:
+    """Load events CSV. Returns (rows, count, distinct event names)."""
+    rows: list[dict] = []
+    event_names: set[str] = set()
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "user_id" not in reader.fieldnames or "event_name" not in reader.fieldnames or "ts" not in reader.fieldnames:
+            raise ValueError(
+                f"events CSV missing required columns user_id/event_name/ts. Found: {reader.fieldnames}"
+            )
+        for raw in reader:
+            ts = parse_ts(raw.get("ts", ""))
+            if not ts:
+                continue
+            rows.append({
+                "user_id": raw["user_id"],
+                "event_name": raw["event_name"],
+                "ts": ts,
+                "props": {k: v for k, v in raw.items() if k.startswith("property_")},
+            })
+            event_names.add(raw["event_name"])
+    return rows, len(rows), event_names
+
+
+def index_by_user(rows: list[dict]) -> dict[str, list[dict]]:
+    by_user: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_user[r["user_id"]].append(r)
+    for uid in by_user:
+        by_user[uid].sort(key=lambda x: x["ts"])
+    return by_user
+
+
+def signup_ts(events: list[dict]) -> datetime | None:
+    for ev in events:
+        if ev["event_name"] == "signup":
+            return ev["ts"]
+    # Fallback: earliest event
+    return events[0]["ts"] if events else None
+
+
+def hit_event_within(events: list[dict], event_name: str, signup: datetime, hours: int) -> bool:
+    cutoff = signup + timedelta(hours=hours)
+    for ev in events:
+        if ev["event_name"] == event_name and signup <= ev["ts"] <= cutoff:
+            return True
+    return False
+
+
+def hours_to_event(events: list[dict], event_name: str, signup: datetime) -> float | None:
+    for ev in events:
+        if ev["event_name"] == event_name and ev["ts"] >= signup:
+            return (ev["ts"] - signup).total_seconds() / 3600.0
+    return None
+
+
+def active_in_week(events: list[dict], signup: datetime, week: int) -> bool:
+    """Active = at least one session_active event within the 7-day window ending at week N."""
+    start = signup + timedelta(days=7 * (week - 1))
+    end = signup + timedelta(days=7 * week)
+    for ev in events:
+        if ev["event_name"] == "session_active" and start <= ev["ts"] < end:
+            return True
+    return False
+
+
+def split_retention(
+    by_user: dict[str, list[dict]],
+    candidate: str,
+    window_hours: int,
+    retention_week: int,
+) -> dict:
+    """
+    For a candidate event, split users into 'hit' vs 'missed' (within window),
+    compute week-N retention per split, and return diagnostics.
+    """
+    hit_active = 0
+    hit_total = 0
+    miss_active = 0
+    miss_total = 0
+    times_hit: list[float] = []
+    for uid, events in by_user.items():
+        signup = signup_ts(events)
+        if signup is None:
+            continue
+        # Only score users who have at least retention_week*7 days of observable history
+        observation_floor = signup + timedelta(days=7 * retention_week)
+        latest_event = max(ev["ts"] for ev in events)
+        if latest_event < observation_floor:
+            # cohort too young; skip from retention denominator
+            continue
+        hit = hit_event_within(events, candidate, signup, window_hours)
+        active = active_in_week(events, signup, retention_week)
+        if hit:
+            hit_total += 1
+            if active:
+                hit_active += 1
+            t = hours_to_event(events, candidate, signup)
+            if t is not None:
+                times_hit.append(t)
+        else:
+            miss_total += 1
+            if active:
+                miss_active += 1
+
+    hit_rate = (hit_active / hit_total * 100.0) if hit_total else 0.0
+    miss_rate = (miss_active / miss_total * 100.0) if miss_total else 0.0
+    return {
+        "candidate": candidate,
+        "hit_total": hit_total,
+        "miss_total": miss_total,
+        "hit_retention_pct": round(hit_rate, 1),
+        "miss_retention_pct": round(miss_rate, 1),
+        "divergence_pp": round(hit_rate - miss_rate, 1),
+        "p50_hours_to_event": round(median(times_hit), 1) if times_hit else None,
+        "p75_hours_to_event": round(percentile(times_hit, 75), 1) if times_hit else None,
+        "p90_hours_to_event": round(percentile(times_hit, 90), 1) if times_hit else None,
+        "n_eligible": hit_total + miss_total,
+    }
+
+
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * pct / 100.0
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    if f == c:
+        return s[f]
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
+def funnel_steps(by_user: dict[str, list[dict]], activation: str) -> list[dict]:
+    """
+    Compute the canonical funnel:
+        signup -> onboarding_started -> onboarding_completed -> first_value_event
+        -> <activation> -> week-1 active -> week-2 retained.
+    """
+    steps = ["signup", "onboarding_started", "onboarding_completed", "first_value_event"]
+    if activation not in steps:
+        steps.append(activation)
+    steps.append("week_1_active")
+    steps.append("week_2_retained")
+
+    counts = {s: 0 for s in steps}
+    for uid, events in by_user.items():
+        names = {ev["event_name"] for ev in events}
+        signup = signup_ts(events)
+        if signup is None:
+            continue
+        for s in ("signup", "onboarding_started", "onboarding_completed", "first_value_event"):
+            if s in names:
+                counts[s] += 1
+        if activation in names and activation not in ("signup", "onboarding_started", "onboarding_completed", "first_value_event"):
+            counts[activation] += 1
+        if active_in_week(events, signup, 1):
+            counts["week_1_active"] += 1
+        if active_in_week(events, signup, 2):
+            counts["week_2_retained"] += 1
+
+    rows = []
+    last = None
+    first = None
+    for s in steps:
+        n = counts[s]
+        if first is None:
+            first = n
+        step_to_step = (n / last * 100.0) if last else 100.0
+        signup_to_step = (n / first * 100.0) if first else 0.0
+        rows.append({
+            "step": s,
+            "n": n,
+            "step_to_step_pct": round(step_to_step, 1),
+            "signup_to_step_pct": round(signup_to_step, 1),
+        })
+        last = n
+    return rows
+
+
+def segment_dropoff(
+    by_user: dict[str, list[dict]],
+    activation: str,
+    largest_drop_step: str,
+    prior_step: str,
+) -> list[dict]:
+    """Break down the largest drop by signup source / persona / plan."""
+    seg_data: dict[tuple[str, str, str], dict[str, int]] = defaultdict(lambda: {"in": 0, "out": 0})
+    for uid, events in by_user.items():
+        names = {ev["event_name"] for ev in events}
+        # Prior-step gate: only count users who reached the prior step
+        if prior_step == "week_1_active":
+            signup = signup_ts(events)
+            reached_prior = bool(signup) and active_in_week(events, signup, 1)
+        elif prior_step == "week_2_retained":
+            signup = signup_ts(events)
+            reached_prior = bool(signup) and active_in_week(events, signup, 2)
+        else:
+            reached_prior = prior_step in names
+
+        if not reached_prior:
+            continue
+
+        # Did they reach the largest_drop_step?
+        if largest_drop_step == "week_1_active":
+            signup = signup_ts(events)
+            reached_drop = bool(signup) and active_in_week(events, signup, 1)
+        elif largest_drop_step == "week_2_retained":
+            signup = signup_ts(events)
+            reached_drop = bool(signup) and active_in_week(events, signup, 2)
+        else:
+            reached_drop = largest_drop_step in names
+
+        # Pull segment props from the signup row
+        signup_row = next((ev for ev in events if ev["event_name"] == "signup"), events[0])
+        source = signup_row["props"].get("property_signup_source", "unknown")
+        persona = signup_row["props"].get("property_persona", "unknown")
+        plan = signup_row["props"].get("property_plan", "unknown")
+        key = (source, persona, plan)
+        if reached_drop:
+            seg_data[key]["in"] += 1
+        else:
+            seg_data[key]["out"] += 1
+
+    segs = []
+    for (source, persona, plan), counts in seg_data.items():
+        total = counts["in"] + counts["out"]
+        if total < 5:  # too small to be informative
+            continue
+        conv = counts["in"] / total * 100.0
+        segs.append({
+            "signup_source": source,
+            "persona": persona,
+            "plan": plan,
+            "n": total,
+            "reached_pct": round(conv, 1),
+            "dropped": counts["out"],
+        })
+    segs.sort(key=lambda x: x["reached_pct"])
+    return segs[:10]
+
+
+def write_artifact(
+    out_path: Path,
+    json_path: Path,
+    client: str,
+    events_path: Path,
+    events_count: int,
+    distinct_events: list[str],
+    candidate_results: list[dict],
+    activation_event: str | None,
+    refusal_reason: str | None,
+    funnel: list[dict],
+    largest_drop: dict,
+    drop_segs: list[dict],
+    today: str,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: activation funnel audit, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [aha-moment-defines-activation, retention-cohort-curves-over-blended-rates]")
+    lines.append(f"client: {client}")
+    lines.append(f"events_source: {events_path.relative_to(SUBSTRATE_ROOT) if str(events_path).startswith(str(SUBSTRATE_ROOT)) else events_path}")
+    lines.append(f"events_row_count: {events_count}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Activation funnel audit, {client}, {today}")
+    lines.append("")
+    lines.append(f"Source: `{events_path}` (rows: {events_count}; ingested {today})")
+    lines.append("")
+    lines.append(f"Distinct events observed: {', '.join(sorted(distinct_events)[:20])}{'...' if len(distinct_events) > 20 else ''}")
+    lines.append("")
+
+    lines.append("## 1. Activation candidate test")
+    lines.append("")
+    lines.append("Each candidate event was tested for retention-curve divergence at the chosen retention week. The candidate with the steepest divergence, given a sufficient cohort size, is named the activation event.")
+    lines.append("")
+    lines.append("| Candidate event | n eligible | hit retention | missed retention | divergence (pp) | p50 hrs to event |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for r in candidate_results:
+        p50 = r["p50_hours_to_event"] if r["p50_hours_to_event"] is not None else "—"
+        lines.append(
+            f"| `{r['candidate']}` | {r['n_eligible']} | {r['hit_retention_pct']}% | {r['miss_retention_pct']}% | {r['divergence_pp']:+.1f} | {p50} |"
+        )
+    lines.append("")
+
+    if refusal_reason:
+        lines.append(f"### Refusal: {refusal_reason}")
+        lines.append("")
+        lines.append("No candidate event produced sufficient retention-curve divergence given the cohort sizes available. Surfaced for the operator:")
+        lines.append("")
+        lines.append("- Are there candidate value events not in this list? Cite `clients/<client>/product-knowledge/value-events.md` and add them via `--candidate-events`.")
+        lines.append("- Is the events taxonomy correct? A behavioral event may exist under a different name in the export.")
+        lines.append("- Has the retention week been chosen correctly? Try `--retention-week 1` or `4` if the product cycle is shorter or longer.")
+        lines.append("- If candidates are exhausted, this is a product-level finding: the product has no event whose presence predicts retention. That is a product investigation, not a marketing one.")
+        lines.append("")
+        lines.append("## 2-5. Skipped (no defensible activation event).")
+    else:
+        assert activation_event is not None
+        lines.append(f"### Named activation event: `{activation_event}`")
+        lines.append("")
+        winning = next(r for r in candidate_results if r["candidate"] == activation_event)
+        lines.append(
+            f"- Hit cohort retention at retention-week: {winning['hit_retention_pct']}% (n={winning['hit_total']})."
+        )
+        lines.append(
+            f"- Miss cohort retention at retention-week: {winning['miss_retention_pct']}% (n={winning['miss_total']})."
+        )
+        lines.append(f"- Divergence: {winning['divergence_pp']:+.1f} pp.")
+        lines.append("")
+
+        lines.append("## 2. Funnel conversion")
+        lines.append("")
+        lines.append("| Step | n | Step-to-step | Signup-to-step |")
+        lines.append("|---|---:|---:|---:|")
+        for row in funnel:
+            lines.append(
+                f"| `{row['step']}` | {row['n']} | {row['step_to_step_pct']}% | {row['signup_to_step_pct']}% |"
+            )
+        lines.append("")
+
+        lines.append("## 3. Largest drop-off cohorts")
+        lines.append("")
+        lines.append(
+            f"Largest step-to-step drop: `{largest_drop['from']}` → `{largest_drop['to']}` "
+            f"({largest_drop['from_n']} → {largest_drop['to_n']}, "
+            f"{largest_drop['drop_pct']:.1f}% conversion)."
+        )
+        lines.append("")
+        if drop_segs:
+            lines.append("Worst-performing segments at this step (signup_source × persona × plan):")
+            lines.append("")
+            lines.append("| Source | Persona | Plan | n | Reached % |")
+            lines.append("|---|---|---|---:|---:|")
+            for s in drop_segs[:10]:
+                lines.append(
+                    f"| {s['signup_source']} | {s['persona']} | {s['plan']} | {s['n']} | {s['reached_pct']}% |"
+                )
+        else:
+            lines.append("Segment breakdown unavailable: required property columns missing or cohort too small.")
+        lines.append("")
+
+        lines.append("## 4. Time-to-aha statistics (for users who activated)")
+        lines.append("")
+        lines.append(f"- p50 (median): {winning['p50_hours_to_event']} hours")
+        lines.append(f"- p75: {winning['p75_hours_to_event']} hours")
+        lines.append(f"- p90: {winning['p90_hours_to_event']} hours")
+        lines.append("")
+        lines.append("If p90 sits past the activation window, the window may be too tight and is excluding users who would activate. Consider widening `--window-hours`.")
+        lines.append("")
+
+        lines.append("## 5. Substrate citations")
+        lines.append("")
+        lines.append(f"- Events export: `{events_path}` (rows: {events_count})")
+        lines.append(f"- ICP layer: `clients/{client}/icp/icp.md`")
+        lines.append(f"- Product knowledge: `clients/{client}/product-knowledge/product-knowledge.md`")
+        lines.append("- Pattern grounding: `knowledge/patterns/aha-moment-defines-activation.md` (procedure: retention-curve segmentation across candidates).")
+        lines.append("- Pattern grounding: `knowledge/patterns/retention-cohort-curves-over-blended-rates.md` (cohort-conditioned retention math).")
+        lines.append("")
+
+    lines.append("## Refusal log")
+    lines.append("")
+    rejected = [r for r in candidate_results if r["candidate"] != activation_event]
+    if rejected:
+        for r in rejected:
+            why_parts = []
+            if r["hit_total"] < MIN_COHORT_SIZE:
+                why_parts.append(f"hit cohort too small (n={r['hit_total']} < {MIN_COHORT_SIZE})")
+            if abs(r["divergence_pp"]) < MIN_DIVERGENCE_POINTS:
+                why_parts.append(f"divergence {r['divergence_pp']:+.1f}pp below {MIN_DIVERGENCE_POINTS}pp floor")
+            why = "; ".join(why_parts) or "passed but lower divergence than winner"
+            lines.append(f"- `{r['candidate']}`: {why}")
+    else:
+        lines.append("No candidates rejected.")
+    lines.append("")
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append(f"- `skills/retention-cohort-analysis/bin/retention-cohort-analysis --client {client}`, pull cohort retention curves with the named activation event.")
+    lines.append(f"- `skills/churn-diagnose/bin/churn-diagnose --client {client}`, diagnose churn drivers using the activation gap as a baseline.")
+    lines.append("- `routines/retention-monthly.md`, schedule the next read.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+    json_payload = {
+        "client": client,
+        "generated_at": today,
+        "events_source": str(events_path),
+        "events_row_count": events_count,
+        "activation_event": activation_event,
+        "refusal_reason": refusal_reason,
+        "candidate_results": candidate_results,
+        "funnel": funnel,
+        "largest_drop": largest_drop,
+        "segment_dropoff": drop_segs,
+    }
+    json_path.write_text(json.dumps(json_payload, indent=2), encoding="utf-8")
+
+
+def find_largest_drop(funnel: list[dict]) -> dict:
+    """Find the step with the worst step-to-step conversion (excluding the synthetic first row)."""
+    worst = {"from": "signup", "to": "signup", "drop_pct": 100.0, "from_n": 0, "to_n": 0}
+    for i in range(1, len(funnel)):
+        prev_row = funnel[i - 1]
+        cur = funnel[i]
+        if cur["step_to_step_pct"] < worst["drop_pct"]:
+            worst = {
+                "from": prev_row["step"],
+                "to": cur["step"],
+                "drop_pct": cur["step_to_step_pct"],
+                "from_n": prev_row["n"],
+                "to_n": cur["n"],
+            }
+    return worst
+
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    """Substrate gap check. Refuse if required layers missing."""
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/")
+    if not (client_root / "product-knowledge").is_dir() and not (client_root / "product-knowledge.md").is_file():
+        fails.append(f"product-knowledge layer missing: clients/{client}/product-knowledge/")
+    return len(fails) == 0, fails
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="activation-funnel-audit")
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--events", required=True, help="events CSV path")
+    parser.add_argument("--candidate-events", default="", help="comma-separated candidate event names")
+    parser.add_argument("--window-hours", type=int, default=24)
+    parser.add_argument("--retention-week", type=int, default=2)
+    parser.add_argument("--strict-substrate", action="store_true", help="fail if substrate layers missing (default: warn)")
+    args = parser.parse_args()
+
+    client = args.client
+    events_path = Path(args.events).resolve()
+    if not events_path.is_file():
+        print(f"REFUSED: events CSV not found at {events_path}", file=sys.stderr)
+        print("  fix: place the export under clients/<client>/events/exports/<YYYY-MM>.csv", file=sys.stderr)
+        return 3
+
+    ok, fails = preflight(client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        if args.strict_substrate:
+            return 3
+        print("  (continuing without substrate; outputs will mark layers as gaps)", file=sys.stderr)
+
+    try:
+        rows, count, distinct_events = load_events(events_path)
+    except ValueError as e:
+        print(f"REFUSED: missing-events-export, {e}", file=sys.stderr)
+        return 3
+
+    by_user = index_by_user(rows)
+    if not by_user:
+        print("REFUSED: events file has no parseable rows", file=sys.stderr)
+        return 3
+
+    # Build candidate list
+    if args.candidate_events:
+        candidates = [c.strip() for c in args.candidate_events.split(",") if c.strip()]
+    else:
+        # Default: candidates that exist in the export AND are not onboarding-only
+        candidates = [c for c in DEFAULT_VALUE_CANDIDATES if c in distinct_events]
+        if not candidates:
+            # Use any non-onboarding event with sufficient occurrences
+            event_counts: dict[str, int] = defaultdict(int)
+            for r in rows:
+                event_counts[r["event_name"]] += 1
+            candidates = [
+                e for e, n in sorted(event_counts.items(), key=lambda x: -x[1])
+                if e not in ONBOARDING_EVENTS and n >= 200
+            ][:6]
+
+    if not candidates:
+        print("REFUSED: no-activation-candidate, no candidate events available in export", file=sys.stderr)
+        return 3
+
+    print(f"[activation-funnel-audit] client={client} events={events_path.name} candidates={candidates}", file=sys.stderr)
+
+    # Test each candidate
+    results: list[dict] = []
+    for c in candidates:
+        r = split_retention(by_user, c, args.window_hours, args.retention_week)
+        results.append(r)
+
+    # Rank by divergence; require minimum cohort and minimum divergence
+    results.sort(key=lambda x: x["divergence_pp"], reverse=True)
+    top = results[0] if results else None
+    activation_event: str | None = None
+    refusal: str | None = None
+    if top is None:
+        refusal = "no-activation-candidate (results empty)"
+    elif top["hit_total"] < MIN_COHORT_SIZE:
+        refusal = f"no-activation-candidate (top candidate {top['candidate']} hit cohort n={top['hit_total']} < {MIN_COHORT_SIZE})"
+    elif top["divergence_pp"] < MIN_DIVERGENCE_POINTS:
+        refusal = f"no-activation-candidate (top candidate {top['candidate']} divergence {top['divergence_pp']:+.1f}pp below {MIN_DIVERGENCE_POINTS}pp floor)"
+    else:
+        activation_event = top["candidate"]
+
+    funnel = funnel_steps(by_user, activation_event or "first_value_event")
+    largest_drop = find_largest_drop(funnel)
+    drop_segs = segment_dropoff(
+        by_user,
+        activation_event or "first_value_event",
+        largest_drop["to"],
+        largest_drop["from"],
+    )
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = SUBSTRATE_ROOT / "clients" / client / "retention"
+    out_path = out_dir / f"activation-audit-{today}.md"
+    json_path = out_dir / f"activation-audit-{today}.json"
+    write_artifact(
+        out_path=out_path,
+        json_path=json_path,
+        client=client,
+        events_path=events_path,
+        events_count=count,
+        distinct_events=sorted(distinct_events),
+        candidate_results=results,
+        activation_event=activation_event,
+        refusal_reason=refusal,
+        funnel=funnel,
+        largest_drop=largest_drop,
+        drop_segs=drop_segs,
+        today=today,
+    )
+
+    if refusal:
+        print(f"REFUSED: {refusal}", file=sys.stderr)
+        print(f"  artifact written (with refusal log): {out_path}", file=sys.stderr)
+        return 3
+
+    print(f"[activation-funnel-audit] activation event named: {activation_event}", file=sys.stderr)
+    print(f"[activation-funnel-audit] artifact: {out_path}")
+    print(f"[activation-funnel-audit] json sidecar: {json_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

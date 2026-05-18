@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""nps-loop-design, design a closed-loop NPS program with measurement contract.
+
+Writes a program spec: survey timing, score-band routing (promoter / passive /
+detractor branches), detractor routing conditioned on ICP fit per the
+save-everyone-vs-let-the-wrong-fit-go contradiction, and a measurement contract.
+
+Usage:
+    nps-loop-design --client <client> [--survey-cadence 90] \
+        [--trigger transactional|relational|both] \
+        [--detractor-routing save-call|honest-close|conditional] \
+        [--promoter-routing reference|review-request|case-study|all] \
+        [--diagnosis <churn-diagnosis-json>]
+
+Outputs:
+    clients/<client>/retention/nps-program-spec-<date>.md
+
+Exit codes:
+    0, spec written
+    3, preflight refusal
+    4, invalid args
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+KILL_LIST = {
+    "orchestration", "seamless", "strategic", "leverage", "transform",
+    "holistic", "synergy", "bespoke", "unlock", "robust", "sophisticated",
+    "comprehensive",
+}
+THROAT_CLEARING = {
+    "in today's world", "let's face it", "we all know", "i'd like to",
+    "i wanted to reach out",
+}
+EM_DASH = "—"
+EN_DASH = "–"
+
+
+def voice_check(text: str) -> list[str]:
+    issues: list[str] = []
+    lower = text.lower()
+    for w in KILL_LIST:
+        if re.search(rf"\b{re.escape(w)}\b", lower):
+            issues.append(f"kill-list: {w}")
+    for tc in THROAT_CLEARING:
+        if tc in lower:
+            issues.append(f"throat-clearing: '{tc}'")
+    if EM_DASH in text or EN_DASH in text:
+        issues.append("em-dash present")
+    return issues
+
+
+def survey_design(client: str, voc_excerpt: str | None) -> dict:
+    """Compose the survey copy. Mirrors VoC language when available."""
+    return {
+        "ultimate_question": (
+            "On a scale from 0 to 10, how likely are you to recommend "
+            f"{client} to a peer who has the same job to do?"
+        ),
+        "followup_open": "What is the primary reason for your score?",
+        "followup_for_promoters": "Who comes to mind as someone we could help next?",
+        "followup_for_passives": "What is one thing we could change that would move you to a 9 or 10?",
+        "followup_for_detractors": "What stopped working, and where would you go instead today?",
+        "send_timing_rules": [
+            "Relational: every 90 days from last completed survey or signup, whichever is later.",
+            "Transactional (onboarding): 7 days after `onboarding_completed` event, only if the user has at least 1 `session_active` event in the prior 3 days.",
+            "Transactional (support): 24 hours after `support_ticket_resolved` event.",
+            "Suppression: skip if a survey was completed in the last 60 days.",
+            "Suppression: skip if the user is in active churn-recovery sequence.",
+        ],
+        "voc_excerpt_used": voc_excerpt,
+    }
+
+
+def routing_spec(detractor_routing: str, promoter_routing: str, has_diagnosis: bool) -> dict:
+    """Compose the score-band routing matrix."""
+    promoter_actions = []
+    if promoter_routing in ("reference", "all"):
+        promoter_actions.append({
+            "name": "reference-track",
+            "trigger": "score >= 9 AND ICP fit >= 0.75 AND tenure >= 180 days",
+            "action": "CSM logs as reference candidate; AE may invite to peer reference call.",
+            "guardrail": "1 reference ask per quarter per account; do not over-ask.",
+        })
+    if promoter_routing in ("review-request", "all"):
+        promoter_actions.append({
+            "name": "review-track",
+            "trigger": "score >= 9 AND no review submitted",
+            "action": "Lifecycle email asks for a G2 / Capterra / Product Hunt review with 1-click deep link.",
+            "guardrail": "1 review ask per year per account.",
+        })
+    if promoter_routing in ("case-study", "all"):
+        promoter_actions.append({
+            "name": "case-study-track",
+            "trigger": "score >= 9 AND outcome metric exists in CRM AND ICP fit >= 0.75",
+            "action": "PMM emails to scope a case study; gate on outcome data quality.",
+            "guardrail": "1 case study ask per quarter per account; gate on outcome data freshness.",
+        })
+    # Promoter no-ask branch, required by the skill
+    promoter_actions.append({
+        "name": "no-ask-thanks",
+        "trigger": "score >= 9 AND any of the above tracks recently asked",
+        "action": "Thank-you message; no ask; surface a power-user feature tip.",
+        "guardrail": "Default branch; preserves goodwill per Reichheld.",
+    })
+
+    passive_actions = [
+        {
+            "name": "product-feedback",
+            "trigger": "score in [7, 8]",
+            "action": "Open-text feedback collected; routed to product team for tagging.",
+            "guardrail": "No save call attempt; passives are not detractors.",
+        },
+        {
+            "name": "playbook-nudge",
+            "trigger": "score in [7, 8] AND followup mentions a feature gap",
+            "action": "Lifecycle email surfaces playbook for the named feature gap.",
+            "guardrail": "Playbook citation must trace to product-knowledge.md.",
+        },
+    ]
+
+    if detractor_routing == "save-call":
+        # Position A across the board (Murphy/Mehta), flag this as orthodoxy
+        detractor_actions = [
+            {
+                "name": "save-call-default",
+                "trigger": "score <= 6",
+                "action": "CSM call within 48 hours.",
+                "guardrail": "WARNING: this routing applies Murphy-style save program globally. Per the save-everyone-vs-let-the-wrong-fit-go contradiction, this misallocates CS hours when low-fit detractors are routed the same as high-fit detractors.",
+            }
+        ]
+    elif detractor_routing == "honest-close":
+        # Position B across the board (Reichheld), flag as also-orthodoxy
+        detractor_actions = [
+            {
+                "name": "honest-close-default",
+                "trigger": "score <= 6",
+                "action": "Plain email acknowledging the score; offer to help find an alternative.",
+                "guardrail": "WARNING: this routing applies Reichheld-style let-go globally. Per the contradiction, save-eligible high-fit detractors deserve a save call.",
+            }
+        ]
+    else:  # conditional (default)
+        detractor_actions = [
+            {
+                "name": "high-fit-late-stage-save",
+                "trigger": "score <= 6 AND ICP fit >= 0.75 AND tenure >= 90 days",
+                "action": "AE / CSM call within 48 hours; full save program (Position A).",
+                "guardrail": "Per save-everyone-vs-let-the-wrong-fit-go: high-fit late-stage = recoverable LTV.",
+            },
+            {
+                "name": "high-fit-early-stage-activation-save",
+                "trigger": "score <= 6 AND ICP fit >= 0.75 AND tenure < 90 days",
+                "action": "Lifecycle email surfaces the activation event the user did not hit; offer 20-min CSM session if user replies.",
+                "guardrail": "Early high-fit churn is activation failure, not loyalty failure. Cite activation-funnel-audit output.",
+            },
+            {
+                "name": "mid-fit-triage",
+                "trigger": "score <= 6 AND 0.5 <= ICP fit < 0.75",
+                "action": "One outreach to surface 'right tool wrong moment' vs 'right moment wrong tool'; gate further touches on reply.",
+                "guardrail": "No automated nurture; reply gates the next touch.",
+            },
+            {
+                "name": "low-fit-honest-close",
+                "trigger": "score <= 6 AND ICP fit < 0.5",
+                "action": "Plain note from CSM acknowledging the fit gap; offer alternatives if positioning.md documents them; no save attempt.",
+                "guardrail": "Per Reichheld / Elliott-McCrea: spending CS hours on this band is misallocation. Reallocate to high-fit retention.",
+            },
+        ]
+        if has_diagnosis:
+            detractor_actions.append({
+                "name": "diagnosis-aligned-routing",
+                "trigger": "any detractor score with diagnosis-band recommendation",
+                "action": "Match the diagnosis's per-band recommendation directly.",
+                "guardrail": "When churn-diagnose has named the band recommendation, use it; the per-cohort signal beats the program-default heuristic.",
+            })
+
+    return {
+        "promoter": promoter_actions,
+        "passive": passive_actions,
+        "detractor": detractor_actions,
+    }
+
+
+def measurement_contract(today: datetime) -> dict:
+    return {
+        "metrics": [
+            {
+                "name": "close-the-loop rate",
+                "predicted": "65%",
+                "definition": "Share of survey responses that received a logged action within 7 days.",
+                "baseline": "Operator-reported pre-program rate (cite baseline-survey.md if present).",
+                "source_system": "Lifecycle tool + CRM action log.",
+            },
+            {
+                "name": "promoter-to-reference rate",
+                "predicted": "10%",
+                "definition": "Share of promoter responses that produce at least one usable reference (review, case-study quote, peer call) within 60 days.",
+                "baseline": "Industry baseline (Reichheld) is 5-15%; predict 10% mid-band.",
+                "source_system": "CRM reference field + review platform aggregator.",
+            },
+            {
+                "name": "detractor-to-reactivation rate",
+                "predicted": "8%",
+                "definition": "Share of detractor responses (across all sub-bands) that lead to a measurable reactivation or upgrade within 90 days.",
+                "baseline": "Murphy save-program data 10-15% on save-eligible cohorts; conditional routing weighted average ~8%.",
+                "source_system": "Events table + CRM stage transitions.",
+            },
+            {
+                "name": "survey response rate",
+                "predicted": "20%",
+                "definition": "Share of relational sends that receive a score (transactional measured separately).",
+                "baseline": "Mid-market SaaS averages 15-25% per Reichheld + Bain research.",
+                "source_system": "Survey tool.",
+            },
+        ],
+        "resolution_date": (today + timedelta(days=120)).strftime("%Y-%m-%d"),
+        "kill_criterion": "If close-the-loop rate < 30% at 90d, the program is not closed-loop; it is a survey collection. Pause and rebuild the routing.",
+    }
+
+
+def write_md(
+    out_path: Path,
+    client: str,
+    survey: dict,
+    routing: dict,
+    contract: dict,
+    cadence_days: int,
+    trigger: str,
+    detractor_routing: str,
+    promoter_routing: str,
+    voice_violations: list[str],
+    has_diagnosis: bool,
+    today: str,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: NPS program spec, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [churn-prediction-vs-churn-diagnosis, retention-cohort-curves-over-blended-rates]")
+    lines.append("contradictions_aware: [save-everyone-vs-let-the-wrong-fit-go]")
+    lines.append(f"client: {client}")
+    lines.append(f"cadence_days: {cadence_days}")
+    lines.append(f"trigger: {trigger}")
+    lines.append(f"detractor_routing: {detractor_routing}")
+    lines.append(f"promoter_routing: {promoter_routing}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# NPS program spec, {client}, {today}")
+    lines.append("")
+    lines.append(
+        "Per Reichheld's loyalty-system frame, this is a closed-loop *program*, not a single number. The value comes from acting on responses; the score is the leading indicator."
+    )
+    lines.append("")
+
+    lines.append("## 1. Survey design")
+    lines.append("")
+    lines.append(f"**Ultimate question:** {survey['ultimate_question']}")
+    lines.append("")
+    lines.append(f"**Follow-up (open):** {survey['followup_open']}")
+    lines.append("")
+    lines.append("Score-band-specific follow-ups:")
+    lines.append("")
+    lines.append(f"- Promoters (9-10): {survey['followup_for_promoters']}")
+    lines.append(f"- Passives (7-8): {survey['followup_for_passives']}")
+    lines.append(f"- Detractors (0-6): {survey['followup_for_detractors']}")
+    lines.append("")
+    lines.append("**Send timing:**")
+    lines.append("")
+    for rule in survey["send_timing_rules"]:
+        lines.append(f"- {rule}")
+    lines.append("")
+
+    lines.append("## 2. Response routing")
+    lines.append("")
+    lines.append("### Promoter routing (score 9-10)")
+    lines.append("")
+    lines.append("| Track | Trigger | Action | Guardrail |")
+    lines.append("|---|---|---|---|")
+    for act in routing["promoter"]:
+        lines.append(f"| {act['name']} | {act['trigger']} | {act['action']} | {act['guardrail']} |")
+    lines.append("")
+
+    lines.append("### Passive routing (score 7-8)")
+    lines.append("")
+    lines.append("| Track | Trigger | Action | Guardrail |")
+    lines.append("|---|---|---|---|")
+    for act in routing["passive"]:
+        lines.append(f"| {act['name']} | {act['trigger']} | {act['action']} | {act['guardrail']} |")
+    lines.append("")
+
+    lines.append("### Detractor routing (score 0-6)")
+    lines.append("")
+    lines.append(
+        "Per `knowledge/contradictions/save-everyone-vs-let-the-wrong-fit-go.md`, detractor routing is conditioned on ICP fit and time-in-product, not applied as a global default."
+    )
+    lines.append("")
+    lines.append("| Track | Trigger | Action | Guardrail |")
+    lines.append("|---|---|---|---|")
+    for act in routing["detractor"]:
+        lines.append(f"| {act['name']} | {act['trigger']} | {act['action']} | {act['guardrail']} |")
+    lines.append("")
+
+    lines.append("## 3. Voice constraints")
+    lines.append("")
+    if voice_violations:
+        lines.append("**Voice violations found in survey copy. Edit before send:**")
+        for v in voice_violations:
+            lines.append(f"- {v}")
+    else:
+        lines.append("Voice gate passes: no kill-list words, no em-dashes, no throat-clearing openers in the survey copy.")
+    lines.append("")
+
+    lines.append("## 4. Measurement contract")
+    lines.append("")
+    lines.append(f"Resolution date: {contract['resolution_date']}")
+    lines.append("")
+    lines.append("| Metric | Predicted | Definition | Baseline | Source |")
+    lines.append("|---|---:|---|---|---|")
+    for m in contract["metrics"]:
+        lines.append(f"| {m['name']} | {m['predicted']} | {m['definition']} | {m['baseline']} | {m['source_system']} |")
+    lines.append("")
+    lines.append(f"**Kill criterion:** {contract['kill_criterion']}")
+    lines.append("")
+
+    lines.append("## 5. Cadence calendar")
+    lines.append("")
+    lines.append(f"- Relational survey: every {cadence_days} days from last response or signup.")
+    if trigger in ("transactional", "both"):
+        lines.append("- Transactional (onboarding): 7 days post-`onboarding_completed`, gated on at least 1 active session in the prior 3 days.")
+        lines.append("- Transactional (support): 24 hours post-`support_ticket_resolved`.")
+    lines.append("- Suppression: skip if a survey was completed in last 60 days; skip if user is in active churn-recovery sequence.")
+    lines.append("")
+
+    lines.append("## 6. Substrate citations")
+    lines.append("")
+    lines.append(f"- ICP layer: `clients/{client}/icp/icp.md` (drives detractor routing).")
+    lines.append(f"- VoC: `clients/{client}/voc/voc.md` (mirrors customer language in survey copy).")
+    lines.append(f"- Brand voice: `clients/{client}/brand-voice/brand-voice.md` (voice gate).")
+    if has_diagnosis:
+        lines.append(f"- Churn diagnosis: latest `clients/{client}/retention/churn-diagnosis-*.json` (aligns detractor routing with diagnosis recommendation).")
+    lines.append("- Pattern grounding: `knowledge/patterns/churn-prediction-vs-churn-diagnosis.md` (diagnose first).")
+    lines.append("- Pattern grounding: `knowledge/patterns/retention-cohort-curves-over-blended-rates.md` (NPS as a cohort signal).")
+    lines.append("- Contradiction: `knowledge/contradictions/save-everyone-vs-let-the-wrong-fit-go.md` (detractor routing conditioning).")
+    lines.append("")
+
+    lines.append("## 7. Hand-off")
+    lines.append("")
+    lines.append("This file is a *spec*. Send-time logic lives in lifecycle tooling (Customer.io / Iterable / HubSpot / Pendo). Routing automation lives in CRM workflows. The skill does not implement; it specifies.")
+    lines.append("")
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append("- `routines/retention-monthly.md`, schedule the close-the-loop review.")
+    lines.append(f"- `skills/win-back-sequence/bin/win-back-sequence --client {client} --diagnosis <churn-diagnosis>`, design save sequence for save-eligible detractors.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing (refusing, required for detractor routing conditioning)")
+    if not (client_root / "voc").is_dir() and not (client_root / "voc.md").is_file():
+        fails.append(f"voc layer missing")
+    if not (client_root / "brand-voice").is_dir() and not (client_root / "brand-voice.md").is_file():
+        fails.append(f"brand-voice layer missing (refusing, required for voice gate)")
+    return len(fails) == 0, fails
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--survey-cadence", type=int, default=90)
+    parser.add_argument("--trigger", default="both", choices=["transactional", "relational", "both"])
+    parser.add_argument(
+        "--detractor-routing",
+        default="conditional",
+        choices=["save-call", "honest-close", "conditional"],
+    )
+    parser.add_argument(
+        "--promoter-routing",
+        default="all",
+        choices=["reference", "review-request", "case-study", "all"],
+    )
+    parser.add_argument("--diagnosis", default=None, help="optional churn-diagnosis JSON to align detractor routing")
+    parser.add_argument("--strict-substrate", action="store_true")
+    args = parser.parse_args()
+
+    if args.survey_cadence < 60:
+        print(
+            f"REFUSED: cadence-too-frequent, survey-cadence={args.survey_cadence} below 60d floor.",
+            file=sys.stderr,
+        )
+        print("  Per Reichheld's survey-fatigue research, relational NPS at <60d cadence degrades data quality.", file=sys.stderr)
+        return 3
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        if args.strict_substrate:
+            return 3
+        print("  (continuing without substrate; outputs will mark layers as gaps)", file=sys.stderr)
+
+    has_diagnosis = bool(args.diagnosis) and Path(args.diagnosis).is_file()
+    today_dt = datetime.now(timezone.utc)
+    today = today_dt.strftime("%Y-%m-%d")
+
+    print(f"[nps-loop-design] client={args.client} cadence={args.survey_cadence}d trigger={args.trigger} det_routing={args.detractor_routing}", file=sys.stderr)
+
+    survey = survey_design(args.client, voc_excerpt=None)
+    routing = routing_spec(args.detractor_routing, args.promoter_routing, has_diagnosis)
+    contract = measurement_contract(today_dt)
+
+    # Voice gate over the survey copy
+    all_text = " ".join([
+        survey["ultimate_question"],
+        survey["followup_open"],
+        survey["followup_for_promoters"],
+        survey["followup_for_passives"],
+        survey["followup_for_detractors"],
+    ])
+    voice_violations = voice_check(all_text)
+
+    out_path = SUBSTRATE_ROOT / "clients" / args.client / "retention" / f"nps-program-spec-{today}.md"
+    write_md(
+        out_path,
+        client=args.client,
+        survey=survey,
+        routing=routing,
+        contract=contract,
+        cadence_days=args.survey_cadence,
+        trigger=args.trigger,
+        detractor_routing=args.detractor_routing,
+        promoter_routing=args.promoter_routing,
+        voice_violations=voice_violations,
+        has_diagnosis=has_diagnosis,
+        today=today,
+    )
+
+    print(f"[nps-loop-design] voice violations: {len(voice_violations)}", file=sys.stderr)
+    print(f"[nps-loop-design] artifact: {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

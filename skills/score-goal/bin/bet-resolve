@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# bet-resolve — resolve eligible goals in the substrate ledger.
+#
+# Usage:
+#   bet-resolve                            # resolve all eligible goals
+#   bet-resolve --dry-run                  # log what would resolve
+#   bet-resolve --goal-id <slug>           # force one goal
+#   bet-resolve --since YYYY-MM-DD --until YYYY-MM-DD
+#
+# Suggested LaunchAgent label: com.substrate.goal-resolution
+
+set -uo pipefail
+
+# Backwards-compat: accept FLYWHEEL_ROOT as deprecated alias for SUBSTRATE_ROOT.
+if [ -n "${FLYWHEEL_ROOT:-}" ] && [ -z "${SUBSTRATE_ROOT:-}" ]; then
+  echo "DEPRECATED: FLYWHEEL_ROOT is deprecated; use SUBSTRATE_ROOT." >&2
+  SUBSTRATE_ROOT="$FLYWHEEL_ROOT"
+fi
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+
+# Default ledger: most recent goals/ledger-*.md, falling back to goals/ledger.md.
+DEFAULT_LEDGER="$SUBSTRATE_ROOT/goals/ledger.md"
+QUARTER_LEDGER=$(ls -t "$SUBSTRATE_ROOT/goals/ledger-"*.md 2>/dev/null | head -1)
+LEDGER="${LEDGER:-${QUARTER_LEDGER:-$DEFAULT_LEDGER}}"
+
+cat <<EOF >&2
+bet-resolve: resolves goals on $LEDGER
+
+This skill is a thin runner. The actual resolution logic is operator-driven:
+read goals/ledger.md, find rows where status=open and the resolution_date has
+passed, evaluate the actual outcome against the target, append a row to the
+goal's resolution log, then flip status=resolved.
+
+The companion CLI score-calibration (bin/score-calibration) writes Brier
+scores into data/calibration.sqlite once a goal is marked resolved.
+
+If you have a custom resolver script wired (e.g. scripts/bet-resolve.py),
+substitute this stub.
+EOF
+exit 64

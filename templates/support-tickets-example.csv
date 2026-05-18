@@ -1,0 +1,63 @@
+ticket_id,account_id,opened_at,category,subject,body,resolution_time_hours,csat,priority,first_response_minutes,escalated,resolved
+t_5001,a_1001,2026-04-02T09:14:00Z,billing,"Invoice not received for March","I was supposed to receive an invoice for March but never got the email. Can you resend it?",2.5,5,low,18,false,true
+t_5002,a_1001,2026-04-15T11:32:00Z,billing,"Question about pricing tiers","Looking at the team plan pricing, do additional seats prorate within the billing period?",1.0,5,low,12,false,true
+t_5003,a_1002,2026-04-08T14:22:00Z,onboarding,"How do I import my contact list","I have a CSV of about 5000 contacts I want to import. Where does that go in your tool?",0.5,5,low,8,false,true
+t_5004,a_1002,2026-04-12T16:08:00Z,onboarding,"Cannot find the team setup flow","I created my account but I do not see how to invite teammates. The button is not where the screenshot in the email said it would be.",1.5,4,medium,15,false,true
+t_5005,a_1003,2026-02-04T10:11:00Z,onboarding,"Lost on first login","I logged in for the first time and there is nothing on the dashboard. What am I supposed to do first?",4.0,2,medium,45,false,true
+t_5006,a_1003,2026-02-09T13:45:00Z,bug,"Page not loading","The settings page just spins forever. I tried Chrome and Firefox.",6.5,3,high,28,true,true
+t_5007,a_1003,2026-02-14T08:22:00Z,onboarding,"Still cannot figure this out","I have been trying for 3 weeks and I just cannot get this product to do what your homepage said it would. I am very disappointed and considering switching to your competitor.",12.0,1,high,52,true,true
+t_5008,a_1004,2026-01-29T11:55:00Z,bug,"Export not working","When I try to export my data the file is empty. This is the second time this has happened.",8.0,2,high,35,true,true
+t_5009,a_1004,2026-02-08T09:18:00Z,how-to,"How do I cancel my subscription","I want to cancel. The product is not what I expected and I do not have time to figure it out. Please cancel.",2.0,1,high,22,false,true
+t_5010,a_1005,2026-04-12T15:30:00Z,integration,"Webhook payload format","Can you confirm the exact JSON shape your webhooks send? I am trying to wire it into our internal system.",3.0,5,low,18,false,true
+t_5011,a_1005,2026-04-18T10:08:00Z,integration,"Slack integration broken","Our Slack notifications stopped firing yesterday around 2pm. Other integrations seem fine.",4.5,3,high,12,true,true
+t_5012,a_1005,2026-04-25T13:42:00Z,billing,"Renewal date confusion","Our renewal is coming up but I am seeing two different dates in my account. Which is correct?",1.0,4,medium,20,false,true
+t_5013,a_1006,2026-02-12T14:18:00Z,onboarding,"Cannot get this working","Honestly this is too complicated. I just wanted a simple way to do X and instead I have to learn 5 concepts. Can you just refund me?",1.5,1,high,28,true,true
+t_5014,a_1007,2026-04-15T09:33:00Z,how-to,"Bulk action question","Is there a way to apply the same setting to multiple items at once?",2.5,4,low,15,false,true
+t_5015,a_1007,2026-04-22T11:18:00Z,how-to,"Keyboard shortcuts","Do you have a list of keyboard shortcuts for your tool? I am trying to be faster.",0.5,5,low,8,false,true
+t_5016,a_1008,2026-02-15T12:44:00Z,onboarding,"Not what I expected","I signed up because I thought your product would do X but it actually does Y. Disappointed. Cancelling.",1.0,1,medium,25,false,true
+t_5017,a_1009,2026-04-10T08:55:00Z,how-to,"Reporting question","How do I build a custom report that shows X grouped by Y?",3.5,4,low,18,false,true
+t_5018,a_1009,2026-04-22T10:11:00Z,billing,"Annual invoice","Can I get an annual invoice instead of monthly? Our finance team prefers it.",2.0,5,low,15,false,true
+t_5019,a_1010,2026-04-28T14:08:00Z,bug,"Notification spam","I am getting duplicate notifications for the same event. This is very annoying.",5.5,2,medium,22,false,true
+t_5020,a_1010,2026-05-02T09:42:00Z,bug,"Notification spam continues","The duplicate notifications are still happening after I reported it last week. Considering cancelling if this is not fixed.",8.0,1,high,18,true,true
+t_5021,a_1011,2026-04-08T11:25:00Z,how-to,"Workflow automation","Can your tool trigger a workflow when X happens? Looking for the recipe page.",1.5,4,low,12,false,true
+t_5022,a_1011,2026-04-15T13:18:00Z,how-to,"Multiple workspaces","Can a single user be a member of multiple workspaces? We are testing it for two teams.",2.0,5,low,18,false,true
+t_5023,a_1012,2026-04-12T16:33:00Z,integration,"API rate limits","What are your API rate limits? We are building a heavy integration.",1.0,5,low,8,false,true
+t_5024,a_1012,2026-04-20T09:11:00Z,integration,"API authentication","Our API token rotation is failing. Token gets a 401 after rotating.",4.0,3,high,15,true,true
+t_5025,a_1013,2026-04-15T14:55:00Z,bug,"Mobile app crash","Your iOS app keeps crashing when I open the inbox tab. iPhone 14, iOS 17.",10.0,2,high,32,true,true
+t_5026,a_1013,2026-04-22T11:08:00Z,bug,"Mobile app still crashing","The iOS app crash is still happening 1 week after I reported it. This is unacceptable.",14.0,1,high,28,true,false
+t_5027,a_1014,2026-04-10T12:41:00Z,onboarding,"Welcome to my account","Just signed up. Where is the onboarding tour?",0.5,5,low,5,false,true
+t_5028,a_1014,2026-04-12T15:22:00Z,how-to,"Best practices","Do you have a best-practices guide for getting the most out of your product?",2.0,5,low,12,false,true
+t_5029,a_1015,2026-04-08T10:33:00Z,how-to,"Tag management","How do I bulk edit tags across many items?",1.5,4,low,15,false,true
+t_5030,a_1015,2026-04-18T13:11:00Z,how-to,"Permission levels","What is the difference between admin and member roles? I cannot find the permissions matrix.",2.5,4,low,18,false,true
+t_5031,a_1016,2026-04-15T11:58:00Z,billing,"Refund request","I am cancelling. Per your terms I should be eligible for a partial refund. Please process.",3.0,3,medium,22,false,true
+t_5032,a_1017,2026-04-20T09:25:00Z,onboarding,"Cannot find the activation step","Your email said complete the activation. I clicked the link but nothing happened.",1.5,3,medium,18,false,true
+t_5033,a_1018,2026-04-08T14:12:00Z,integration,"Zapier connection lost","My Zapier zap stopped working. The trigger fires but nothing happens downstream.",6.0,3,high,28,true,true
+t_5034,a_1018,2026-04-22T10:55:00Z,integration,"Zapier still broken","The zap I reported last week is still broken. I am moving back to my old tool.",10.0,1,high,42,true,false
+t_5035,a_1019,2026-04-12T15:28:00Z,how-to,"Onboarding workflow","I am setting up our team account. Where do I configure the team-wide settings vs per-user?",2.0,4,medium,15,false,true
+t_5036,a_1019,2026-04-25T11:18:00Z,how-to,"Team settings inheritance","Follow up to my earlier question. Do team settings cascade to new members automatically?",1.5,5,low,12,false,true
+t_5037,a_1020,2026-04-15T13:45:00Z,bug,"Search not finding obvious matches","Search returns zero results for things I know are in the system. The search is broken.",5.0,2,medium,22,false,true
+t_5038,a_1020,2026-04-28T10:08:00Z,bug,"Search bug worse","The search bug I reported is worse. I cannot find anything anymore.",8.5,1,high,25,true,true
+t_5039,a_1021,2026-04-08T09:14:00Z,onboarding,"How does the trial work","I started a trial but I am not sure what is included. Can you clarify?",0.5,5,low,8,false,true
+t_5040,a_1021,2026-04-12T14:33:00Z,how-to,"Inviting external users","Can I invite people from outside my company to a workspace?",2.0,4,low,15,false,true
+t_5041,a_1022,2026-04-15T11:22:00Z,how-to,"Mobile app feature parity","Does the mobile app have all the features of the web app?",1.0,4,low,12,false,true
+t_5042,a_1022,2026-04-22T13:08:00Z,billing,"Annual upgrade","I want to switch from monthly to annual billing for the discount. How?",1.5,5,low,18,false,true
+t_5043,a_1023,2026-04-08T15:45:00Z,bug,"File upload size","Trying to upload a 50MB file and getting a size error. Your docs say 100MB is fine.",4.5,3,medium,22,false,true
+t_5044,a_1024,2026-04-12T10:33:00Z,how-to,"How do I export to CSV","I want to download my data as CSV. Where is that option?",0.5,5,low,8,false,true
+t_5045,a_1024,2026-04-22T14:11:00Z,how-to,"CSV format question","The CSV I exported is missing some columns I see in the UI. Is there a way to include all fields?",2.0,4,low,15,false,true
+t_5046,a_1025,2026-04-15T12:55:00Z,integration,"OAuth setup","Setting up OAuth for our SSO. Where are the redirect URI requirements?",2.5,5,low,18,false,true
+t_5047,a_1026,2026-04-10T09:22:00Z,onboarding,"Lost in the dashboard","I have been a customer for a month and I still cannot find the main features. Your UI is confusing.",4.0,2,medium,28,false,true
+t_5048,a_1027,2026-04-08T13:18:00Z,how-to,"Custom fields","Can I add custom fields to records?",1.0,4,low,12,false,true
+t_5049,a_1027,2026-04-22T15:08:00Z,how-to,"Custom field types","What custom field types do you support? I need a date-range type.",1.5,5,low,15,false,true
+t_5050,a_1028,2026-04-15T11:42:00Z,bug,"Data missing","Some of my data from last week appears to be missing. This is concerning.",6.0,2,high,22,true,true
+t_5051,a_1028,2026-04-22T10:11:00Z,billing,"Refund for data loss","Following up on the data loss issue. I want a partial refund or I am cancelling.",3.5,2,high,18,true,true
+t_5052,a_1029,2026-04-12T14:08:00Z,how-to,"Reporting export","How do I export a report as PDF?",1.5,4,low,12,false,true
+t_5053,a_1030,2026-04-08T11:33:00Z,onboarding,"Team setup","I am setting up our team. What is the recommended onboarding order for a 10-person team?",3.0,5,low,18,false,true
+t_5054,a_1030,2026-04-22T13:55:00Z,how-to,"Team analytics","How can I see what my team members are doing in the tool? Looking for an admin view.",2.5,4,low,18,false,true
+t_5055,a_1031,2026-04-15T09:14:00Z,bug,"Login loop","I keep getting logged out after 30 minutes. Other tools keep me logged in for days.",4.5,3,medium,22,false,true
+t_5056,a_1032,2026-04-10T15:25:00Z,how-to,"Workflow trigger","Can I trigger an action based on a specific field value change?",2.0,4,low,15,false,true
+t_5057,a_1033,2026-04-08T10:18:00Z,integration,"Webhook authentication","Do your webhooks support HMAC signatures? Our security team requires it.",1.5,5,low,12,false,true
+t_5058,a_1034,2026-04-22T11:42:00Z,how-to,"Bulk delete","How do I delete multiple items at once? The UI only lets me do one at a time.",1.0,4,low,15,false,true
+t_5059,a_1035,2026-04-15T13:18:00Z,onboarding,"Team training","Do you offer team training sessions for new customers?",2.5,5,low,18,false,true
+t_5060,a_1036,2026-04-08T14:55:00Z,bug,"Slow performance","The app has been very slow this week. Loading times are 5-10 seconds for things that used to be instant.",5.5,2,medium,22,false,true
+t_5061,a_1037,2026-04-12T09:33:00Z,how-to,"User management","Can I deactivate a user without deleting their data?",1.0,5,low,12,false,true
+t_5062,a_1038,2026-04-22T15:11:00Z,billing,"Downgrade","I want to downgrade my plan. The team plan is too expensive for our usage.",2.0,3,medium,18,false,true

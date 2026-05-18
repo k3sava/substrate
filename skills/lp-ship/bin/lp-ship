@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# lp-ship — ship a landing page through the gate ladder
+#
+# Usage: lp-ship <lp-asset-path> [--stage|--prod|--dry-run]
+#
+# Pipeline:
+#   1. preflight (substrate-cite + voice-enforce + copy-quality + refusal-pattern)
+#   2. measurement-contract slot check (frontmatter must have measurement_contract)
+#   3. synth-audience displacement panel (if asset is competitive LP)
+#   4. stage to <your-deploy-target>.vercel.app/lp/<asset-slug>/  (with --stage)
+#   5. promote to production (with --prod; requires gates closed in deploy_path)
+#
+# Exit codes:
+#   0 — all gates passed; staged or prod-promoted depending on flag
+#   1 — gate failed
+#   2 — file not found
+#
+# Notes:
+#   --dry-run: runs gates, doesn't stage/promote
+#   --stage: requires gates pass; copies to <your-deploy-target> repo, commits, pushes
+#   --prod: requires LP frontmatter `gate_status` to be "all-gates-cleared"; promotes from staging
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+
+ASSET="${1:?asset path required}"
+[ -f "$ASSET" ] || { echo "asset not found: $ASSET" >&2; exit 2; }
+
+MODE="${2:---dry-run}"
+
+ASSET_SLUG=$(basename "$ASSET" .md | sed 's/-v[0-9]*-[0-9]*-[0-9]*-[0-9]*$//')
+
+echo "=== lp-ship: $ASSET ===" >&2
+echo "mode: $MODE" >&2
+echo "slug: $ASSET_SLUG" >&2
+echo "" >&2
+
+# Gate 1: preflight (composite). The runtime moved from skills/preflight/ to
+# skills/pre-publish-check/ during the substrate rename; we check both so
+# external installs that pinned the old path still work.
+echo "→ Gate 1: preflight" >&2
+PREFLIGHT_BIN="$SUBSTRATE_ROOT/skills/pre-publish-check/bin/preflight"
+if [ ! -x "$PREFLIGHT_BIN" ]; then
+  PREFLIGHT_BIN="$SUBSTRATE_ROOT/skills/preflight/bin/preflight"
+fi
+if [ -x "$PREFLIGHT_BIN" ] && "$PREFLIGHT_BIN" "$ASSET" 2>/dev/null >/dev/null; then
+  echo "  ✓ preflight PASS" >&2
+else
+  echo "  ✗ preflight FAIL — run 'substrate pre-publish-check $ASSET' for details" >&2
+  exit 1
+fi
+
+# Gate 2: measurement-contract slot check
+echo "→ Gate 2: measurement-contract slot" >&2
+mc_present=$(awk 'BEGIN{infm=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^measurement_contract:/{print "yes"; exit}' "$ASSET")
+if [ "$mc_present" = "yes" ]; then
+  echo "  ✓ measurement_contract present" >&2
+else
+  echo "  ✗ measurement_contract missing in frontmatter" >&2
+  exit 1
+fi
+
+# Gate 3: synth-audience (only if LP audience targeting suggests it)
+echo "→ Gate 3: synth-audience panel (auto-detect axis)" >&2
+if "$SUBSTRATE_ROOT/skills/synth-audience/bin/synth-audience" "$ASSET" 2>/dev/null | tail -3 | grep -q "succeeded"; then
+  echo "  ✓ synth-audience panel ran" >&2
+else
+  echo "  · synth-audience skipped or partial" >&2
+fi
+
+echo "" >&2
+
+case "$MODE" in
+  --dry-run)
+    echo "DRY-RUN: all gates passed; not staging or promoting" >&2
+    echo "PASS-DRY: $ASSET"
+    exit 0
+    ;;
+  --stage)
+    STAGING_REPO="${STAGING_REPO:-}"
+    if [ -z "$STAGING_REPO" ]; then
+      echo "STAGING_REPO env var not set; cannot --stage. Set STAGING_REPO=/path/to/staging-repo" >&2
+      exit 1
+    fi
+    STAGING_TARGET="$STAGING_REPO/lp/$ASSET_SLUG/draft.md"
+    if [ ! -d "$STAGING_REPO" ]; then
+      echo "staging repo not found at $STAGING_REPO" >&2
+      exit 1
+    fi
+    mkdir -p "$(dirname "$STAGING_TARGET")"
+    cp "$ASSET" "$STAGING_TARGET"
+    echo "staged to $STAGING_TARGET" >&2
+    echo "PASS-STAGED: $ASSET → $STAGING_TARGET"
+    exit 0
+    ;;
+  --prod)
+    gate_status=$(awk 'BEGIN{infm=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^gate_status:/{sub(/^gate_status:[[:space:]]*/, ""); print; exit}' "$ASSET")
+    if [ "$gate_status" != "all-gates-cleared" ]; then
+      echo "✗ gate_status is '$gate_status'; production-promote requires 'all-gates-cleared'" >&2
+      echo "  Update frontmatter once the cross-function review pod complete" >&2
+      exit 1
+    fi
+    echo "production-promote not yet wired (Vercel CLI integration pending)" >&2
+    echo "manually promote: cd $STAGING_REPO && vercel --prod" >&2
+    exit 1
+    ;;
+  *)
+    echo "unknown mode: $MODE (use --dry-run, --stage, or --prod)" >&2
+    exit 1
+    ;;
+esac

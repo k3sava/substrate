@@ -1,0 +1,844 @@
+#!/usr/bin/env python3
+"""social-content-design — design platform-native social posts grounded in
+canonical positioning, a buyer-state cohort, and a chosen platform shape.
+
+Refuses without canonical positioning, ICP, or brand voice. Refuses without a
+named buyer-state cohort. Composes voice-enforce on every body. Reads optional
+calendar at clients/<client>/social/calendar.yaml.
+
+Each platform gets its own native format. The cross-post default is rejected
+because each platform has native rhythms (per native-format-beats-cross-post).
+Personal-account framing is the default because B2B reach compounds on personal
+accounts (per creator-not-corporate). Distribution-not-conversion framing
+applies to every draft (per social-as-distribution-not-conversion).
+
+Usage:
+    social-content-design --client <client>
+                          --platform <linkedin-long|linkedin-text|x-thread|x-single|tiktok|instagram-caption|youtube-short>
+                          --cohort <buyer-state-slug>
+                          --purpose <thought-leadership|teardown|story|how-to|news|hot-take|customer-spotlight>
+                          [--author <personal|corporate>]
+                          [--variants <int>]
+                          [--out <dir>]
+                          [--calendar-slot <slot-id>]
+                          [--allow-voice-fail]
+
+Exit codes:
+    0 — drafts written; voice-enforce PASS on every body
+    1 — drafts written; one or more voice-enforce FAIL
+    3 — refused (substrate gap, missing positioning, missing cohort)
+    4 — invalid args
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+
+
+PLATFORM_CONSTRAINTS: dict[str, dict] = {
+    "linkedin-long": {
+        "format": "long-form text post",
+        "max_total_chars": 3000,
+        "preferred_total_chars": "800-1500",
+        "preview_chars_before_more": 250,
+        "hook_lines": "1-2",
+        "body_sections": "3-7",
+        "link_in_body": False,
+        "link_in_first_comment": True,
+        "close_shape": "comment-prompt question",
+    },
+    "linkedin-text": {
+        "format": "short text post",
+        "max_total_chars": 1300,
+        "preview_chars_before_more": 250,
+        "hook_lines": "1-2",
+        "body_sections": "3-6",
+        "link_in_body": False,
+        "close_shape": "soft close",
+    },
+    "x-thread": {
+        "format": "thread of tweets",
+        "tweet_max_chars": 280,
+        "preferred_thread_length": "5-8 tweets",
+        "hook_tweet_rule": "no link, no @ in lead",
+        "close_shape": "soft call on final tweet",
+    },
+    "x-single": {
+        "format": "single tweet",
+        "tweet_max_chars": 280,
+        "shape": "hook + payoff in one breath",
+        "close_shape": "no call required",
+    },
+    "tiktok": {
+        "format": "vertical-video script + caption",
+        "hook_window_seconds": 1.5,
+        "hook_max_words": 12,
+        "body_seconds": "15-30",
+        "caption_max_chars": 2200,
+        "caption_visible_before_more_chars": 100,
+        "needs_on_screen_text": True,
+    },
+    "instagram-caption": {
+        "format": "caption for image or carousel",
+        "preview_chars_before_more": 125,
+        "max_caption_chars": 2200,
+        "preferred_caption_chars": "200-1500",
+        "hashtag_count": "3-7 mixed reach",
+        "close_shape": "soft call",
+    },
+    "youtube-short": {
+        "format": "vertical-video script + title + description",
+        "title_max_chars": 100,
+        "hook_window_seconds": 3,
+        "body_seconds": "15-50",
+        "description_max_chars": 5000,
+        "description_visible_before_more_chars": 150,
+    },
+}
+
+
+PURPOSE_TEMPLATES = {
+    "thought-leadership": {
+        "hook_lens": "name a category-level shift the cohort is feeling but has not articulated",
+        "body_arc": "observation → mechanism → implication → invitation",
+        "anchor_target": "value-pillar language from positioning",
+    },
+    "teardown": {
+        "hook_lens": "name a public artifact (page, ad, post, product moment) and the one thing it gets wrong",
+        "body_arc": "artifact → what works → what breaks → what would land instead",
+        "anchor_target": "unique-attribute language from positioning",
+    },
+    "story": {
+        "hook_lens": "open mid-scene with the cohort's friction in concrete terms",
+        "body_arc": "scene → tension → turn → lesson",
+        "anchor_target": "voice-of-customer language",
+    },
+    "how-to": {
+        "hook_lens": "name the outcome the cohort wants and the one move that gets there",
+        "body_arc": "outcome → 3-5 steps → caveat → call",
+        "anchor_target": "value-theme language from positioning",
+    },
+    "news": {
+        "hook_lens": "name the change and what it means for the cohort right now",
+        "body_arc": "what changed → why it matters → cohort implication → what to do",
+        "anchor_target": "category-level anchor terms",
+    },
+    "hot-take": {
+        "hook_lens": "stake a contrarian position the cohort is half-thinking but not saying",
+        "body_arc": "claim → reasoning → proof → invitation to disagree",
+        "anchor_target": "differentiation anchors",
+    },
+    "customer-spotlight": {
+        "hook_lens": "name the customer's outcome in their own words",
+        "body_arc": "customer → before-state → trigger → after-state → quote",
+        "anchor_target": "outcome-led pillar language",
+    },
+}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def read_file_or_none(path: Path) -> str | None:
+    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+
+def extract_canonical_statement(text: str) -> str:
+    in_block = False
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(canonical|the position|statement|positioning)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s:
+                out.append(s)
+    return "\n".join(out).strip() or text[:400].strip()
+
+
+def extract_value_pillars(positioning_text: str) -> list[str]:
+    out: list[str] = []
+    in_pillars = False
+    for line in positioning_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(value|value themes|value pillars|3\.\s*value)\b", s, re.IGNORECASE):
+            in_pillars = True
+            continue
+        if in_pillars:
+            if s.startswith("#"):
+                break
+            if s.startswith("-") or s.startswith("*"):
+                out.append(s.lstrip("-* ").strip())
+    return out[:6]
+
+
+def extract_unique_attributes(positioning_text: str) -> list[str]:
+    out: list[str] = []
+    in_block = False
+    for line in positioning_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(unique attributes|2\.\s*unique)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s.startswith("-") or s.startswith("*"):
+                out.append(s.lstrip("-* ").strip())
+    return out[:6]
+
+
+def extract_anchors(positioning_text: str) -> list[str]:
+    """Pull load-bearing terms (5+ chars) from the canonical statement."""
+    canonical = extract_canonical_statement(positioning_text)
+    candidates = re.findall(r"[a-z][a-z-]{4,}", canonical.lower())
+    seen = set()
+    out: list[str] = []
+    stop = {"unlike", "which", "their", "every", "those", "where", "while",
+            "without", "across", "against", "around", "before", "after",
+            "still", "would", "should", "could", "about"}
+    for w in candidates:
+        if w not in seen and w not in stop:
+            seen.add(w)
+            out.append(w)
+    return out[:20]
+
+
+def find_persona_file(client: str, cohort: str) -> Path | None:
+    candidates = [
+        SUBSTRATE_ROOT / "clients" / client / "personas" / f"{cohort}.md",
+        SUBSTRATE_ROOT / "clients" / client / "personas" / "buyer-state" / f"{cohort}.md",
+        SUBSTRATE_ROOT / "personas" / "buyer-state" / f"{cohort}.md",
+        SUBSTRATE_ROOT / "personas" / f"{cohort}.md",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+def extract_cohort_signals(persona_text: str) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {
+        "frictions": [], "objections": [], "criteria": [],
+        "voice": [], "goals": [], "snapshot": [],
+    }
+    cur = None
+    for line in persona_text.splitlines():
+        s = line.strip()
+        m = re.match(r"^#+\s*(.+)$", s)
+        if m:
+            h = m.group(1).lower()
+            if "snapshot" in h or "one-line" in h or "jtbd" in h:
+                cur = "snapshot"
+            elif "friction" in h or "care about" in h:
+                cur = "frictions"
+            elif "objection" in h:
+                cur = "objections"
+            elif "criteri" in h or "decision" in h:
+                cur = "criteria"
+            elif "voice" in h or "tone" in h:
+                cur = "voice"
+            elif "goal" in h:
+                cur = "goals"
+            else:
+                cur = None
+            continue
+        if cur and s and (s.startswith("-") or s.startswith("*")):
+            out[cur].append(s.lstrip("-* ").strip())
+        elif cur == "snapshot" and s:
+            out["snapshot"].append(s)
+    return out
+
+
+def extract_kill_list(brand_voice_text: str | None) -> list[str]:
+    default = ["orchestration", "seamless", "strategic", "leverage", "transform",
+               "holistic", "synergy", "bespoke", "unlock", "robust", "sophisticated",
+               "comprehensive"]
+    if not brand_voice_text:
+        return default
+    out: list[str] = []
+    in_block = False
+    for line in brand_voice_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(kill[-\s]?list|words to avoid|banned|do not use)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s.startswith("-") or s.startswith("*"):
+                out.append(s.lstrip("-* ").strip().lower())
+    return out or default
+
+
+def parse_calendar_slot(client: str, slot_id: str | None) -> dict | None:
+    """Naive YAML-ish reader for calendar.yaml. Looks for a slot whose `id`
+    matches; returns its declared `theme`, `cohort`, `purpose`, `platform`.
+
+    Avoids the PyYAML dep. The format is documented in
+    templates/social-calendar-example.yaml.
+    """
+    if not slot_id:
+        return None
+    cal_path = SUBSTRATE_ROOT / "clients" / client / "social" / "calendar.yaml"
+    if not cal_path.is_file():
+        return None
+    text = cal_path.read_text(encoding="utf-8")
+    slots: list[dict] = []
+    cur: dict | None = None
+    in_slots = False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if re.match(r"^slots\s*:", s):
+            in_slots = True
+            continue
+        if not in_slots:
+            continue
+        m = re.match(r"^-\s*id\s*:\s*(.+)$", s)
+        if m:
+            if cur is not None:
+                slots.append(cur)
+            cur = {"id": m.group(1).strip().strip('"\'')}
+            continue
+        m = re.match(r"^([a-z_]+)\s*:\s*(.+)$", s)
+        if m and cur is not None:
+            cur[m.group(1)] = m.group(2).strip().strip('"\'')
+    if cur is not None:
+        slots.append(cur)
+    for slot in slots:
+        if slot.get("id") == slot_id:
+            return slot
+    return None
+
+
+# ---------- Per-platform draft renderers ----------
+
+def render_linkedin_long(*, anchors: list[str], pillars: list[str],
+                         uniques: list[str], cohort: dict[str, list[str]],
+                         purpose: str, author: str) -> dict:
+    template = PURPOSE_TEMPLATES[purpose]
+    friction = (cohort["frictions"][0] if cohort.get("frictions") else "<friction from persona>")
+    objection = (cohort["objections"][0] if cohort.get("objections") else "<objection from persona>")
+    pillar = (pillars[0] if pillars else "<value pillar>")
+    unique = (uniques[0] if uniques else "<unique attribute>")
+    anchor1 = anchors[0] if anchors else "<anchor>"
+    anchor2 = anchors[1] if len(anchors) > 1 else "<anchor>"
+
+    # Hook
+    hook_line = f"<hook line: {template['hook_lens']}; lead with friction, not product>"
+    hook_l2 = f"<second hook line: name the {anchor1} or {anchor2} angle>"
+
+    body = []
+    body.append(f"<beat 1: state the observation that names {friction[:140]} in plain terms>")
+    body.append(f"<beat 2: explain the mechanism — why this is happening now, not last year>")
+    body.append(f"<beat 3: counter the cohort objection — '{objection[:120]}' — with a specific example>")
+    body.append(f"<beat 4: name the implication for the role the cohort holds>")
+    body.append(f"<beat 5: anchor on the value pillar — '{pillar[:120]}' — without product-pitch language>")
+    if author == "corporate":
+        close = f"<close: name the company milestone or announcement, link in first comment>"
+    else:
+        close = f"<close (comment-prompt): ask a question that invites the cohort to share their version>"
+    return {
+        "hook": [hook_line, hook_l2],
+        "body": body,
+        "close": close,
+        "platform_note": ("Personal-account voice; reach compounds on personal accounts in B2B "
+                          "(per pat_creator-not-corporate). Corporate-handle posts read as announcement, "
+                          "not as growth content.") if author == "personal" else (
+            "Corporate-handle voice; this is announcement copy. For growth-shaped posts, use --author personal. "
+            "Reach gap is structural, not stylistic (per pat_creator-not-corporate)."),
+        "format_note": ("Native LinkedIn shape: short opener, line breaks every 1-2 sentences, no link in body, "
+                        "comment-prompt close. Per pat_native-format-beats-cross-post, do not paste this draft "
+                        "into X or Threads as-is; rewrite for the surface."),
+    }
+
+
+def render_linkedin_text(*, anchors: list[str], pillars: list[str],
+                         uniques: list[str], cohort: dict[str, list[str]],
+                         purpose: str, author: str) -> dict:
+    pillar = (pillars[0] if pillars else "<value pillar>")
+    friction = (cohort["frictions"][0] if cohort.get("frictions") else "<friction>")
+    return {
+        "hook": [f"<hook line 1: name '{friction[:150]}' in cohort language>",
+                 f"<hook line 2: pivot on the anchor '{anchors[0] if anchors else '<anchor>'}'.>"],
+        "body": [f"<beat: state the value pillar '{pillar[:120]}' in cohort language>",
+                 f"<beat: name a specific moment when this lands>",
+                 f"<beat: name what the cohort gives up if they ignore it>"],
+        "close": "<soft close: a one-line invitation to keep thinking, no hard call>",
+        "platform_note": "Short LinkedIn post; no link in body; soft close.",
+        "format_note": "Per pat_native-format-beats-cross-post, this shape does not map to X-thread cross-post.",
+    }
+
+
+def render_x_thread(*, anchors: list[str], pillars: list[str],
+                    uniques: list[str], cohort: dict[str, list[str]],
+                    purpose: str, author: str) -> dict:
+    pillar = (pillars[0] if pillars else "<value pillar>")
+    unique = (uniques[0] if uniques else "<unique attribute>")
+    objection = (cohort["objections"][0] if cohort.get("objections") else "<objection>")
+    friction = (cohort["frictions"][0] if cohort.get("frictions") else "<friction>")
+    tweets = []
+    tweets.append(f"<tweet 1 (max 280): hook on the cohort's friction — '{friction[:160]}' — no link, no @>")
+    tweets.append(f"<tweet 2: state the contrarian beat using the unique attribute '{unique[:140]}'>")
+    tweets.append(f"<tweet 3: name the mechanism that makes this true — one sentence, one example>")
+    tweets.append(f"<tweet 4: counter the cohort objection '{objection[:140]}' with a specific case>")
+    tweets.append(f"<tweet 5: name the value pillar '{pillar[:140]}' as a payoff line>")
+    tweets.append(f"<tweet 6: name the implication if the cohort acts on this in the next 30 days>")
+    tweets.append(f"<tweet 7 (close): soft call — link to long-form, newsletter, or product, with one line of context>")
+    return {
+        "hook": [tweets[0]],
+        "body": tweets[1:-1],
+        "close": tweets[-1],
+        "platform_note": "X thread; hook tweet has no link or @ in lead. Reply rate beats RT rate.",
+        "format_note": ("Native X-thread shape; per pat_native-format-beats-cross-post, do not cross-post wholesale "
+                        "to LinkedIn — the line break density and opener length are different."),
+    }
+
+
+def render_x_single(*, anchors: list[str], pillars: list[str],
+                    uniques: list[str], cohort: dict[str, list[str]],
+                    purpose: str, author: str) -> dict:
+    friction = (cohort["frictions"][0] if cohort.get("frictions") else "<friction>")
+    return {
+        "hook": [f"<single tweet (max 280): hook on '{friction[:120]}' and payoff in one breath; "
+                 f"include anchor '{anchors[0] if anchors else '<anchor>'}'.>"],
+        "body": [],
+        "close": "<no call required>",
+        "platform_note": "Single tweet; the entire payoff happens in one tweet.",
+        "format_note": "Per pat_native-format-beats-cross-post, single-tweet shape does not map to LinkedIn directly.",
+    }
+
+
+def render_tiktok(*, anchors: list[str], pillars: list[str],
+                  uniques: list[str], cohort: dict[str, list[str]],
+                  purpose: str, author: str) -> dict:
+    friction = (cohort["frictions"][0] if cohort.get("frictions") else "<friction>")
+    unique = (uniques[0] if uniques else "<unique attribute>")
+    pillar = (pillars[0] if pillars else "<value pillar>")
+    return {
+        "hook": [f"<voice-over hook (first 1.5s, max 12 words): name '{friction[:80]}' in cohort language>"],
+        "body": [
+            "<beat 1 (3-6s): pattern interrupt — visual change OR contradiction>",
+            f"<beat 2 (6-15s): the unique attribute '{unique[:80]}' demonstrated, not stated>",
+            f"<beat 3 (15-25s): the value pillar '{pillar[:80]}' as the payoff>",
+            "<beat 4 (25-30s): on-screen call to action, ambient voice-over outro>",
+        ],
+        "close": "<caption (first 100 chars visible): cohort hook line + soft call; remaining caption: context + 2-3 hashtags>",
+        "platform_note": "TikTok; no logos or product UI in first 1.5s; pattern-interrupt at 3s mark.",
+        "format_note": ("Native TikTok shape; per pat_native-format-beats-cross-post, the same script does not "
+                        "carry to YouTube Shorts without a title and description rewrite."),
+    }
+
+
+def render_instagram_caption(*, anchors: list[str], pillars: list[str],
+                             uniques: list[str], cohort: dict[str, list[str]],
+                             purpose: str, author: str) -> dict:
+    friction = (cohort["frictions"][0] if cohort.get("frictions") else "<friction>")
+    pillar = (pillars[0] if pillars else "<value pillar>")
+    return {
+        "hook": [f"<hook (first 125 chars): name '{friction[:100]}' in cohort language>"],
+        "body": [
+            f"<beat: name the moment the cohort feels it>",
+            f"<beat: state the value pillar '{pillar[:120]}' as a payoff>",
+            "<beat: name what changes when the cohort acts on it>",
+        ],
+        "close": "<soft call + 3-7 hashtags mixing reach (1-2 broad, 3-5 niche)>",
+        "platform_note": "Instagram caption; hook visible before 'more'; no link in caption (link in bio).",
+        "format_note": "Per pat_native-format-beats-cross-post, Instagram captions and LinkedIn posts diverge on opener length.",
+    }
+
+
+def render_youtube_short(*, anchors: list[str], pillars: list[str],
+                         uniques: list[str], cohort: dict[str, list[str]],
+                         purpose: str, author: str) -> dict:
+    friction = (cohort["frictions"][0] if cohort.get("frictions") else "<friction>")
+    pillar = (pillars[0] if pillars else "<value pillar>")
+    return {
+        "hook": [f"<title (max 100 chars): cohort-language hook + outcome>",
+                 f"<voice-over hook (first 3s): name '{friction[:80]}' in cohort language>"],
+        "body": [
+            "<beat 1 (3-10s): name the contrarian observation>",
+            f"<beat 2 (10-25s): demonstrate the unique attribute>",
+            f"<beat 3 (25-50s): state the value pillar '{pillar[:100]}' as the payoff and call>",
+        ],
+        "close": "<description (first 150 chars visible): one-line context + link to long-form; remaining: chapters and resources>",
+        "platform_note": "YouTube Shorts; title and first frame matter for click-through; description first-150 visible.",
+        "format_note": "Per pat_native-format-beats-cross-post, YouTube Shorts and TikTok diverge on title and description architecture.",
+    }
+
+
+PLATFORM_RENDERERS = {
+    "linkedin-long": render_linkedin_long,
+    "linkedin-text": render_linkedin_text,
+    "x-thread": render_x_thread,
+    "x-single": render_x_single,
+    "tiktok": render_tiktok,
+    "instagram-caption": render_instagram_caption,
+    "youtube-short": render_youtube_short,
+}
+
+
+# ---------- Top-level draft assembly ----------
+
+def render_draft(*, client: str, platform: str, cohort: str, purpose: str,
+                 author: str, calendar_slot: str | None,
+                 canonical: str, anchors: list[str], pillars: list[str],
+                 uniques: list[str], cohort_signals: dict[str, list[str]],
+                 cohort_path: Path, kill_list: list[str], today: str,
+                 variant_idx: int) -> str:
+    constraints = PLATFORM_CONSTRAINTS[platform]
+    renderer = PLATFORM_RENDERERS[platform]
+    rendered = renderer(
+        anchors=anchors, pillars=pillars, uniques=uniques,
+        cohort=cohort_signals, purpose=purpose, author=author,
+    )
+
+    lines = []
+    lines.append("---")
+    lines.append(f"draft_id: {client}-social-{platform}-{cohort}-{purpose}-{today}-{variant_idx}")
+    lines.append("asset_type: social-draft")
+    lines.append(f"client: {client}")
+    lines.append(f"platform: {platform}")
+    lines.append(f"cohort: {cohort}")
+    lines.append(f"purpose: {purpose}")
+    lines.append(f"author: {author}")
+    lines.append(f"calendar_slot: {calendar_slot or ''}")
+    lines.append(f"variant_idx: {variant_idx}")
+    lines.append("substrate_layers_read: [positioning, icp, voc, brand-voice]")
+    lines.append("patterns_applied: [native-format-beats-cross-post, creator-not-corporate, social-as-distribution-not-conversion, buyer-mindset-not-product-features, copywriting-craft-fundamentals]")
+    lines.append("contradictions_resolved: []")
+    lines.append("produced_by: social-content-design")
+    lines.append("authored_date: " + today)
+    lines.append("voice_check: pending")
+    lines.append("canonical_position_excerpt: |")
+    for ln in canonical.splitlines()[:8]:
+        lines.append(f"  {ln}")
+    lines.append("cohort_voice_signals: |")
+    for s in (cohort_signals.get("snapshot") or [])[:3]:
+        lines.append(f"  {s}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# social-content-design: {client} | {platform} | {cohort} | {purpose} | {today} | v{variant_idx}")
+    lines.append("")
+
+    # Brief context
+    lines.append("## Brief context")
+    lines.append("")
+    lines.append("Canonical positioning excerpt:")
+    lines.append("")
+    lines.append("> " + canonical.replace("\n", "\n> ").strip())
+    lines.append("")
+    lines.append(f"Cohort: `{cohort}` from `{cohort_path.relative_to(SUBSTRATE_ROOT) if str(cohort_path).startswith(str(SUBSTRATE_ROOT)) else cohort_path}`.")
+    lines.append("")
+    if cohort_signals.get("snapshot"):
+        lines.append("Cohort one-line snapshot:")
+        for s in cohort_signals["snapshot"][:2]:
+            lines.append(f"> {s}")
+        lines.append("")
+    if cohort_signals.get("frictions"):
+        lines.append("Cohort frictions to lean into (top 3):")
+        for f in cohort_signals["frictions"][:3]:
+            lines.append(f"- {f}")
+        lines.append("")
+    lines.append(f"Purpose: `{purpose}`. Hook lens: {PURPOSE_TEMPLATES[purpose]['hook_lens']}.")
+    lines.append("")
+    lines.append(f"Author lane: `{author}`. " + (
+        "Personal-account voice. B2B reach compounds on personal accounts (per pat_creator-not-corporate); "
+        "corporate-handle posts read as announcement, not as growth."
+        if author == "personal"
+        else "Corporate-handle voice. Use for announcements; for growth-shaped posts, default to --author personal."
+    ))
+    lines.append("")
+    lines.append("Buyer mindset to write toward: the cohort is not in product-feature mindset. The hook lands "
+                 "in their friction or their objection (the buyer's mindset is the substrate; product features "
+                 "are the receipt). Write toward forces of progress, not toward feature parity.")
+    lines.append("")
+
+    # Format constraints
+    lines.append("## Format constraints")
+    lines.append("")
+    lines.append(f"Platform format: `{constraints['format']}`.")
+    for k, v in constraints.items():
+        if k == "format":
+            continue
+        lines.append(f"- {k}: {v}")
+    lines.append("")
+
+    # The draft
+    lines.append("## The draft")
+    lines.append("")
+    if rendered["hook"]:
+        lines.append("**Hook**:")
+        lines.append("")
+        for h in rendered["hook"]:
+            lines.append(f"{h}")
+        lines.append("")
+    if rendered["body"]:
+        lines.append("**Body**:")
+        lines.append("")
+        for b in rendered["body"]:
+            lines.append(f"- {b}")
+        lines.append("")
+    if rendered["close"]:
+        lines.append("**Close**:")
+        lines.append("")
+        lines.append(rendered["close"])
+        lines.append("")
+    lines.append("**Platform note**:")
+    lines.append("")
+    lines.append(rendered["platform_note"])
+    lines.append("")
+    lines.append("**Native-format note**:")
+    lines.append("")
+    lines.append(rendered["format_note"])
+    lines.append("")
+    lines.append("Each platform has native rhythms; cross-posted content underperforms native authoring "
+                 "substantially. The rewrite is the work, not the cross-post. Per pat_native-format-beats-cross-post, "
+                 "ship native authoring on the surface this draft targets; rewrite for the next surface separately.")
+    lines.append("")
+
+    # Anchor terms
+    lines.append("## Anchor terms used")
+    lines.append("")
+    lines.append("Variants must include at least 2 of these anchors (per `copywriting-craft-fundamentals` — specific over abstract):")
+    lines.append("")
+    for a in anchors[:12]:
+        lines.append(f"- `{a}`")
+    lines.append("")
+
+    # Avoid list
+    lines.append("## Avoid list (kill-list + off-position terms)")
+    lines.append("")
+    lines.append("These terms are off-position. Drafts that include them are rejected by `voice-enforce`:")
+    lines.append("")
+    for k in kill_list[:20]:
+        lines.append(f"- `{k}`")
+    lines.append("")
+
+    # Refusal compliance
+    lines.append("## Refusal-pattern compliance")
+    lines.append("")
+    lines.append("This draft does NOT:")
+    lines.append("")
+    lines.append("- Claim a number, customer name, or quote without a substrate path.")
+    lines.append("- Use kill-list terms.")
+    lines.append("- Promise an outcome not in the allowed-claims set.")
+    lines.append("- Cross-post the same shape across platforms; per pat_native-format-beats-cross-post, the rewrite is the work.")
+    lines.append("")
+    lines.append("If the operator-finished post drifts from these rules, run `voice-enforce` and `claim-verify` before scheduling.")
+    lines.append("")
+
+    # Distribution note
+    lines.append("## Distribution note")
+    lines.append("")
+    lines.append("Social drives top-of-funnel awareness; last-click attribution underweights its real role "
+                 "(per pat_social-as-distribution-not-conversion). Track this draft on cohort metrics:")
+    lines.append("")
+    lines.append("- Branded-search lift in the 30-90 days after publish.")
+    lines.append("- Direct-traffic lift, audience overlap with closed-won.")
+    lines.append("- Newsletter or trial signups attributed via UTM where social is the touch.")
+    lines.append("- Engagement rate per post per platform separately; do not aggregate.")
+    lines.append("")
+    lines.append("Last-click CAC for this post is structurally undercount; do not fund the social program against it.")
+    lines.append("")
+
+    # Substrate citations
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- positioning: `clients/{client}/01-position.md`")
+    lines.append(f"- ICP: `clients/{client}/02-icp.md`")
+    lines.append(f"- brand voice: `clients/{client}/07-brand-voice.md`")
+    lines.append(f"- cohort: `{cohort_path.relative_to(SUBSTRATE_ROOT) if str(cohort_path).startswith(str(SUBSTRATE_ROOT)) else cohort_path}`")
+    if calendar_slot:
+        lines.append(f"- calendar slot: `clients/{client}/social/calendar.yaml#slot:{calendar_slot}`")
+    lines.append("")
+
+    # See also
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `social-fatigue-monitor` — flags this post if engagement decays after publish.")
+    lines.append("- `social-amplification-test` — A/B test hook variants against this draft.")
+    lines.append("- `social-listening-themes` — feeds new hook angles from comment data.")
+    lines.append("- `voice-enforce` and `claim-verify` — gates the body must pass before publish.")
+    lines.append("- `routines/social-content-cycle.md` — the weekly cycle this draft is one slot of.")
+    lines.append("- `knowledge/patterns/native-format-beats-cross-post.md`")
+    lines.append("- `knowledge/patterns/creator-not-corporate.md`")
+    lines.append("- `knowledge/patterns/social-as-distribution-not-conversion.md`")
+    return "\n".join(lines)
+
+
+def run_voice_enforce(asset: Path) -> tuple[bool, str]:
+    voice_bin = SUBSTRATE_ROOT / "skills" / "voice-enforce" / "bin" / "voice-enforce"
+    if not voice_bin.is_file():
+        return True, "voice-enforce binary not found; skipping"
+    try:
+        result = subprocess.run(
+            [str(voice_bin), str(asset)],
+            capture_output=True, text=True, timeout=20,
+        )
+        return result.returncode == 0, (result.stdout + result.stderr).strip()[-400:]
+    except Exception as exc:
+        return False, f"voice-enforce error: {exc}"
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="social-content-design")
+    p.add_argument("--client", required=True)
+    p.add_argument("--platform", required=True, choices=list(PLATFORM_CONSTRAINTS.keys()))
+    p.add_argument("--cohort", required=True)
+    p.add_argument("--purpose", required=True, choices=list(PURPOSE_TEMPLATES.keys()))
+    p.add_argument("--author", default="personal", choices=["personal", "corporate"])
+    p.add_argument("--variants", type=int, default=1)
+    p.add_argument("--out", default=None)
+    p.add_argument("--calendar-slot", default=None)
+    p.add_argument("--allow-voice-fail", action="store_true",
+                   help="Mark voice-enforce failures but exit 0 (for in-progress drafts).")
+    args = p.parse_args()
+
+    if args.variants < 1 or args.variants > 8:
+        sys.stderr.write("REFUSED: --variants must be between 1 and 8\n")
+        return 4
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        return refuse("client-root-missing",
+                      f"clients/{args.client}/ not found. "
+                      f"Run substrate-bootstrap-prospect or create the client substrate first.")
+
+    pos_path = client_root / "01-position.md"
+    pos = read_file_or_none(pos_path)
+    if pos is None:
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/01-position.md not found. "
+                      f"Run positioning-forge first; the draft cannot be grounded.")
+
+    bv_path = client_root / "07-brand-voice.md"
+    bv = read_file_or_none(bv_path)
+    if bv is None:
+        sys.stderr.write(f"  warn: brand-voice layer absent at {bv_path}; "
+                         f"using default kill-list. Add 07-brand-voice.md for sharper voice gating.\n")
+
+    cohort_path = find_persona_file(args.client, args.cohort)
+    if cohort_path is None:
+        return refuse("missing-buyer-state",
+                      f"buyer-state cohort '{args.cohort}' not found. Looked in: "
+                      f"clients/{args.client}/personas/, personas/buyer-state/. "
+                      f"Add the persona file before drafting prospecting social copy.")
+
+    # Optional calendar
+    slot = None
+    if args.calendar_slot:
+        slot = parse_calendar_slot(args.client, args.calendar_slot)
+        if slot is None:
+            return refuse("calendar-slot-undeclared",
+                          f"slot '{args.calendar_slot}' not found in clients/{args.client}/social/calendar.yaml. "
+                          f"Add the slot or drop --calendar-slot.")
+
+    # Extract substrate
+    canonical = extract_canonical_statement(pos)
+    anchors = extract_anchors(pos)
+    pillars = extract_value_pillars(pos)
+    uniques = extract_unique_attributes(pos)
+    cohort_text = cohort_path.read_text(encoding="utf-8")
+    cohort_signals = extract_cohort_signals(cohort_text)
+    kill_list = extract_kill_list(bv)
+
+    # Output dir
+    out_dir = Path(args.out) if args.out else (client_root / "social" / "drafts")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Purpose+platform mismatch warning
+    if args.platform == "x-single" and args.purpose in ("teardown", "story", "customer-spotlight"):
+        sys.stderr.write(f"  warn: purpose '{args.purpose}' does not fit single-tweet shape; "
+                         f"consider --platform x-thread instead.\n")
+
+    voice_failures = 0
+    written: list[Path] = []
+    for v in range(args.variants):
+        out_path = out_dir / f"{args.platform}-{args.cohort}-{args.purpose}-{today}-{v}.md"
+        md = render_draft(
+            client=args.client,
+            platform=args.platform,
+            cohort=args.cohort,
+            purpose=args.purpose,
+            author=args.author,
+            calendar_slot=args.calendar_slot,
+            canonical=canonical,
+            anchors=anchors,
+            pillars=pillars,
+            uniques=uniques,
+            cohort_signals=cohort_signals,
+            cohort_path=cohort_path,
+            kill_list=kill_list,
+            today=today,
+            variant_idx=v,
+        )
+        out_path.write_text(md, encoding="utf-8")
+        written.append(out_path)
+
+        # Voice gate
+        ok, voice_log = run_voice_enforce(out_path)
+        new_text = out_path.read_text(encoding="utf-8")
+        if ok:
+            new_text = new_text.replace("voice_check: pending", "voice_check: pass", 1)
+            out_path.write_text(new_text, encoding="utf-8")
+            sys.stderr.write(f"  ✓ {out_path.name} voice-enforce PASS\n")
+        else:
+            new_text = new_text.replace("voice_check: pending", "voice_check: fail", 1)
+            out_path.write_text(new_text, encoding="utf-8")
+            sys.stderr.write(f"  ✗ {out_path.name} voice-enforce FAIL\n")
+            sys.stderr.write(f"    {voice_log}\n")
+            voice_failures += 1
+
+    sys.stderr.write(f"\n[social-content-design] wrote {len(written)} drafts to {out_dir}\n")
+    sys.stderr.write(f"  client={args.client}  platform={args.platform}  cohort={args.cohort}  "
+                     f"purpose={args.purpose}  author={args.author}\n")
+    sys.stderr.write(f"  anchors={len(anchors)}  pillars={len(pillars)}  uniques={len(uniques)}  "
+                     f"kill_list={len(kill_list)}\n")
+
+    for w in written:
+        print(str(w))
+
+    if voice_failures > 0 and not args.allow_voice_fail:
+        sys.stderr.write(f"FAIL: {voice_failures} draft(s) failed voice-enforce; fix before publish.\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

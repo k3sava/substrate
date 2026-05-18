@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""social-amplification-test — design A/B tests for hook variants, format
+variants, or posting time. Real power calculation against a baseline
+engagement rate. Outputs a test spec with measurement contract.
+
+Refuses without canonical positioning and a named buyer-state cohort.
+Composes substrate citations for every variant scaffold.
+
+Usage:
+    social-amplification-test --client <client>
+                              --platform <linkedin|x|tiktok|instagram|youtube|threads>
+                              --cohort <buyer-state-slug>
+                              --test-type <hook|format|time>
+                              --baseline-engagement-rate <float>
+                              [--target-lift-pct <float>]
+                              [--variants <int>]
+                              [--alpha <float>]
+                              [--power <float>]
+                              [--out <dir>]
+
+Exit codes:
+    0 — test spec written
+    3 — refused (substrate gap, missing positioning, missing cohort)
+    4 — invalid args
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+
+
+# Critical values for common alphas / powers, two-sided where applicable.
+# We use z-tables rather than scipy because power calculations should not need
+# a heavy dependency. Two-sided alpha 0.10 = z 1.645; alpha 0.05 = z 1.96.
+ZA_TWO_SIDED = {0.20: 1.282, 0.10: 1.645, 0.05: 1.960, 0.025: 2.241, 0.01: 2.576}
+ZB_ONE_SIDED = {0.70: 0.524, 0.80: 0.842, 0.85: 1.036, 0.90: 1.282, 0.95: 1.645}
+
+
+# Typical platform impressions-per-post per author lane (rough order of magnitude
+# for run-day estimation; honest about being approximate).
+PLATFORM_TYPICAL_IMPRESSIONS = {
+    "linkedin": {"personal_low": 800, "personal_high": 8000, "corporate_low": 200, "corporate_high": 2000},
+    "x": {"personal_low": 1500, "personal_high": 30000, "corporate_low": 500, "corporate_high": 5000},
+    "tiktok": {"personal_low": 3000, "personal_high": 100000, "corporate_low": 1000, "corporate_high": 30000},
+    "instagram": {"personal_low": 1000, "personal_high": 20000, "corporate_low": 500, "corporate_high": 8000},
+    "youtube": {"personal_low": 1000, "personal_high": 50000, "corporate_low": 500, "corporate_high": 10000},
+    "threads": {"personal_low": 1000, "personal_high": 15000, "corporate_low": 300, "corporate_high": 3000},
+}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def read_file_or_none(path: Path) -> str | None:
+    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+
+def extract_canonical_statement(text: str) -> str:
+    in_block = False
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(canonical|the position|statement|positioning)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s:
+                out.append(s)
+    return "\n".join(out).strip() or text[:400].strip()
+
+
+def extract_anchors(positioning_text: str) -> list[str]:
+    canonical = extract_canonical_statement(positioning_text)
+    candidates = re.findall(r"[a-z][a-z-]{4,}", canonical.lower())
+    seen = set()
+    out: list[str] = []
+    stop = {"unlike", "which", "their", "every", "those", "where", "while",
+            "without", "across", "against", "around", "before", "after"}
+    for w in candidates:
+        if w not in seen and w not in stop:
+            seen.add(w)
+            out.append(w)
+    return out[:15]
+
+
+def extract_value_pillars(positioning_text: str) -> list[str]:
+    out: list[str] = []
+    in_pillars = False
+    for line in positioning_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(value|value themes|value pillars|3\.\s*value)\b", s, re.IGNORECASE):
+            in_pillars = True
+            continue
+        if in_pillars:
+            if s.startswith("#"):
+                break
+            if s.startswith("-") or s.startswith("*"):
+                out.append(s.lstrip("-* ").strip())
+    return out[:6]
+
+
+def extract_unique_attributes(positioning_text: str) -> list[str]:
+    out: list[str] = []
+    in_block = False
+    for line in positioning_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(unique attributes|2\.\s*unique)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s.startswith("-") or s.startswith("*"):
+                out.append(s.lstrip("-* ").strip())
+    return out[:6]
+
+
+def find_persona_file(client: str, cohort: str) -> Path | None:
+    candidates = [
+        SUBSTRATE_ROOT / "clients" / client / "personas" / f"{cohort}.md",
+        SUBSTRATE_ROOT / "clients" / client / "personas" / "buyer-state" / f"{cohort}.md",
+        SUBSTRATE_ROOT / "personas" / "buyer-state" / f"{cohort}.md",
+        SUBSTRATE_ROOT / "personas" / f"{cohort}.md",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+def extract_cohort_signals(persona_text: str) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {
+        "frictions": [], "objections": [], "criteria": [], "snapshot": [],
+    }
+    cur = None
+    for line in persona_text.splitlines():
+        s = line.strip()
+        m = re.match(r"^#+\s*(.+)$", s)
+        if m:
+            h = m.group(1).lower()
+            if "snapshot" in h or "jtbd" in h:
+                cur = "snapshot"
+            elif "friction" in h or "care about" in h:
+                cur = "frictions"
+            elif "objection" in h:
+                cur = "objections"
+            elif "criteri" in h or "decision" in h:
+                cur = "criteria"
+            else:
+                cur = None
+            continue
+        if cur and s and (s.startswith("-") or s.startswith("*")):
+            out[cur].append(s.lstrip("-* ").strip())
+        elif cur == "snapshot" and s:
+            out["snapshot"].append(s)
+    return out
+
+
+# ---------- Power calculation ----------
+
+def closest_z(d: dict, key: float) -> float:
+    if key in d:
+        return d[key]
+    keys = sorted(d.keys())
+    # Pick nearest (by absolute difference)
+    return d[min(keys, key=lambda k: abs(k - key))]
+
+
+def two_proportion_sample_size(p1: float, p2: float, alpha: float, power: float) -> int:
+    """Sample size per arm for two-proportion z-test."""
+    z_a = closest_z(ZA_TWO_SIDED, alpha)
+    z_b = closest_z(ZB_ONE_SIDED, power)
+    diff = abs(p2 - p1)
+    if diff == 0:
+        return 10**9
+    n = ((z_a + z_b) ** 2) * (p1 * (1 - p1) + p2 * (1 - p2)) / (diff ** 2)
+    return int(math.ceil(n))
+
+
+def estimate_run_days(required_sample: int, platform: str, posts_per_day: float = 1.0) -> int:
+    """Estimate days to accumulate the required impression sample.
+
+    Uses a midpoint of the personal-account impressions-per-post range for
+    the platform; biased low to avoid optimistic estimates.
+    """
+    plat_short = platform.split("-")[0]
+    pdata = PLATFORM_TYPICAL_IMPRESSIONS.get(plat_short, {"personal_low": 800, "personal_high": 8000})
+    midpoint = (pdata.get("personal_low", 800) + pdata.get("personal_high", 8000)) / 2.0
+    impressions_per_day = midpoint * posts_per_day
+    if impressions_per_day <= 0:
+        return 90
+    days = required_sample / impressions_per_day
+    return int(math.ceil(days))
+
+
+# ---------- Variant scaffolds ----------
+
+def render_hook_variants(*, anchors: list[str], pillars: list[str], uniques: list[str],
+                         cohort: dict[str, list[str]], variants: int) -> list[str]:
+    """Generate N hook scaffolds, each anchored on a different beat."""
+    out: list[str] = []
+    frictions = cohort.get("frictions") or [f"<friction-{i}>" for i in range(variants)]
+    objections = cohort.get("objections") or [f"<objection-{i}>" for i in range(variants)]
+    pillars = pillars or [f"<value-pillar-{i}>" for i in range(variants)]
+    uniques = uniques or [f"<unique-attribute-{i}>" for i in range(variants)]
+
+    angles = [
+        ("friction-led", "Open on the cohort's friction, not on the product. "
+                         "Hook lens: name the moment the cohort feels it. Per pat_buyer-mindset-not-product-features, "
+                         "the buyer is in friction-mindset, not feature-mindset."),
+        ("contrarian-take", "Stake a position that contradicts the dominant assumption in the cohort. "
+                            "Hook lens: name the assumption, then name the move that drops it. "
+                            "Specific over abstract per pat_copywriting-craft-fundamentals."),
+        ("data-anchor", "Lead with a verifiable number from substrate or public source. "
+                        "Hook lens: the number is the hook; the implication follows. No invented stats."),
+        ("story-cold-open", "Open mid-scene with a concrete moment from a real customer or operator. "
+                            "Hook lens: scene first, name the lesson at the end."),
+    ]
+
+    for i in range(variants):
+        name, lens = angles[i % len(angles)]
+        friction = frictions[i % len(frictions)]
+        objection = objections[i % len(objections)]
+        pillar = pillars[i % len(pillars)]
+        unique = uniques[i % len(uniques)]
+        anchor = anchors[i % max(len(anchors), 1)] if anchors else "<anchor>"
+        block = []
+        block.append(f"### Variant {chr(ord('A') + i)} — {name}")
+        block.append("")
+        block.append(f"**Hook angle**: {lens}")
+        block.append("")
+        block.append(f"**Hook draft**: <hook line targeting cohort friction '{friction[:120]}'; "
+                     f"includes anchor `{anchor}` from positioning.>")
+        block.append("")
+        block.append(f"**Body bridge**: pivot to value pillar '{pillar[:120]}'; counter the cohort objection "
+                     f"'{objection[:120]}' with a specific case.")
+        block.append("")
+        block.append(f"**Close**: <native-format close per the platform; variants share the same close>")
+        block.append("")
+        block.append(f"**Substrate cited**: clients/<client>/01-position.md (anchor `{anchor}`); "
+                     f"clients/<client>/02-icp.md; personas/buyer-state/<cohort>.md (friction)")
+        out.append("\n".join(block))
+    return out
+
+
+def render_format_variants(*, platform: str, variants: int) -> list[str]:
+    out: list[str] = []
+    options = []
+    plat_short = platform.split("-")[0]
+    if plat_short == "linkedin":
+        options = [
+            ("long-form-text", "800-1500 chars, 5-7 body sections, comment-prompt close, no link in body."),
+            ("short-text", "max 1300 chars, 3-6 body sections, soft close."),
+            ("carousel-image", "8-10 slides, hook on slide 1, payoff on last slide; alt-text per slide."),
+            ("video", "30-60s talking-head; on-screen text reinforces the hook."),
+        ]
+    elif plat_short == "x":
+        options = [
+            ("thread-7", "7-tweet thread; hook tweet has no link or @ in lead; soft call on final."),
+            ("single-tweet", "single tweet (max 280 chars); hook + payoff in one breath."),
+            ("quote-tweet", "quote-tweet a public artifact with a one-line cohort-language commentary."),
+            ("image-anchor", "single tweet with one-image proof; tweet body is short context."),
+        ]
+    elif plat_short == "tiktok":
+        options = [
+            ("vertical-video-15s", "15s vertical video; pattern interrupt at 3s; payoff at 12s."),
+            ("vertical-video-30s", "30s vertical video; second pattern interrupt at 18s."),
+            ("voiceover-no-talking-head", "voiceover with screen-grab b-roll; no on-screen presenter."),
+        ]
+    elif plat_short == "instagram":
+        options = [
+            ("reel-15s", "15s reel; hook in first 1.5s."),
+            ("carousel-image", "5-10 slides; hook on slide 1; payoff on slide 4-5."),
+            ("single-image", "single image with caption; hook in first 125 chars."),
+        ]
+    elif plat_short == "youtube":
+        options = [
+            ("short-30s", "30s vertical short; title and first frame load-bearing."),
+            ("short-60s", "60s vertical short; second arc beat at 30s."),
+        ]
+    else:
+        options = [
+            ("native-text", "platform-native text shape per native-format rules."),
+            ("link-anchor", "platform-native shape with link anchor."),
+        ]
+    for i in range(variants):
+        name, desc = options[i % len(options)]
+        out.append(f"### Variant {chr(ord('A') + i)} — {name}\n\n**Format**: {desc}\n\n"
+                   f"**Same idea, different shape**: variants share the underlying claim; the test isolates "
+                   f"format from message. Per pat_native-format-beats-cross-post, native authoring is the work; "
+                   f"do not paste this variant into another platform without rewriting.")
+    return out
+
+
+def render_time_variants(*, variants: int) -> list[str]:
+    out: list[str] = []
+    slots = [
+        ("Tue 09:30 local", "weekday-morning slot; default for B2B."),
+        ("Tue 17:30 local", "end-of-workday slot; comment velocity peaks here on LinkedIn."),
+        ("Wed 13:00 local", "midweek post-lunch; X and Threads peak slot."),
+        ("Sat 10:00 local", "weekend slot; lower competition, narrower professional audience."),
+    ]
+    for i in range(variants):
+        name, desc = slots[i % len(slots)]
+        out.append(f"### Variant {chr(ord('A') + i)} — {name}\n\n**Time slot**: {desc}\n\n"
+                   f"**Content held constant**: the variants differ only in posting time. "
+                   f"Pin one creative; vary the slot.")
+    return out
+
+
+def render_test_spec(*, client: str, platform: str, cohort: str, test_type: str,
+                     variants: int, baseline: float, target_lift_pct: float,
+                     alpha: float, power: float, sample_per_variant: int,
+                     run_days: int, canonical: str, anchors: list[str],
+                     pillars: list[str], uniques: list[str],
+                     cohort_signals: dict[str, list[str]], cohort_path: Path,
+                     today: str) -> str:
+    target_rate = baseline * (1 + target_lift_pct / 100.0)
+
+    if test_type == "hook":
+        variant_blocks = render_hook_variants(
+            anchors=anchors, pillars=pillars, uniques=uniques,
+            cohort=cohort_signals, variants=variants,
+        )
+    elif test_type == "format":
+        variant_blocks = render_format_variants(platform=platform, variants=variants)
+    else:  # time
+        variant_blocks = render_time_variants(variants=variants)
+
+    lines = []
+    lines.append("---")
+    lines.append("asset_type: audit")
+    lines.append(f"test_id: {client}-social-test-{platform}-{test_type}-{cohort}-{today}")
+    lines.append(f"test_type: {test_type}")
+    lines.append(f"platform: {platform}")
+    lines.append(f"cohort: {cohort}")
+    lines.append(f"variants: {variants}")
+    lines.append(f"baseline_engagement_rate: {baseline}")
+    lines.append(f"target_lift_pct: {target_lift_pct}")
+    lines.append(f"alpha: {alpha}")
+    lines.append(f"power: {power}")
+    lines.append(f"required_sample_per_variant: {sample_per_variant}")
+    lines.append(f"expected_run_days: {run_days}")
+    lines.append("substrate_layers_read: [positioning, icp, voc, brand-voice]")
+    lines.append("patterns_applied: [native-format-beats-cross-post, social-as-distribution-not-conversion, copywriting-craft-fundamentals, buyer-mindset-not-product-features, measurement-correlated-short-signals]")
+    lines.append("contradictions_resolved: []")
+    lines.append("produced_by: social-amplification-test")
+    lines.append("authored_date: " + today)
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# social-amplification-test: {client} | {platform} | {test_type} | {cohort} | {today}")
+    lines.append("")
+    lines.append(f"Test type: `{test_type}`. Platform: `{platform}`. Cohort: `{cohort}`.")
+    lines.append("")
+    lines.append("## Test rationale")
+    lines.append("")
+    if test_type == "hook":
+        lines.append("Hook variation is the highest-leverage A/B for social. The body, the call, and the format "
+                     "stay constant. Per pat_buyer-mindset-not-product-features, the buyer mindset on this surface "
+                     "is friction-led, not feature-led; the hook is the surface area that lands or fails to land. "
+                     "Per pat_copywriting-craft-fundamentals, specific beats abstract; variants here differ on which "
+                     "specific angle leads.")
+    elif test_type == "format":
+        lines.append("Format variation tests whether the platform-native shape is the bottleneck, not the message. "
+                     "Per pat_native-format-beats-cross-post, each platform has native rhythms; this test surfaces "
+                     "which shape the cohort engages with on this platform. Per pat_buyer-mindset-not-product-features, "
+                     "the buyer mindset is the substrate; format is one lever for landing in that mindset. Per "
+                     "pat_copywriting-craft-fundamentals, specific over abstract still applies inside each variant; "
+                     "the format change does not loosen the craft bar.")
+    else:
+        lines.append("Time variation tests whether the audience is on-platform when the post lands. The content "
+                     "is held constant; the slot varies. This isolates time from message. Per "
+                     "pat_buyer-mindset-not-product-features, the buyer mindset is contextual; time-of-day changes "
+                     "the mindset the same hook lands in. Per pat_copywriting-craft-fundamentals, specific over "
+                     "abstract holds across slots; the time change does not loosen the craft bar.")
+    lines.append("")
+    lines.append("Anchor terms from positioning to use in variants:")
+    lines.append("")
+    for a in anchors[:10]:
+        lines.append(f"- `{a}`")
+    lines.append("")
+    if cohort_signals.get("snapshot"):
+        lines.append("Cohort snapshot:")
+        for s in cohort_signals["snapshot"][:2]:
+            lines.append(f"> {s}")
+        lines.append("")
+
+    lines.append("## Variant scaffolds")
+    lines.append("")
+    for block in variant_blocks:
+        lines.append(block)
+        lines.append("")
+
+    lines.append("## Measurement contract")
+    lines.append("")
+    lines.append(f"- **Baseline engagement rate**: {baseline:.4f}")
+    lines.append(f"- **Target rate (baseline + {target_lift_pct:.1f}% lift)**: {target_rate:.4f}")
+    lines.append(f"- **Alpha (two-sided)**: {alpha}")
+    lines.append(f"- **Power**: {power}")
+    lines.append(f"- **Required sample per variant** (impressions): {sample_per_variant:,}")
+    lines.append(f"- **Total required sample across variants**: {sample_per_variant * variants:,}")
+    lines.append(f"- **Estimated run days at typical platform velocity**: {run_days}")
+    lines.append("")
+    lines.append("Per pat_measurement-correlated-short-signals, alpha defaults to 0.10 because short-signal "
+                 "tests on social use looser thresholds than full-funnel tests; the absolute count is the metric, "
+                 "not stage rate.")
+    lines.append("")
+
+    lines.append("## Power calculation detail")
+    lines.append("")
+    z_a = closest_z(ZA_TWO_SIDED, alpha)
+    z_b = closest_z(ZB_ONE_SIDED, power)
+    lines.append(f"- z_alpha (two-sided, alpha={alpha}): {z_a}")
+    lines.append(f"- z_beta (one-sided, power={power}): {z_b}")
+    lines.append(f"- p1 (baseline): {baseline:.4f}")
+    lines.append(f"- p2 (target): {target_rate:.4f}")
+    lines.append(f"- formula: n = (z_a + z_b)^2 * (p1*(1-p1) + p2*(1-p2)) / (p2 - p1)^2")
+    lines.append(f"- derived n per variant: {sample_per_variant:,}")
+    lines.append("")
+
+    lines.append("## Resolution rules")
+    lines.append("")
+    lines.append("- **PASS**: variant B (or any non-A) reaches statistical significance over variant A at "
+                 f"alpha={alpha}, with absolute lift at or above the target ({target_rate:.4f} vs {baseline:.4f}).")
+    lines.append("- **FAIL**: variant A retains higher engagement rate at the planned sample size.")
+    lines.append("- **NULL**: variants are statistically indistinguishable at the planned sample size; the test "
+                 "concludes no signal. NULL is data — log it.")
+    lines.append("- **KILL CRITERION**: any variant produces an engagement rate more than 50% below baseline "
+                 "across 2,000 impressions and 24 hours; pause the variant and conclude.")
+    lines.append("")
+    lines.append("Resolution is logged to `clients/<client>/goals/ledger.md` if the test is opened as a goal "
+                 "via `open-goal`. Brier score updates on resolve.")
+    lines.append("")
+
+    lines.append("## Operator wiring")
+    lines.append("")
+    lines.append("1. Author each variant per the scaffold above. Compose `voice-enforce` on every variant body.")
+    lines.append("2. Schedule into the platform with consistent audience targeting and bid (where applicable).")
+    lines.append("3. Track impressions and engagement count per variant (not aggregated).")
+    lines.append("4. At the planned sample size, compare variant rates with a two-proportion z-test.")
+    lines.append("5. Log the resolution and the cohort metrics that moved (or did not).")
+    lines.append("")
+
+    lines.append("## Distribution-not-conversion reminder")
+    lines.append("")
+    lines.append("Per pat_social-as-distribution-not-conversion, social drives top-of-funnel awareness. "
+                 "Last-click attribution underweights its real role. Resolve this test on the engagement-rate "
+                 "metric, not on a single-touch CAC. The downstream effect (branded-search lift, audience "
+                 "overlap with closed-won, newsletter signups) is read on a 30-90 day window, not on the test "
+                 "window.")
+    lines.append("")
+    lines.append("Per pat_native-format-beats-cross-post, each platform has native rhythms; cross-posted "
+                 "content underperforms native authoring substantially, so a winner here may not transfer to a "
+                 "different platform without a native rewrite.")
+    lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- positioning: `clients/{client}/01-position.md`")
+    lines.append(f"- ICP: `clients/{client}/02-icp.md`")
+    lines.append(f"- brand voice: `clients/{client}/07-brand-voice.md`")
+    lines.append(f"- cohort: `{cohort_path.relative_to(SUBSTRATE_ROOT) if str(cohort_path).startswith(str(SUBSTRATE_ROOT)) else cohort_path}`")
+    lines.append("")
+
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `social-content-design` — author the variants this test scaffolds.")
+    lines.append("- `social-fatigue-monitor` — read post-test performance for rolling-window decay.")
+    lines.append("- `ad-incrementality-test` — for incrementality questions, use the holdout sibling.")
+    lines.append("- `routines/social-content-cycle.md` — the weekly cycle that opens these tests.")
+    lines.append("- `knowledge/patterns/measurement-correlated-short-signals.md`")
+    lines.append("- `knowledge/patterns/native-format-beats-cross-post.md`")
+    lines.append("- `knowledge/patterns/social-as-distribution-not-conversion.md`")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="social-amplification-test")
+    p.add_argument("--client", required=True)
+    p.add_argument("--platform", required=True,
+                   choices=["linkedin", "x", "tiktok", "instagram", "youtube", "threads"])
+    p.add_argument("--cohort", required=True)
+    p.add_argument("--test-type", required=True, choices=["hook", "format", "time"])
+    p.add_argument("--baseline-engagement-rate", type=float, required=True)
+    p.add_argument("--target-lift-pct", type=float, default=20.0)
+    p.add_argument("--variants", type=int, default=2)
+    p.add_argument("--alpha", type=float, default=0.10)
+    p.add_argument("--power", type=float, default=0.80)
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    if args.variants < 2 or args.variants > 4:
+        sys.stderr.write("REFUSED: too-many-variants — --variants must be in [2, 4]\n")
+        return 4
+    if not (0 < args.baseline_engagement_rate < 1):
+        sys.stderr.write("REFUSED: baseline-out-of-range — engagement rate must be > 0 and < 1\n")
+        return 4
+    if args.target_lift_pct < 1:
+        sys.stderr.write("REFUSED: target-lift-pct too small (< 1)\n")
+        return 4
+    if args.target_lift_pct < 5:
+        sys.stderr.write("WARN: lift-too-small — sample size may exceed typical social windows; spec proceeds.\n")
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        return refuse("client-root-missing", f"clients/{args.client}/ not found.")
+    pos_path = client_root / "01-position.md"
+    pos = read_file_or_none(pos_path)
+    if pos is None:
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/01-position.md not found.")
+    cohort_path = find_persona_file(args.client, args.cohort)
+    if cohort_path is None:
+        return refuse("missing-buyer-state",
+                      f"buyer-state cohort '{args.cohort}' not found.")
+
+    canonical = extract_canonical_statement(pos)
+    anchors = extract_anchors(pos)
+    pillars = extract_value_pillars(pos)
+    uniques = extract_unique_attributes(pos)
+    cohort_signals = extract_cohort_signals(cohort_path.read_text(encoding="utf-8"))
+
+    target_rate = args.baseline_engagement_rate * (1 + args.target_lift_pct / 100.0)
+    sample = two_proportion_sample_size(args.baseline_engagement_rate, target_rate, args.alpha, args.power)
+    run_days = estimate_run_days(sample, args.platform, posts_per_day=1.0)
+
+    md = render_test_spec(
+        client=args.client,
+        platform=args.platform,
+        cohort=args.cohort,
+        test_type=args.test_type,
+        variants=args.variants,
+        baseline=args.baseline_engagement_rate,
+        target_lift_pct=args.target_lift_pct,
+        alpha=args.alpha,
+        power=args.power,
+        sample_per_variant=sample,
+        run_days=run_days,
+        canonical=canonical,
+        anchors=anchors,
+        pillars=pillars,
+        uniques=uniques,
+        cohort_signals=cohort_signals,
+        cohort_path=cohort_path,
+        today=today,
+    )
+
+    out_dir = Path(args.out) if args.out else (client_root / "social" / "tests")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{args.platform}-{args.test_type}-{args.cohort}-{today}.md"
+    out_path.write_text(md, encoding="utf-8")
+
+    sys.stderr.write(f"\n[social-amplification-test] wrote {out_path}\n")
+    sys.stderr.write(f"  test_type={args.test_type}  platform={args.platform}  cohort={args.cohort}\n")
+    sys.stderr.write(f"  baseline={args.baseline_engagement_rate:.4f}  target_lift_pct={args.target_lift_pct}%  "
+                     f"target={target_rate:.4f}\n")
+    sys.stderr.write(f"  required sample per variant: {sample:,}\n")
+    sys.stderr.write(f"  estimated run days: {run_days}\n")
+
+    print(str(out_path))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

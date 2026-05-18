@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# help-docs — substrate skill runtime (auto-generated, v1.2)
+#
+# Runs preflight against SKILL.md frontmatter (substrate_layers_required,
+# patterns_grounded, contradictions_aware, required_reads), then emits a
+# structured LLM prompt. Pipe stdout to your model CLI of choice.
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+MODE=""
+EXTRA=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)   CLIENT="$2"; shift 2 ;;
+    --mode)     MODE="$2"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+help-docs — substrate skill runtime
+
+Usage:
+  help-docs --client <client> [--mode <mode>] [extra args...]
+
+Modes:
+  gap-analysis article update aeo-tune
+
+The skill runs preflight against substrate (substrate_layers_required,
+patterns_grounded, contradictions_aware, required_reads). On pass, it
+emits a structured LLM prompt to stdout.
+
+See skills/help-docs/SKILL.md for full spec.
+EOF
+      exit 0 ;;
+    *) EXTRA+=("$1"); shift ;;
+  esac
+done
+
+if [ -z "$CLIENT" ]; then
+  echo "ERR: --client required" >&2
+  echo "  try: help-docs --help" >&2
+  exit 4
+fi
+
+skill_preflight "help-docs" "$CLIENT" || exit 3
+skill_emit_prompt "help-docs" "$CLIENT" "${MODE:-default}" "${EXTRA[@]:-}"

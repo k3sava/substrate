@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# substrate-status — operator-facing review queue + substrate state snapshot
+#
+# Usage: substrate-status [--terse|--detail] [--client <slug>]
+#
+# Shows:
+#   1. Active goals (open + window state)
+#   2. Assets in draft/ pending review (per-asset gate state, per-client)
+#   3. Substrate decay state (last audit)
+#   4. LaunchAgent health (which crons are alive)
+#   5. Recent activity (last 5 commits)
+#   6. Wired skills count
+#   7. Preflight sweep summary
+
+set -uo pipefail
+
+# Backwards-compat: accept FLYWHEEL_ROOT as deprecated alias for SUBSTRATE_ROOT.
+if [ -n "${FLYWHEEL_ROOT:-}" ] && [ -z "${SUBSTRATE_ROOT:-}" ]; then
+  echo "DEPRECATED: FLYWHEEL_ROOT is deprecated; use SUBSTRATE_ROOT." >&2
+  SUBSTRATE_ROOT="$FLYWHEEL_ROOT"
+fi
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+cd "$SUBSTRATE_ROOT"
+
+MODE="--detail"
+CLIENT="${SUBSTRATE_CLIENT:-${CLIENT:-}}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --terse|--detail) MODE="$1"; shift ;;
+    --client) CLIENT="$2"; shift 2 ;;
+    --client=*) CLIENT="${1#--client=}"; shift ;;
+    *) shift ;;
+  esac
+done
+
+bold() { printf "\033[1m%s\033[0m\n" "$1"; }
+dim()  { printf "\033[2m%s\033[0m\n" "$1"; }
+green(){ printf "\033[32m%s\033[0m" "$1"; }
+red()  { printf "\033[31m%s\033[0m" "$1"; }
+yellow(){ printf "\033[33m%s\033[0m" "$1"; }
+
+bold "═══ substrate status — $(date +%Y-%m-%d) ═══"
+echo ""
+
+# 1. Active goals
+bold "active goals"
+LEDGER="goals/ledger.md"
+if [ -f "$LEDGER" ]; then
+  awk -F'|' '
+    /^## Active (bets|goals)/{in_t=1; next}
+    in_t && /^\| (bet_id|goal_id) /{header_seen=1; next}
+    in_t && /^\|---/{next}
+    in_t && /^\|/ && header_seen {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $9);
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $10);
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $11);
+      printf "  %-22s status=%-9s p=%-15s close=%s\n", $2, $10, $9, $11
+    }
+    in_t && /^## /{exit}
+  ' "$LEDGER" 2>/dev/null
+fi
+echo ""
+
+# 2. Assets in draft/
+bold "assets in draft/ (pending review)"
+if [ -n "$CLIENT" ]; then
+  client_dirs=("clients/$CLIENT")
+else
+  # No client passed: scan every clients/<slug>/ that has assets/draft/.
+  client_dirs=()
+  if [ -d "clients" ]; then
+    while IFS= read -r d; do
+      client_dirs+=("$d")
+    done < <(find clients -maxdepth 2 -type d -name draft 2>/dev/null | sed 's|/assets/draft$||')
+  fi
+fi
+draft_count=0
+for cd in "${client_dirs[@]}"; do
+  DRAFT_DIR="$cd/assets/draft"
+  [ -d "$DRAFT_DIR" ] || continue
+  for f in "$DRAFT_DIR"/lp-*.md "$DRAFT_DIR"/vertical-playbooks/*.md; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" .md)
+    gate_status=$(awk 'BEGIN{infm=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^gate_status:/{sub(/^gate_status:[[:space:]]*/, ""); print; exit}' "$f")
+    [ -z "$gate_status" ] && gate_status="(not set)"
+    bet_id=$(awk 'BEGIN{infm=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^(bet_id|goal_id):/{sub(/^(bet_id|goal_id):[[:space:]]*/, ""); print; exit}' "$f")
+    printf "  %-60s %s%s\n" "${cd#clients/}/$(basename "$DRAFT_DIR")/$name" "$gate_status" "${bet_id:+ [$bet_id]}"
+    draft_count=$((draft_count + 1))
+  done
+done
+if [ "$draft_count" -eq 0 ]; then
+  echo "  (none)"
+fi
+echo ""
+
+# 3. Substrate decay
+bold "context decay (last audit)"
+last_audit=$(ls -t knowledge/intel/context-decay-*.md 2>/dev/null | head -1)
+if [ -n "$last_audit" ]; then
+  total=$(grep "^total_files:" "$last_audit" | awk '{print $2}')
+  stale=$(grep "^stale:" "$last_audit" | awk '{print $2}')
+  printf "  audit: %s\n" "$last_audit"
+  if [ "${stale:-0}" -eq 0 ]; then
+    printf "  $(green ✓) all %s context files fresh\n" "$total"
+  else
+    printf "  $(red ✗) %s of %s files stale\n" "$stale" "$total"
+  fi
+else
+  printf "  $(yellow !) no audit run yet — run: substrate context-curate\n"
+fi
+echo ""
+
+# 4. LaunchAgent health
+bold "LaunchAgents (cron health)"
+expected="com.substrate.heartbeat com.substrate.goal-resolution com.substrate.score-calibration com.substrate.taste-leaderboard-refresh com.substrate.context-curate com.substrate.competitive-scout"
+for la in $expected; do
+  status=$(launchctl list 2>/dev/null | awk -v label="$la" '$3==label {print $1; found=1; exit} END{if(!found) print "MISSING"}')
+  if [ "$status" = "MISSING" ]; then
+    printf "  $(yellow ·) %-44s not loaded (optional)\n" "$la"
+  elif [ "$status" = "-" ]; then
+    printf "  $(green ✓) %-44s registered (scheduled)\n" "$la"
+  else
+    printf "  $(green ✓) %-44s running PID=%s\n" "$la" "$status"
+  fi
+done
+echo ""
+
+# 5. Recent activity
+if [ "$MODE" = "--detail" ]; then
+  bold "recent activity (last 5 commits)"
+  git -C "$SUBSTRATE_ROOT" log --oneline -5 2>/dev/null | sed 's/^/  /'
+  echo ""
+fi
+
+# 6. Wired skills count
+bold "skills wired"
+wired=$(ls "$SUBSTRATE_ROOT"/skills/*/bin/* 2>/dev/null | wc -l | tr -d ' ')
+total_skills=$(ls -d "$SUBSTRATE_ROOT"/skills/*/ 2>/dev/null | grep -v "/_" | wc -l | tr -d ' ')
+echo "  $wired / $total_skills skills callable via 'substrate <skill>'"
+echo "  full list: substrate --list"
+echo ""
+
+# 7. Preflight sweep (customer-facing assets only — fast)
+bold "preflight sweep (customer-facing drafts)"
+if [ -x "$SUBSTRATE_ROOT/bin/substrate-sweep" ]; then
+  sweep_summary=$("$SUBSTRATE_ROOT/bin/substrate-sweep" --fail-only 2>/dev/null | tail -4)
+  echo "$sweep_summary" | sed 's/^/  /'
+else
+  echo "  substrate-sweep not present (optional companion CLI)"
+fi
+echo ""

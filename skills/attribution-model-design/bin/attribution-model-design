@@ -1,0 +1,869 @@
+#!/usr/bin/env python3
+"""attribution-model-design, design the attribution model the client should run.
+
+Reads clients/<client>/analytics/sources.yaml for the channel inventory. Refuses
+without channels declared. Per the named decision context, recommends one of 8
+models (last-touch, first-touch, linear, time-decay, position-based, markov-chain,
+incrementality-anchored, hybrid) and emits the model spec at
+clients/<client>/analytics/attribution-model.md plus a measurement contract
+under goals/measurement-contracts/ that opens an incrementality validation goal.
+
+Per the incrementality-not-attribution pattern, every model has blind spots; the
+spec names them. Per goalpost-discipline-vs-metric-drift, the contract is locked
+at open. Per the no-decision-vs-named-competitor contradiction, the model spec
+declares whether the channel mix is being optimized against status-quo or named
+competitors and adjusts the recommendation accordingly.
+
+Usage:
+    attribution-model-design --client <client> \
+        [--model <last-touch|first-touch|linear|time-decay|position-based|markov-chain|incrementality-anchored|hybrid|all>] \
+        [--decision-context <budget-allocation|channel-pruning|board-reporting|exec-attribution>] \
+        [--window <YYYY-MM-DD,YYYY-MM-DD>] \
+        [--quarter <YYYY-Q[1-4]>]
+
+Exit codes:
+    0, model spec + measurement contract written
+    1, written with warnings (model-context-mismatch)
+    3, refused (substrate gap, missing channel inventory)
+    4, invalid args
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+
+# Model specifications: each model has math (the credit formula), data
+# requirements, blind spots, and a triangulation move.
+MODEL_SPECS: dict[str, dict] = {
+    "last-touch": {
+        "math": (
+            "credit_for_channel(C, conversion) = 1 if last_touch == C else 0. "
+            "All credit lands on the channel that recorded the final touch before conversion."
+        ),
+        "data_requirement": "single touch field per conversion (most ad-platform default)",
+        "blind_spots": [
+            "overstates bottom-of-funnel channels (paid-search, retargeting, direct)",
+            "understates top-of-funnel channels (organic-content, referral, brand-search-driving channels)",
+            "ignores assist touches entirely",
+            "the channel that 'won' the deal was usually not the channel that created the lead",
+        ],
+        "triangulation_move": "incrementality test on the model's recommended highest-credit channel",
+        "decision_fit": {
+            "budget-allocation": "poor (default for the platform UI but biased toward bottom-funnel)",
+            "channel-pruning": "poor (will recommend pruning channels that create demand)",
+            "board-reporting": "acceptable with caveat (familiar number; explain the bias)",
+            "exec-attribution": "poor (the channel credited is rarely the one that mattered)",
+        },
+    },
+    "first-touch": {
+        "math": (
+            "credit_for_channel(C, conversion) = 1 if first_touch == C else 0. "
+            "All credit lands on the channel that recorded the first touch."
+        ),
+        "data_requirement": "first_touch_source per conversion (HubSpot first-touch property is canonical)",
+        "blind_spots": [
+            "overstates demand-creation channels (organic-content, referral)",
+            "understates conversion-driving channels (paid-search, retargeting, sales outbound at the close)",
+            "first-touch is often a brand-search session that the prospect did because they heard about you elsewhere; the credit lands on the wrong channel",
+            "ignores all subsequent touches",
+        ],
+        "triangulation_move": "ask 50 closed-won customers 'how did you first hear about us' and compare with first-touch; the gap is the lie the model tells",
+        "decision_fit": {
+            "budget-allocation": "poor in isolation (use as a check on last-touch, not as the primary)",
+            "channel-pruning": "fair (surfaces channels that actually originate buyer interest)",
+            "board-reporting": "acceptable as paired with last-touch (the difference between first and last is the multi-touch journey)",
+            "exec-attribution": "poor (single-touch is single-truth)",
+        },
+    },
+    "linear": {
+        "math": (
+            "credit_for_channel(C, conversion) = "
+            "(touches_from_C_in_path / total_touches_in_path). "
+            "Equal credit across every touch in the conversion path."
+        ),
+        "data_requirement": "every touch logged with channel + timestamp (CDP or warehouse stitch)",
+        "blind_spots": [
+            "treats the first touch and the last touch as equally important; usually they are not",
+            "overcounts channels that fire many low-quality touches (display impressions, retargeting cookies)",
+            "no decay: a touch from 90 days ago carries the same weight as a touch yesterday",
+        ],
+        "triangulation_move": "compare with time-decay (linear vs time-decay difference shows which channels dominate by recency)",
+        "decision_fit": {
+            "budget-allocation": "fair (better than single-touch, worse than time-decay or position-based)",
+            "channel-pruning": "fair (linear at least gives all channels signal)",
+            "board-reporting": "acceptable",
+            "exec-attribution": "fair",
+        },
+    },
+    "time-decay": {
+        "math": (
+            "credit_for_channel(C, conversion) at touch_t = "
+            "exp(-(time_since_t / half_life)). "
+            "Recent touches get more weight; touches further from conversion decay exponentially."
+        ),
+        "data_requirement": "every touch logged with channel + timestamp; configurable half-life (default 7 days for SaaS, 14 for enterprise)",
+        "blind_spots": [
+            "still overcounts noisy retargeting touches near conversion",
+            "half-life choice is somewhat arbitrary and changes the channel ranking",
+            "demand-creation channels that fire 60+ days before conversion get undercredited",
+        ],
+        "triangulation_move": "vary half-life across {3, 7, 14, 30} days and check whether the channel rank stays stable; rank flips are diagnostic",
+        "decision_fit": {
+            "budget-allocation": "good (the recency-weight matches B2C and short-cycle B2B reality)",
+            "channel-pruning": "good",
+            "board-reporting": "acceptable (some explanation needed)",
+            "exec-attribution": "good for short-cycle deals; weak for enterprise",
+        },
+    },
+    "position-based": {
+        "math": (
+            "credit_for_channel(C, conversion) = "
+            "0.40 if C == first_touch + 0.40 if C == last_touch + "
+            "0.20 / (n_middle_touches) for each middle touch. "
+            "Common variants: 40/20/40 or 30/40/30."
+        ),
+        "data_requirement": "every touch logged with channel + timestamp + position-in-path",
+        "blind_spots": [
+            "position weights are picked, not derived; the choice is a hypothesis",
+            "compresses middle-touch contribution into a single bucket",
+            "does not capture interaction effects between touches",
+        ],
+        "triangulation_move": "compare against linear and against markov-chain; large differences in middle-touch credit are a red flag",
+        "decision_fit": {
+            "budget-allocation": "good (acknowledges both demand-creation and conversion-driving)",
+            "channel-pruning": "very good (clear surface for which channels drive create vs close)",
+            "board-reporting": "good",
+            "exec-attribution": "very good for mid-cycle deals",
+        },
+    },
+    "markov-chain": {
+        "math": (
+            "Build a Markov chain over touch sequences. For each channel, compute "
+            "the conversion probability difference between the chain with the "
+            "channel present and the chain with it removed (removal effect). "
+            "Credit = removal_effect / sum(removal_effects)."
+        ),
+        "data_requirement": "complete touch path per converter and per non-converter (CDP + warehouse stitch); minimum 1k converted paths for stable estimates",
+        "blind_spots": [
+            "assumes Markov property (next touch depends only on current); real buyer journeys violate this",
+            "sensitive to path-cleaning choices (deduplication, order assumption, attribution windows)",
+            "computationally expensive; requires recompute per change",
+            "non-converter sample is hard to assemble at scale",
+        ],
+        "triangulation_move": "compare Markov removal-effect ranking against incrementality test ranking; ideally within 1 position rank-shift",
+        "decision_fit": {
+            "budget-allocation": "very good when data quality and path completeness are high",
+            "channel-pruning": "very good",
+            "board-reporting": "weak (math is hard to explain to non-analysts)",
+            "exec-attribution": "good if the data infrastructure is mature",
+        },
+    },
+    "incrementality-anchored": {
+        "math": (
+            "Run quarterly incrementality tests per channel (geo holdout for paid, "
+            "PSA control for platform-managed campaigns, audience holdout for "
+            "lifecycle email). The incremental conversion rate per channel becomes "
+            "the calibration factor applied to platform-reported conversions."
+        ),
+        "data_requirement": "ad-spend by channel by week, conversions by channel by week, geo / audience holdout setup; routinely-run incrementality tests",
+        "blind_spots": [
+            "tests run at moments-in-time; channel incrementality drifts with creative fatigue and seasonality",
+            "tests measure marginal incrementality at current spend, not at re-allocated spend",
+            "small channels (<5% of budget) are often not testable with reasonable MDE",
+            "interaction effects between channels still go unmeasured (lift on a brand-search test does not capture the lift the brand-search test cannibalized from organic)",
+        ],
+        "triangulation_move": "alternate test types (geo holdout this quarter, audience holdout next) to triangulate against test-type bias",
+        "decision_fit": {
+            "budget-allocation": "best (causation, not correlation)",
+            "channel-pruning": "best",
+            "board-reporting": "good (with explanation; the credibility is high)",
+            "exec-attribution": "best",
+        },
+    },
+    "hybrid": {
+        "math": (
+            "Use a multi-touch model (position-based or time-decay) for routine "
+            "reporting + cohort attribution. Calibrate the model's channel ranking "
+            "with quarterly incrementality tests on the top-3 channels by spend. "
+            "When the model rank and the incrementality rank disagree by >1 "
+            "position, the test result wins and the model's weights get tuned."
+        ),
+        "data_requirement": "all of position-based or time-decay's data + quarterly incrementality test infrastructure",
+        "blind_spots": [
+            "still inherits position-based or time-decay's blind spots between tests",
+            "calibration cadence (quarterly) means a fresh creative-fatigue shift takes 3 months to surface",
+            "incrementality tests only run on top channels; long-tail channels stay correlation-attributed",
+        ],
+        "triangulation_move": "the incrementality test IS the triangulation; keep cadence honest",
+        "decision_fit": {
+            "budget-allocation": "very good (correlation for routine, causation for big bets)",
+            "channel-pruning": "very good",
+            "board-reporting": "very good",
+            "exec-attribution": "very good",
+        },
+    },
+}
+
+DEFAULT_RECOMMENDATIONS = {
+    "budget-allocation": "hybrid",
+    "channel-pruning": "position-based",
+    "board-reporting": "hybrid",
+    "exec-attribution": "incrementality-anchored",
+}
+
+
+# --- minimal yaml --------------------------------------------------------
+
+def load_yaml(path: Path) -> dict | None:
+    try:
+        import yaml  # type: ignore
+        return yaml.safe_load(path.read_text())
+    except ImportError:
+        pass
+    return _parse_minimal_yaml(path.read_text())
+
+
+def _parse_minimal_yaml(text: str) -> dict:
+    root: dict = {}
+    stack: list[tuple[int, dict | list]] = [(-1, root)]
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = re.sub(r"(\s)#.*$", r"\1", raw).rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            value_part = stripped[2:].strip()
+            if isinstance(parent, list):
+                if ":" in value_part and not value_part.endswith(":"):
+                    k, _, v = value_part.partition(":")
+                    new_map = {k.strip(): _scalar(v.strip())}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+                elif value_part:
+                    parent.append(_scalar(value_part))
+                else:
+                    new_map = {}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+            i += 1
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if not val:
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines):
+                    next_line = lines[j]
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent > indent and next_line.strip().startswith("- "):
+                        new_list: list = []
+                        if isinstance(parent, dict):
+                            parent[key] = new_list
+                        stack.append((indent, new_list))
+                    else:
+                        new_map: dict = {}
+                        if isinstance(parent, dict):
+                            parent[key] = new_map
+                        stack.append((indent, new_map))
+            else:
+                if isinstance(parent, dict):
+                    parent[key] = _scalar(val)
+        i += 1
+    return root
+
+
+def _scalar(v: str):
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    if v.startswith("'") and v.endswith("'"):
+        return v[1:-1]
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    if v.lower() in ("null", "~"):
+        return None
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        return [_scalar(p.strip()) for p in inner.split(",")] if inner else []
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    return v
+
+
+# --- helpers --------------------------------------------------------------
+
+def refuse(reason: str, detail: str = "") -> int:
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    return 3
+
+
+def channel_count(sources_yaml: dict) -> int:
+    channels = sources_yaml.get("channels") or []
+    if isinstance(channels, list):
+        return len(channels)
+    return 0
+
+
+def find_recent_incrementality(client: str) -> Path | None:
+    base = SUBSTRATE_ROOT / "clients" / client / "analytics" / "incrementality"
+    if not base.is_dir():
+        return None
+    matches = sorted(base.glob("*.md"), reverse=True)
+    return matches[0] if matches else None
+
+
+def find_recent_diagnostic(client: str, channel: str) -> Path | None:
+    base = SUBSTRATE_ROOT / "clients" / client / "ads" / "diagnostics"
+    if not base.is_dir():
+        return None
+    matches = sorted(base.glob(f"{channel}-*.md"), reverse=True)
+    return matches[0] if matches else None
+
+
+def parse_window(window: str) -> tuple[str, str]:
+    parts = window.split(",")
+    if len(parts) != 2:
+        raise ValueError(f"window must be YYYY-MM-DD,YYYY-MM-DD, got {window!r}")
+    return parts[0].strip(), parts[1].strip()
+
+
+def trailing_window(days: int = 90) -> tuple[str, str]:
+    today = datetime.now(timezone.utc)
+    start = today - timedelta(days=days)
+    return start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+
+
+def quarter_end(quarter: str) -> str:
+    m = re.match(r"^(\d{4})-Q([1-4])$", quarter.strip())
+    if not m:
+        raise ValueError(f"quarter must be YYYY-Q[1-4], got {quarter!r}")
+    year, q = int(m.group(1)), int(m.group(2))
+    end_month = q * 3
+    end_day = 31 if end_month in (3, 12) else 30 if end_month in (6, 9) else 31
+    return datetime(year, end_month, end_day).strftime("%Y-%m-%d")
+
+
+# --- model context fit + contradiction position ---------------------------
+
+def context_fit_score(model: str, decision_context: str) -> str:
+    """Return a textual fit rating from MODEL_SPECS."""
+    spec = MODEL_SPECS.get(model)
+    if not spec:
+        return "unknown"
+    return spec["decision_fit"].get(decision_context, "unknown")
+
+
+def fit_is_warning(rating: str) -> bool:
+    return rating.startswith("poor") or rating.startswith("weak")
+
+
+def pick_contradiction_position(decision_context: str, channels: list[dict]) -> tuple[str, str]:
+    """Pick position for no-decision-vs-named-competitor based on channel mix.
+
+    Heuristic:
+      - If the channel mix is dominated by demand-creation surfaces (organic-content,
+        organic-search, referral, content), the team is operating in an emerging or
+        early-category context where status-quo / no-decision is the real competitor;
+        models should not over-credit conversion-driving channels.
+      - If the channel mix is dominated by intent-capture surfaces (paid-search,
+        retargeting, direct, comparison-page traffic), the team is operating in a
+        named-competitor context; last-touch attribution is more honest, and the
+        model spec should call out competitive comparison content.
+      - If the mix is balanced, the model is run with both positions noted.
+    """
+    if not channels:
+        return ("undetermined", "channel inventory empty; cannot infer category maturity")
+    demand_creation = {"organic-search", "referral", "content", "organic-social"}
+    intent_capture = {"paid-search", "retargeting", "direct", "linkedin-ads", "paid-social"}
+    dc_count = sum(1 for c in channels if c.get("name") in demand_creation)
+    ic_count = sum(1 for c in channels if c.get("name") in intent_capture)
+    if dc_count > ic_count + 1:
+        return (
+            "Position A (Dunford status-quo)",
+            f"Channel mix favors demand-creation surfaces ({dc_count} vs {ic_count}); "
+            "the buyer journey usually starts before any named competitor enters the picture, "
+            "and the model risks under-crediting demand-creation work. Recommend models that "
+            "weight first-touch and middle-touch (position-based, time-decay with longer half-life, "
+            "incrementality-anchored on demand-creation channels)."
+        )
+    if ic_count > dc_count + 1:
+        return (
+            "Position B (Gartner named-competitor)",
+            f"Channel mix favors intent-capture surfaces ({ic_count} vs {dc_count}); "
+            "the buyer is comparing against named competitors at conversion time, and last-touch "
+            "is closer to the truth. The model spec should pair last-touch with a battle-card "
+            "review and named-competitor content audit. Incrementality-anchored testing on the "
+            "intent-capture channels validates whether they are creating demand or only capturing it."
+        )
+    return (
+        "Both positions, condition per cohort",
+        f"Channel mix is balanced ({dc_count} demand-creation vs {ic_count} intent-capture). "
+        "Run the multi-touch model and pair it with quarterly incrementality tests on top-3 "
+        "channels by spend; the test resolves which position applies to which channel."
+    )
+
+
+# --- renderers ------------------------------------------------------------
+
+def render_model_spec(client: str, recommended: str, all_models: list[str],
+                      decision_context: str, window: tuple[str, str],
+                      sources_yaml: dict, today: str,
+                      contradiction_pick: tuple[str, str],
+                      diagnostic_paths: list[str],
+                      incrementality_path: str | None,
+                      warnings: list[str]) -> str:
+    channels = sources_yaml.get("channels") or []
+    sources = sources_yaml.get("sources") or []
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: attribution model, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append(f"client: {client}")
+    lines.append(f"recommended_model: {recommended}")
+    lines.append(f"decision_context: {decision_context}")
+    lines.append(f"validity_window: {window[0]} to {window[1]}")
+    lines.append("patterns_grounded: [incrementality-not-attribution, goalpost-discipline-vs-metric-drift]")
+    lines.append("contradictions_aware: [no-decision-vs-named-competitor]")
+    lines.append(f"contradiction_positions: {contradiction_pick[0]!r}")
+    lines.append("position_rationale: |")
+    for ln in contradiction_pick[1].splitlines():
+        lines.append(f"  {ln}")
+    if warnings:
+        lines.append("warnings:")
+        for w in warnings:
+            lines.append(f"  - {w}")
+    lines.append("produced_by: attribution-model-design")
+    lines.append("---")
+    lines.append("")
+
+    lines.append(f"# Attribution model spec, {client}, {today}")
+    lines.append("")
+    lines.append(
+        "Most teams default to last-touch because that is the platform UI default. "
+        "Last-touch systematically biases budget-allocation toward the channel that closed "
+        "and away from the channel that created the lead. This spec names the model the team "
+        "should run, the model's blind spots, the data the model needs, and the corroborating "
+        "test that triangulates against correlation bias."
+    )
+    lines.append("")
+    lines.append("Per the `incrementality-not-attribution` pattern, every correlation-based "
+                 "model is a hypothesis, not a measurement. The triangulation column on each model "
+                 "names the test that turns the hypothesis into a measurement.")
+    lines.append("")
+
+    lines.append("## Recommended model")
+    lines.append("")
+    fit = context_fit_score(recommended, decision_context)
+    lines.append(f"**Model:** `{recommended}`  ")
+    lines.append(f"**Decision context:** `{decision_context}`  ")
+    lines.append(f"**Fit rating:** {fit}  ")
+    lines.append("")
+    spec = MODEL_SPECS[recommended]
+    lines.append("**Math:**")
+    lines.append("")
+    lines.append(f"> {spec['math']}")
+    lines.append("")
+    lines.append(f"**Data requirement:** {spec['data_requirement']}")
+    lines.append("")
+    lines.append("**Stated blind spots:**")
+    lines.append("")
+    for bs in spec["blind_spots"]:
+        lines.append(f"- {bs}")
+    lines.append("")
+    lines.append(f"**Triangulation move:** {spec['triangulation_move']}.")
+    lines.append("")
+
+    lines.append("## Contradiction navigation, no-decision vs named-competitor")
+    lines.append("")
+    lines.append(f"[contradiction:no-decision-vs-named-competitor] picked {contradiction_pick[0]} because:")
+    lines.append("")
+    lines.append(contradiction_pick[1])
+    lines.append("")
+
+    lines.append("## All models compared")
+    lines.append("")
+    lines.append("| Model | Fit for context | Math (1-line) | Triangulation |")
+    lines.append("|---|---|---|---|")
+    for m in all_models:
+        s = MODEL_SPECS[m]
+        fit_m = s["decision_fit"].get(decision_context, "unknown")
+        math_short = s["math"].split(". ")[0]
+        # truncate
+        if len(math_short) > 80:
+            math_short = math_short[:77] + "..."
+        triangulation_short = s["triangulation_move"]
+        if len(triangulation_short) > 80:
+            triangulation_short = triangulation_short[:77] + "..."
+        lines.append(f"| `{m}` | {fit_m} | {math_short} | {triangulation_short} |")
+    lines.append("")
+
+    lines.append("## Channel inventory (read from sources.yaml)")
+    lines.append("")
+    if channels:
+        lines.append("| Channel | Platform | Source-systems | Notes |")
+        lines.append("|---|---|---|---|")
+        for c in channels:
+            name = c.get("name", "")
+            platform = c.get("platform", "")
+            srcs = c.get("source_systems", [])
+            srcs_str = ", ".join(srcs) if isinstance(srcs, list) else str(srcs)
+            note = c.get("notes", "")
+            lines.append(f"| {name} | {platform} | {srcs_str} | {note} |")
+    else:
+        lines.append("_No channels declared. Refusing to recommend a multi-touch model._")
+    lines.append("")
+
+    lines.append("## Source-system inventory (read from sources.yaml)")
+    lines.append("")
+    if sources:
+        lines.append("| Source | Role | Refresh cadence | API key env |")
+        lines.append("|---|---|---|---|")
+        for s in sources:
+            if isinstance(s, dict):
+                lines.append(
+                    f"| {s.get('name', '')} | {s.get('role', '')} | "
+                    f"{s.get('refresh_cadence', '')} | `{s.get('api_key_env', '')}` |"
+                )
+    lines.append("")
+
+    lines.append("## Validity window")
+    lines.append("")
+    lines.append(f"The model is computed against the trailing window {window[0]} to {window[1]}. "
+                 "Recompute cadence: monthly. Per `goalpost-discipline-vs-metric-drift`, the "
+                 "definition is locked at this open; mid-quarter changes count as overrides.")
+    lines.append("")
+
+    lines.append("## Triangulation plan")
+    lines.append("")
+    lines.append(
+        "Per the `incrementality-not-attribution` pattern, the model is a hypothesis. The plan:"
+    )
+    lines.append("")
+    lines.append("1. **Quarterly incrementality test on top-3 channels by spend.** Geo holdout "
+                 "for paid-search and paid-social; PSA control for platform-managed campaigns; "
+                 "audience holdout for lifecycle email. See `skills/lift-test-design`.")
+    lines.append("2. **Closed-won win-source survey.** Survey every closed-won deal: "
+                 "'how did you first hear about us'. Compare with first-touch model for the "
+                 "same accounts. Gap is the lie the model tells.")
+    lines.append("3. **Brand-search lift watch.** Monitor branded-search query volume monthly. "
+                 "Surges that lead conversions by 30 days are demand-creation-channel signal "
+                 "the multi-touch model often misses.")
+    lines.append("4. **Sales-team pipeline survey, every quarter.** AEs name the deal-source "
+                 "channel for every closed deal. Compare with last-touch and first-touch.")
+    lines.append("")
+    if incrementality_path:
+        lines.append(f"Recent incrementality result: `{incrementality_path}`. "
+                     "Use as anchor for next-quarter calibration.")
+        lines.append("")
+
+    lines.append("## Decision rights")
+    lines.append("")
+    lines.append("This model is allowed to drive:")
+    lines.append("")
+    if decision_context == "budget-allocation":
+        lines.append("- Quarterly budget allocation across channels (with caveats per blind-spot list).")
+        lines.append("- Within-channel campaign weight shifts.")
+    elif decision_context == "channel-pruning":
+        lines.append("- Channel-level kill / scale decisions, paired with one corroborating test.")
+        lines.append("- Long-tail channel pruning.")
+    elif decision_context == "board-reporting":
+        lines.append("- Reporting numbers in board / exec slides, with the blind-spot caveat included.")
+        lines.append("- YoY channel-mix narrative.")
+    else:  # exec-attribution
+        lines.append("- Executive credit on channel-level revenue impact (with corroborating test).")
+        lines.append("- Channel-leader scorecards.")
+    lines.append("")
+    lines.append("This model is NOT allowed to drive:")
+    lines.append("")
+    lines.append("- Single-quarter individual-rep credit (rep-level incentive math is a different problem).")
+    lines.append("- Cross-channel cannibalization analysis (that needs a structural causal model, not attribution).")
+    lines.append("- Pricing / packaging decisions (that needs WTP research).")
+    lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- Channel inventory: `clients/{client}/analytics/sources.yaml`")
+    lines.append(f"- Source-systems: `clients/{client}/analytics/sources.yaml` (sources block)")
+    lines.append(f"- ICP: `clients/{client}/icp/icp.md`")
+    lines.append(f"- Positioning: `clients/{client}/positioning/positioning.md`")
+    if diagnostic_paths:
+        for p in diagnostic_paths:
+            lines.append(f"- Diagnostic: `{p}`")
+    if incrementality_path:
+        lines.append(f"- Recent incrementality: `{incrementality_path}`")
+    lines.append("- Pattern: `knowledge/patterns/incrementality-not-attribution.md`")
+    lines.append("- Pattern: `knowledge/patterns/goalpost-discipline-vs-metric-drift.md`")
+    lines.append("- Contradiction: `knowledge/contradictions/no-decision-vs-named-competitor.md`")
+    lines.append("")
+
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append(f"- `skills/lift-test-design --client {client} --surface paid-ads --mode geo-holdout` for top-channel validation.")
+    lines.append(f"- `skills/dashboard-spec --client {client} --audience growth --decision attribution-debate` to expose the model in a dashboard.")
+    lines.append("- `routines/lift-test-rhythm.md` to schedule the next quarter's tests.")
+    lines.append("")
+
+    if warnings:
+        lines.append("## Warnings")
+        lines.append("")
+        for w in warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_measurement_contract(client: str, recommended: str, decision_context: str,
+                                window: tuple[str, str], today: str,
+                                quarter: str | None) -> str:
+    goal_id = f"{client}-attribution-{recommended}-{quarter or window[1]}"
+    res_date = quarter_end(quarter) if quarter else (
+        (datetime.strptime(window[1], "%Y-%m-%d") + timedelta(days=90)).strftime("%Y-%m-%d")
+    )
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"goal_id: {goal_id}")
+    lines.append(f"client: {client}")
+    lines.append(f"opened_at: {today}")
+    lines.append("status: proposed")
+    lines.append("taste_type: attribution")
+    lines.append(f"resolution_date: {res_date}")
+    lines.append("predicted_p_threshold_met: 0.55")
+    lines.append("substrate_layers_cited: [icp, positioning, sources]")
+    lines.append("patterns_applied: [incrementality-not-attribution, goalpost-discipline-vs-metric-drift]")
+    lines.append("contradictions_aware: [no-decision-vs-named-competitor]")
+    lines.append("produced_by: attribution-model-design")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Measurement contract, {goal_id}")
+    lines.append("")
+    lines.append("## Hypothesis")
+    lines.append("")
+    lines.append(f"The `{recommended}` attribution model, computed against the trailing 90-day "
+                 "window for the named decision context, produces a channel-credit ranking that "
+                 "matches the rank produced by independently-run incrementality tests on the "
+                 "top-3 channels by spend within 1 position rank-shift. Per the "
+                 "`incrementality-not-attribution` pattern, attribution is a hypothesis until "
+                 "incrementality validates it; per `goalpost-discipline-vs-metric-drift`, the "
+                 "model definition is locked at open and any mid-quarter change is logged as an "
+                 "override with attribution.")
+    lines.append("")
+    lines.append("## Predicted outcome")
+    lines.append("")
+    lines.append(f"By {res_date}, the model's channel-credit rank is within 1 position of the "
+                 "incrementality-test ranking on the top-3 spend channels.")
+    lines.append("")
+    lines.append("## Revenue lever")
+    lines.append("")
+    lines.append("```yaml")
+    lines.append("lever_type: budget-allocation-quality")
+    lines.append("annual_revenue_impact_usd: range \"50000-500000\"")
+    lines.append("calculation: |")
+    lines.append("  Annual revenue at risk = (annual ad-spend) * (mis-allocation factor).")
+    lines.append("  Mis-allocation factor for last-touch on a typical SaaS account is 15-30%")
+    lines.append("  per Common Thread Collective findings. Calibrating the model with")
+    lines.append("  incrementality reduces the factor to 5-10%. The savings range above is")
+    lines.append("  per million USD of annual ad-spend.")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Measurement design")
+    lines.append("")
+    lines.append("```")
+    lines.append("Source: warehouse + ad-platform exports + incrementality-test outputs.")
+    lines.append("Method: rank channels by attribution credit; rank channels by incrementality test;")
+    lines.append("        compute Spearman rank correlation between the two ranks.")
+    lines.append("Cohort: trailing-90-day converters per ICP definition.")
+    lines.append("Ambiguous case: incrementality test results contaminated by parallel campaigns or")
+    lines.append("                seasonality; resolve AMBIGUOUS and re-test next quarter.")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Kill criterion")
+    lines.append("")
+    lines.append("Two consecutive quarterly incrementality tests show >2-position rank-shift on the "
+                 "top-3 channels. Either the model is wrong (switch model) or the data wiring is "
+                 "wrong (audit sources.yaml + warehouse stitch). Either way, the model loses "
+                 "decision-rights until the gap closes.")
+    lines.append("")
+    lines.append("## Resolution")
+    lines.append("")
+    lines.append(f"Resolves on {res_date}. Verdict: YES if rank-correlation matches within 1 position; "
+                 "NO if rank-shift > 1; AMBIGUOUS if data quality fails.")
+    lines.append("")
+    lines.append("Brier score = (predicted_p_threshold_met - indicator)^2.")
+    lines.append("")
+    lines.append("## Substrate update on resolution")
+    lines.append("")
+    lines.append("- If YES: lock model spec for next quarter.")
+    lines.append("- If NO: update model recommendation; open incrementality-anchored hybrid as candidate.")
+    lines.append("- If AMBIGUOUS: re-run test next quarter with cleaner window.")
+    return "\n".join(lines)
+
+
+# --- main -----------------------------------------------------------------
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/")
+    if not (client_root / "positioning").is_dir() and not (client_root / "positioning.md").is_file():
+        fails.append(f"positioning layer missing: clients/{client}/positioning/")
+    return len(fails) == 0, fails
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="attribution-model-design")
+    p.add_argument("--client", required=True)
+    p.add_argument(
+        "--model", default=None,
+        choices=list(MODEL_SPECS.keys()) + ["all"],
+        help="recommended model (default: derived from --decision-context)",
+    )
+    p.add_argument(
+        "--decision-context", default="budget-allocation",
+        choices=list(DEFAULT_RECOMMENDATIONS.keys()),
+    )
+    p.add_argument("--window", default=None, help="YYYY-MM-DD,YYYY-MM-DD; default trailing 90 days")
+    p.add_argument("--quarter", default=None, help="YYYY-Q[1-4] for measurement contract resolution")
+    p.add_argument("--strict-substrate", action="store_true")
+    args = p.parse_args()
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        return 3
+
+    sources_yaml_path = SUBSTRATE_ROOT / "clients" / args.client / "analytics" / "sources.yaml"
+    if not sources_yaml_path.is_file():
+        return refuse(
+            "missing-channel-inventory",
+            f"clients/{args.client}/analytics/sources.yaml not found. "
+            "Create it from templates/analytics-sources-example.yaml.",
+        )
+    sources_yaml = load_yaml(sources_yaml_path) or {}
+    if channel_count(sources_yaml) == 0:
+        return refuse(
+            "missing-channel-inventory",
+            f"sources.yaml has no channels declared. The attribution model is meaningless without "
+            "a named channel list. Add at least 3 channels under the `channels:` block.",
+        )
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if args.window:
+        try:
+            window = parse_window(args.window)
+        except ValueError as e:
+            print(f"REFUSED: invalid-window, {e}", file=sys.stderr)
+            return 4
+    else:
+        window = trailing_window(90)
+
+    recommended = args.model or DEFAULT_RECOMMENDATIONS[args.decision_context]
+    if recommended == "all":
+        # Emit all 8 models with the first-by-fit as primary recommendation.
+        all_models = list(MODEL_SPECS.keys())
+        recommended = DEFAULT_RECOMMENDATIONS[args.decision_context]
+    else:
+        all_models = [recommended] + [m for m in MODEL_SPECS if m != recommended]
+
+    warnings: list[str] = []
+    fit_rating = context_fit_score(recommended, args.decision_context)
+    if fit_is_warning(fit_rating):
+        warnings.append(
+            f"model-context-mismatch: model `{recommended}` rated `{fit_rating}` "
+            f"for decision-context `{args.decision_context}`. "
+            f"Strong recommendation: use `{DEFAULT_RECOMMENDATIONS[args.decision_context]}` instead."
+        )
+
+    channels_list = sources_yaml.get("channels") or []
+    contradiction_pick = pick_contradiction_position(args.decision_context, channels_list)
+
+    incrementality_path = None
+    incrementality_file = find_recent_incrementality(args.client)
+    if incrementality_file:
+        incrementality_path = str(incrementality_file.relative_to(SUBSTRATE_ROOT))
+
+    diagnostic_paths: list[str] = []
+    diag_dir = SUBSTRATE_ROOT / "clients" / args.client / "ads" / "diagnostics"
+    if diag_dir.is_dir():
+        for d in sorted(diag_dir.glob("*.md"), reverse=True)[:3]:
+            diagnostic_paths.append(str(d.relative_to(SUBSTRATE_ROOT)))
+
+    spec_md = render_model_spec(
+        client=args.client,
+        recommended=recommended,
+        all_models=all_models,
+        decision_context=args.decision_context,
+        window=window,
+        sources_yaml=sources_yaml,
+        today=today,
+        contradiction_pick=contradiction_pick,
+        diagnostic_paths=diagnostic_paths,
+        incrementality_path=incrementality_path,
+        warnings=warnings,
+    )
+
+    out_dir = SUBSTRATE_ROOT / "clients" / args.client / "analytics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    spec_path = out_dir / "attribution-model.md"
+    spec_path.write_text(spec_md, encoding="utf-8")
+
+    contract_md = render_measurement_contract(
+        client=args.client,
+        recommended=recommended,
+        decision_context=args.decision_context,
+        window=window,
+        today=today,
+        quarter=args.quarter,
+    )
+
+    contract_dir = SUBSTRATE_ROOT / "goals" / "measurement-contracts"
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    contract_path = contract_dir / f"{args.client}-attribution-{recommended}-{args.quarter or 'open'}.md"
+    contract_path.write_text(contract_md, encoding="utf-8")
+
+    print(f"[attribution-model-design] spec: {spec_path}", file=sys.stderr)
+    print(f"[attribution-model-design] contract: {contract_path}", file=sys.stderr)
+    print(f"  model: {recommended}  context: {args.decision_context}  fit: {fit_rating}", file=sys.stderr)
+    print(f"  contradiction-position: {contradiction_pick[0]}", file=sys.stderr)
+    if warnings:
+        for w in warnings:
+            print(f"  warn: {w}", file=sys.stderr)
+
+    print(str(spec_path))
+    return 1 if warnings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

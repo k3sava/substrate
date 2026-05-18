@@ -1,0 +1,71 @@
+#!/bin/bash
+# refresh-leaderboard — SQLite version (replaces the Postgres MV refresh).
+#
+# Reads from data/calibration.sqlite (taste_leaderboard view computes on demand;
+# no MV refresh needed in SQLite). Exports a markdown view at goals/taste-leaderboard.md
+# for human read.
+#
+# LaunchAgent (suggested): ~/Library/LaunchAgents/com.substrate.taste-leaderboard-refresh.plist
+# (nightly, after goal-resolve).
+
+set -e
+ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}}"
+DB="$ROOT/data/calibration.sqlite"
+OUT="$ROOT/goals/taste-leaderboard.md"
+
+if [ ! -f "$DB" ]; then
+  echo "[refresh-leaderboard] DB not initialised; run bin/init-calibration-db first" >&2
+  mkdir -p "$(dirname "$OUT")"
+  NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  cat > "$OUT" <<EOF
+---
+date_refreshed: $NOW
+source: SQLite view taste_leaderboard (data/calibration.sqlite)
+note: DB not initialised — run bin/init-calibration-db. Floor of N>=10 resolutions per (taste_owner, asset_type) cell applies once data exists.
+---
+
+# Taste leaderboard
+
+No resolved bets yet. Run \`bet resolve <id> <outcome>\` to populate.
+EOF
+  exit 0
+fi
+
+NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+mkdir -p "$(dirname "$OUT")"
+
+cat > "$OUT" <<EOF
+---
+date_refreshed: $NOW
+source: SQLite view taste_leaderboard (data/calibration.sqlite); refreshed nightly via the operator's leaderboard cron
+note: only (taste_owner, asset_type) cells with N >= 10 surface here per Beta-Binomial floor; no point estimates below N threshold.
+---
+
+# Taste leaderboard
+
+Per (taste_owner, asset_type) calibration. Lower brier = better. Negative peer_score = better than baseline.
+
+| taste_owner | asset_type | N | brier | log_score | peer | CI±half | first | last |
+|---|---|---:|---:|---:|---:|---:|---|---|
+EOF
+
+sqlite3 "$DB" -separator '|' "
+SELECT
+  COALESCE(taste_owner, '—'),
+  COALESCE(asset_type, '—'),
+  n_resolved_bets,
+  ROUND(mean_brier, 4),
+  ROUND(mean_log_score, 4),
+  ROUND(mean_peer_score, 4),
+  ROUND(brier_ci_half_width, 4),
+  SUBSTR(first_resolved_at, 1, 10),
+  SUBSTR(last_resolved_at, 1, 10)
+FROM taste_leaderboard
+ORDER BY mean_brier ASC, n_resolved_bets DESC;
+" 2>/dev/null | awk -F'|' '{ print "| "$1" | "$2" | "$3" | "$4" | "$5" | "$6" | "$7" | "$8" | "$9" |" }' >> "$OUT"
+
+if [ "$(sqlite3 "$DB" "SELECT COUNT(*) FROM taste_leaderboard;")" = "0" ]; then
+  echo "| (no cells with N≥10 yet) | — | 0 | — | — | — | — | — | — |" >> "$OUT"
+fi
+
+echo "[refresh-leaderboard] refreshed at $NOW; output at $OUT"

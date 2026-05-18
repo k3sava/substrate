@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+narrative-check — Raskin 5-act strategic-narrative gate.
+
+For leadership-facing artifacts (memo / brief / deck / board / cxo / email),
+checks the asset for the 5 acts:
+  1. change-in-world  — what shifted that breaks the old way
+  2. villain          — what blocks the buyer (status quo / competitor / behavior)
+  3. promised-land    — the future state the buyer wants (specific + visceral)
+  4. moment-of-choice — act now or fall behind (cost-of-inaction)
+  5. proof            — receipts (named cases / data / operator)
+
+Operator: Andy Raskin. Source: operator-critic-panel-2026-05-01.md #2.
+
+Usage:
+  narrative-check <asset> [--strict] [--client <slug>]
+
+Exit:
+  0 — 5/5 OR 4/5 acts carried (warning on 4/5)
+  1 — ≤3/5 acts carried
+  2 — file not found / config error
+"""
+
+from __future__ import annotations
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+ANCHORS = {
+    "change_in_world": [
+        r"(shifted|changed|moved) (recently|in (the past|last)|since|now)",
+        r"(the world|the market|buyers?|the category|the function) (has|now|today)",
+        r"(no longer|stopped working|breaks down|broken|isn't working anymore)",
+        r"\bchange in the world\b",
+        r"\bthe (old|prior) way\b",
+    ],
+    "villain": [
+        r"\b(the (problem|obstacle|enemy|villain|trap) is)\b",
+        r"\b(what (stops|blocks|holds back|prevents))\b",
+        r"\b(status quo|the old (way|game|shape))\b",
+        r"\b(without (us|this|the substrate)|in its absence)\b",
+        r"\b(the alternative is)\b",
+    ],
+    "promised_land": [
+        r"\b(imagine|picture|envision)\b",
+        r"\b(instead of [^\.]+,)",
+        r"\bwhat good looks like\b",
+        r"\bthe (new|next) (way|game|shape|operating model)\b",
+        r"\b(where|the place) (we|you) want to (be|land|get to)\b",
+        r"\bthe promised land\b",
+    ],
+    "moment_of_choice": [
+        r"\bnow or never\b",
+        r"\bcost of inaction\b",
+        r"\bwindow (closes|narrowing|open)\b",
+        r"\b(act|decide) (now|today|by (Q\d|next|monday|the end of))\b",
+        r"\b(or (lose|fall behind|slip|miss))\b",
+        r"\bevery (quarter|month) we wait\b",
+    ],
+    "proof": [
+        r"\b(case study|customer (data|story|quote|review))\b",
+        r"\b(named (operator|customer|account))\b",
+        r"\b(the receipt is|the data shows|the evidence is)\b",
+        r"\b(G2|Capterra|Trustpilot|HubSpot dashboard|Amplitude project)\b",
+        r"\b(per (our|the) (workbook|substrate|dashboard))\b",
+        r"\b(\d+(\.\d+)?%|\$[\d,]+|\d+ (deals|customers|reps))\b",
+    ],
+}
+
+
+def strip_frontmatter(text: str) -> str:
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end > 0:
+            return text[end + 4:]
+    return text
+
+
+def opening_window(body: str) -> str:
+    """The first 3 H2 sections + pre-first-H2 text."""
+    parts = re.split(r"(?m)^## ", body, maxsplit=4)
+    head = parts[0]
+    if len(parts) > 1:
+        head += "\n## " + "\n## ".join(parts[1:4])
+    return head[:6000]
+
+
+def carries_act(body: str, anchors: list[str]) -> tuple[bool, int, list[str]]:
+    """Check if any of the act's anchor terms fire in the body."""
+    hits: list[str] = []
+    for pat in anchors:
+        for m in re.finditer(pat, body, re.IGNORECASE):
+            hits.append(m.group(0))
+            if len(hits) >= 3:
+                break
+        if len(hits) >= 3:
+            break
+    return (len(hits) >= 1, len(hits), hits[:3])
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("asset", help="path to leadership-facing markdown")
+    p.add_argument("--strict", action="store_true",
+                   help="fail on 4/5 (default: warn on 4/5)")
+    p.add_argument("--client", default=os.environ.get("SUBSTRATE_CLIENT") or os.environ.get("CLIENT") or "sample-client")
+    args = p.parse_args()
+
+    asset_path = Path(args.asset)
+    if not asset_path.is_file():
+        print(f"asset not found: {args.asset}", file=sys.stderr)
+        return 2
+
+    text = asset_path.read_text()
+    body = strip_frontmatter(text)
+    window = opening_window(body)
+
+    print(f"=== narrative-check (Raskin 5-act): {args.asset} ===", file=sys.stderr)
+
+    carried = 0
+    missing: list[str] = []
+    for act, anchors in ANCHORS.items():
+        ok, count, hits = carries_act(window, anchors)
+        if ok:
+            carried += 1
+            samples = "; ".join(hits[:2])
+            print(f"  ✓ {act:18s}  ({count} signal{'s' if count != 1 else ''}; e.g. \"{samples}\")", file=sys.stderr)
+        else:
+            missing.append(act)
+            print(f"  ✗ {act:18s}  MISSING — see Raskin canon", file=sys.stderr)
+
+    print(f"  → carried {carried}/5", file=sys.stderr)
+
+    if carried == 5:
+        print(f"PASS: {args.asset} (5/5 acts carried)")
+        return 0
+    if carried == 4:
+        if args.strict:
+            print(f"FAIL: {args.asset} (4/5 carried; --strict mode requires 5/5; missing: {missing[0]})")
+            return 1
+        print(f"PASS: {args.asset} (4/5 carried; warning: {missing[0]} missing)")
+        return 0
+    fix_hints = {
+        "change_in_world": "name the recent shift (e.g., 'AI-native marketing means revenue-per-FTE compounds; the old org-by-function shape no longer works')",
+        "villain": "name the obstacle (e.g., 'PMM that reports to product becomes feature comms; PMM that reports to marketing becomes campaign support — neither serves the business outcome')",
+        "promised_land": "describe the future state (e.g., 'every operator amortizes context across the goals they run; revenue per operator goes up')",
+        "moment_of_choice": "name cost-of-inaction (e.g., 'every quarter we wait, the category-first window narrows')",
+        "proof": "cite specific receipts (e.g., 'the most recent call-intel digest already shipped; substrate dashboard URL configured by the operator')",
+    }
+    print(f"\n  fix hints for missing acts:", file=sys.stderr)
+    for m in missing:
+        print(f"    - {m}: {fix_hints[m]}", file=sys.stderr)
+    print(f"FAIL: {args.asset} ({carried}/5 carried; missing: {', '.join(missing)})")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

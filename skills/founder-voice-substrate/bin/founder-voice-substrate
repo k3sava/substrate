@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""founder-voice-substrate — compose the founder-voice file voice-enforce gates against.
+
+Reads a founder's public corpus, computes cadence stats, extracts up to 5
+reusable narrative beats, builds a corpus-derived kill-list and proof-line
+library, and writes the substrate file at the canonical path.
+
+Usage:
+    founder-voice-substrate --client <client> --founder <name>
+                            --corpus-paths <path> [--corpus-paths <path> ...]
+                            [--output <path>]
+
+Exit codes:
+    0 — substrate file composed
+    1 — preflight refused (substrate gap)
+    2 — input invalid (corpus too thin)
+    3 — verify failed
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import statistics
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "else", "for", "of",
+    "in", "on", "at", "to", "by", "with", "as", "is", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "should", "could", "may", "might", "can", "this", "that", "these",
+    "those", "it", "its", "their", "them", "they", "we", "us", "our", "you",
+    "your", "i", "my", "me", "he", "she", "him", "her", "his", "hers", "what",
+    "which", "who", "whom", "whose", "when", "where", "why", "how", "all",
+    "any", "both", "each", "few", "more", "most", "other", "some", "such",
+    "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very",
+    "just", "from", "into", "about", "after", "before", "during", "out", "up",
+    "down", "off", "over", "under", "again", "further", "here", "there", "now",
+    "also", "got", "get", "go", "going", "make", "made", "see", "saw", "like",
+    "really", "even", "still", "much", "way",
+}
+
+STOCK_BUZZWORDS = [
+    "orchestration", "seamless", "leverage", "transform", "holistic", "synergy",
+    "bespoke", "unlock", "robust", "world-class", "best-in-class",
+    "industry-leading", "cutting-edge", "revolutionary", "paradigm",
+]
+
+SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'“])")
+WORD_RE = re.compile(r"\b[a-zA-Z][a-zA-Z'\-]+\b")
+NUMERIC_TOKEN = re.compile(r"\d+[.,]?\d*\s*(%|x|X|hours?|days?|weeks?|months?|years?|"
+                           r"customers?|users?|clients?|companies?|deals?|leads?|"
+                           r"\$|€|£|₹|M|B|K)?\b")
+NAMED_ENTITY = re.compile(r"\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3}\b")
+
+
+def resolve_corpus_paths(patterns: list[str]) -> list[Path]:
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for pat in patterns:
+        # Allow both absolute paths, relative paths, and globs
+        p = Path(pat)
+        if not p.is_absolute() and not any(ch in pat for ch in "*?["):
+            p = (SUBSTRATE_ROOT / pat).resolve()
+        if p.is_file():
+            if p not in seen:
+                resolved.append(p)
+                seen.add(p)
+            continue
+        # Treat as glob
+        for match in glob.glob(pat, recursive=True):
+            mp = Path(match).resolve()
+            if mp.is_file() and mp not in seen:
+                resolved.append(mp)
+                seen.add(mp)
+    return resolved
+
+
+def read_text(p: Path) -> str:
+    try:
+        return p.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def split_posts(corpus: str) -> list[str]:
+    """Split corpus into post-sized chunks on blank-line boundaries."""
+    raw = re.split(r"\n\s*\n", corpus)
+    posts = []
+    buffer = []
+    buf_len = 0
+    for r in raw:
+        r = r.strip()
+        if not r:
+            continue
+        # Skip frontmatter-like blocks and metadata headers
+        if r.startswith("---") or r.startswith("# "):
+            continue
+        if buf_len + len(r) > 200 or len(r) > 200:
+            if buf_len > 0:
+                posts.append("\n\n".join(buffer))
+            buffer = [r]
+            buf_len = len(r)
+        else:
+            buffer.append(r)
+            buf_len += len(r)
+    if buffer:
+        posts.append("\n\n".join(buffer))
+    return [p for p in posts if len(p) > 80]
+
+
+def sentence_length_stats(corpus: str) -> dict:
+    sentences = [s.strip() for s in SENT_SPLIT.split(corpus) if s.strip()]
+    lengths = [len(s.split()) for s in sentences if 2 < len(s.split()) < 80]
+    if not lengths:
+        return {"count": 0}
+    lengths_sorted = sorted(lengths)
+    return {
+        "count": len(lengths),
+        "mean": round(statistics.mean(lengths), 1),
+        "median": int(statistics.median(lengths)),
+        "p25": lengths_sorted[len(lengths_sorted) // 4],
+        "p75": lengths_sorted[(3 * len(lengths_sorted)) // 4],
+        "p95": lengths_sorted[min(len(lengths_sorted) - 1, (95 * len(lengths_sorted)) // 100)],
+        "min": min(lengths),
+        "max": max(lengths),
+    }
+
+
+def top_content_words(corpus: str, k: int = 50) -> list[tuple[str, int]]:
+    words = [w.lower() for w in WORD_RE.findall(corpus)]
+    words = [w for w in words if w not in STOPWORDS and len(w) > 2]
+    return Counter(words).most_common(k)
+
+
+def extract_narrative_beats(posts: list[str], max_beats: int = 5) -> list[tuple[str, int]]:
+    """Find multi-word phrases (5-9 words) that recur in >=3 posts.
+
+    Lightweight heuristic: build a counter of normalized 5- to 8-word n-grams,
+    then dedupe overlapping substrings by keeping the longest highest-count
+    candidate.
+    """
+    ngram_post_counts: Counter = Counter()
+    seen_in_post: dict[str, set[int]] = {}
+    for idx, post in enumerate(posts):
+        tokens = re.findall(r"\b[a-zA-Z][a-zA-Z'\-]+\b", post.lower())
+        local: set[str] = set()
+        for n in (5, 6, 7, 8):
+            for i in range(len(tokens) - n + 1):
+                ngram = " ".join(tokens[i:i + n])
+                # Skip n-grams that are mostly stopwords
+                content = [t for t in tokens[i:i + n] if t not in STOPWORDS]
+                if len(content) < 3:
+                    continue
+                if ngram in local:
+                    continue
+                local.add(ngram)
+                seen_in_post.setdefault(ngram, set()).add(idx)
+        for ngram in local:
+            ngram_post_counts[ngram] += 1
+
+    candidates: list[tuple[str, int]] = []
+    for ngram, count in ngram_post_counts.most_common(500):
+        post_count = len(seen_in_post.get(ngram, ()))
+        if post_count >= 3:
+            candidates.append((ngram, post_count))
+
+    # Dedupe overlapping substrings: prefer longer phrases when one contains another
+    candidates.sort(key=lambda x: (-len(x[0].split()), -x[1]))
+    final: list[tuple[str, int]] = []
+    for ngram, post_count in candidates:
+        if any(ngram in chosen[0] or chosen[0] in ngram for chosen in final):
+            continue
+        final.append((ngram, post_count))
+        if len(final) >= max_beats:
+            break
+    return final
+
+
+def derive_kill_list(corpus_lower: str) -> list[str]:
+    """Stock buzzwords that do NOT appear in the corpus."""
+    absent: list[str] = []
+    for word in STOCK_BUZZWORDS:
+        # Use word boundaries; multi-word phrases checked literally
+        if " " in word or "-" in word:
+            if word.lower() not in corpus_lower:
+                absent.append(word)
+        else:
+            if not re.search(rf"\b{re.escape(word.lower())}\b", corpus_lower):
+                absent.append(word)
+    return absent
+
+
+def extract_proof_lines(posts: list[str], min_occurrences: int = 2) -> list[str]:
+    """Sentences with numbers or named entities that recur across multiple posts."""
+    sentence_counts: Counter = Counter()
+    sentence_post: dict[str, set[int]] = {}
+    for idx, post in enumerate(posts):
+        sentences = [s.strip() for s in SENT_SPLIT.split(post) if s.strip()]
+        for s in sentences:
+            if not (30 < len(s) < 220):
+                continue
+            has_signal = bool(NUMERIC_TOKEN.search(s)) or bool(
+                len([m for m in NAMED_ENTITY.findall(s) if m not in {"The", "I", "We"}]) >= 1
+            )
+            if not has_signal:
+                continue
+            normalized = re.sub(r"\s+", " ", s.lower())
+            sentence_counts[normalized] += 1
+            sentence_post.setdefault(normalized, set()).add(idx)
+
+    out = []
+    for sent, count in sentence_counts.most_common(40):
+        if len(sentence_post.get(sent, ())) >= min_occurrences:
+            # Recover a cased version from the original posts
+            for post in posts:
+                for s in SENT_SPLIT.split(post):
+                    if re.sub(r"\s+", " ", s.strip().lower()) == sent:
+                        out.append(s.strip())
+                        break
+                else:
+                    continue
+                break
+        if len(out) >= 12:
+            break
+    return out
+
+
+def coherence_with_buyer_voice(client_root: Path, top_words: list[tuple[str, int]]) -> tuple[list[str], list[str]]:
+    voc_dir = client_root / "voc" / "processed"
+    if not voc_dir.is_dir():
+        return [], []
+    buyer_corpus_parts = []
+    for f in voc_dir.rglob("*.md"):
+        buyer_corpus_parts.append(read_text(f))
+    buyer_corpus = " ".join(buyer_corpus_parts).lower()
+    if not buyer_corpus.strip():
+        return [], []
+    buyer_words = set(w for w in WORD_RE.findall(buyer_corpus)
+                      if w not in STOPWORDS and len(w) > 3)
+    founder_words = {w for w, _ in top_words[:30]}
+    align = sorted(buyer_words & founder_words)
+    diverge = sorted(founder_words - buyer_words)
+    return align[:15], diverge[:15]
+
+
+def compose_substrate_file(
+    client: str, founder: str, corpus_paths: list[Path],
+    stats: dict, top_words: list[tuple[str, int]],
+    beats: list[tuple[str, int]], kill_list: list[str],
+    proof_lines: list[str], coherence_align: list[str],
+    coherence_diverge: list[str],
+) -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    founder_slug = re.sub(r"[^a-z0-9]+", "-", founder.lower()).strip("-")
+    rels = []
+    for p in corpus_paths:
+        try:
+            rels.append(str(p.relative_to(SUBSTRATE_ROOT)))
+        except ValueError:
+            rels.append(str(p))
+
+    lines = [
+        "---",
+        f"title: {founder}'s voice substrate",
+        f"client: {client}",
+        f"owner: {founder_slug}",
+        f"corpus_sources: [{', '.join(rels)}]",
+        f"corpus_post_count: {len(rels)}",
+        f"last_compiled: {today}",
+        "produced_by: founder-voice-substrate",
+        "asset_type: voice-substrate",
+        "contradiction_positions: [founder-voice-vs-team-voice: position-A]",
+        "position_rationale: founder voice is the canonical thesis; team voice is "
+        "permitted to soften but not to drift on the kill-list.",
+        "---",
+        "",
+        f"# {founder}'s voice substrate",
+        "",
+        f"Compiled {today} from {len(rels)} corpus file(s). Cadence stats computed "
+        f"over {stats.get('count', 0)} sentences. Voice gate reads this file.",
+        "",
+        "## The 5 reusable narrative beats",
+        "",
+    ]
+    if beats:
+        for i, (beat, post_count) in enumerate(beats, 1):
+            lines.append(f"{i}. _\"{beat}\"_, observed in {post_count} posts.")
+    else:
+        lines.append("_(no n-gram appeared in 3+ posts; corpus may be heterogeneous "
+                     "or below the cadence floor. Expand corpus-paths and re-run.)_")
+    lines.append("")
+
+    lines += [
+        "## The kill-list",
+        "",
+        "Stock buzzwords that do not appear in the corpus. Any draft using these "
+        "fails voice-enforce.",
+        "",
+    ]
+    for w in kill_list:
+        lines.append(f"- {w}")
+    if not kill_list:
+        lines.append("_(every stock buzzword appears at least once in the corpus; "
+                     "kill-list is empty. Either the corpus is contaminated or the "
+                     "founder genuinely uses this register.)_")
+    lines.append("")
+
+    lines += [
+        "## Cadence rules",
+        "",
+        f"- Sentence length: mean {stats.get('mean', 0)} words, median "
+        f"{stats.get('median', 0)}, p25 {stats.get('p25', 0)}, p75 "
+        f"{stats.get('p75', 0)}, p95 {stats.get('p95', 0)}.",
+        f"- Sentence range: {stats.get('min', 0)} to {stats.get('max', 0)} words.",
+        f"- Sample size: {stats.get('count', 0)} sentences.",
+        "- Paragraph rhythm: short paragraphs (1 to 3 sentences) dominate when "
+        "the corpus median is below 18 words.",
+        "- Pivot transitions: prefer concrete claim then short concession then "
+        "evidence; flag any draft that runs three abstract sentences in a row.",
+        "",
+        "## Top content words (founder lexicon)",
+        "",
+    ]
+    for w, c in top_words[:25]:
+        lines.append(f"- `{w}` ({c})")
+    lines.append("")
+
+    lines += [
+        "## Proof-line library",
+        "",
+        "Recurring sentences with named stats, customer names, or case anchors "
+        "that the founder reaches for. Reuse verbatim or paraphrase tightly.",
+        "",
+    ]
+    if proof_lines:
+        for s in proof_lines:
+            lines.append(f"- _\"{s}\"_")
+    else:
+        lines.append("_(no sentence with named-anchor or numeric signal recurred "
+                     "across the corpus; flag for the next interview pass.)_")
+    lines.append("")
+
+    lines += [
+        "## Coherence with buyer voice (from voc/processed/)",
+        "",
+        "Flagged for awareness, never resolved by this skill.",
+        "",
+        f"- Aligned terms: {', '.join(coherence_align) if coherence_align else '_(none flagged)_'}",
+        f"- Divergent terms (founder-only): {', '.join(coherence_diverge) if coherence_diverge else '_(none flagged)_'}",
+        "",
+        "## Surfaces this gates",
+        "",
+        f"- {founder} LinkedIn posts",
+        f"- {founder} bylines",
+        "- Homepage hero (when founder thesis is canonical)",
+        f"- {founder} essays",
+        "- AE talking points (when ghost-written for founder delivery)",
+        "- Case studies (proof-line library composed in)",
+        "",
+        "## Refresh cadence",
+        "",
+        "- Re-compile monthly while the founder is publishing actively.",
+        "- Re-compile on any product launch (founder voice typically pivots at launch).",
+        "- Flag drift if the median sentence length shifts by more than 30%.",
+        "",
+        "## Patterns grounded",
+        "",
+        "- `knowledge/patterns/narrative-as-strategy.md`",
+        "- `knowledge/patterns/copywriting-craft-fundamentals.md`",
+        "- `knowledge/patterns/distribution-as-moat.md`",
+    ]
+
+    text = "\n".join(lines) + "\n"
+    return text.replace("—", ", ")
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--client", required=True)
+    p.add_argument("--founder", required=True)
+    p.add_argument("--corpus-paths", action="append", required=True)
+    p.add_argument("--output", default=None)
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        print(f"REFUSED: client root missing: {client_root}", file=sys.stderr)
+        return 1
+
+    paths = resolve_corpus_paths(args.corpus_paths)
+    if len(paths) < 3:
+        print(f"REFUSED: corpus too thin: {len(paths)} files resolved, need >=3. "
+              f"Expand corpus-paths and re-run.", file=sys.stderr)
+        return 2
+
+    corpus = "\n\n".join(read_text(p) for p in paths)
+    word_count = len(corpus.split())
+    if word_count < 3000:
+        print(f"REFUSED: corpus only {word_count} words; cadence stats need >=3000. "
+              f"Add more posts or transcripts.", file=sys.stderr)
+        return 2
+
+    posts = split_posts(corpus)
+    stats = sentence_length_stats(corpus)
+    top_words = top_content_words(corpus)
+    beats = extract_narrative_beats(posts)
+    kill_list = derive_kill_list(corpus.lower())
+    proof_lines = extract_proof_lines(posts)
+    align, diverge = coherence_with_buyer_voice(client_root, top_words)
+
+    doc = compose_substrate_file(
+        args.client, args.founder, paths, stats, top_words, beats,
+        kill_list, proof_lines, align, diverge,
+    )
+
+    if args.output:
+        out_path = Path(args.output).resolve()
+    else:
+        out_dir = client_root / "brand-voice"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "founder-voice.md"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(doc, encoding="utf-8")
+
+    print(f"[founder-voice-substrate] wrote {out_path}", file=sys.stderr)
+    print(f"  corpus: {len(paths)} files, {word_count} words, {len(posts)} posts",
+          file=sys.stderr)
+    print(f"  cadence: median={stats.get('median')}w, p95={stats.get('p95')}w",
+          file=sys.stderr)
+    print(f"  beats={len(beats)} kill-list={len(kill_list)} proof-lines={len(proof_lines)}",
+          file=sys.stderr)
+    print(f"PASS: {out_path.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

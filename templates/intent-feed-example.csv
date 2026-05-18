@@ -1,0 +1,27 @@
+company,domain,industry,signal_type,signal_topic,total_score,signal_count,surge
+Acme Health,acmehealth.example,healthcare-saas,g2-comparison,vs-aircall,82,11,1
+Bluewave Logistics,bluewave.example,logistics,doc-visit,api-docs,58,7,0
+Catalyst Edu,catalyst.example,edtech,review-read,g2-reviews-cloudtalk,34,3,0
+Dorian Capital,dorianvc.example,fintech,pricing-page,product-pricing,90,16,1
+Elementai Robotics,elementai.example,robotics,ad-click,competitor-displacement,46,4,0
+Forge Industrial,forge.example,manufacturing,webinar,industry-benchmarks,67,8,0
+Granite Insurance,granite.example,insurance,homepage,brand-search,28,2,0
+Helio Solar,helio.example,energy-saas,g2-comparison,vs-cloudtalk,72,9,0
+Indigo Talent,indigo.example,hr-tech,doc-visit,api-docs,38,5,0
+Juniper Realty,juniper.example,proptech,ad-click,sponsored-post,18,2,0
+Kestrel Cyber,kestrel.example,cybersecurity,demo-request,direct-inquiry,95,1,1
+Lumina Media,lumina.example,media-saas,doc-visit,migration-guide,52,6,0
+Meridian Bank,meridian.example,banking,pricing-page,enterprise-tier,79,12,0
+Nimbus Education,nimbus.example,edtech,homepage,brand-search,12,1,0
+Olive Pharma,olivepharma.example,pharma,demo-request,direct-inquiry,88,3,1
+Polaris Auto,polaris.example,automotive,homepage,brand-search,22,2,0
+Quartz Logistics,quartz.example,logistics,g2-comparison,vs-aircall,55,7,0
+Redwood Foods,redwood.example,food-manufacturing,homepage,brand-search,9,1,0
+Sapphire Mobility,sapphire.example,mobility-saas,demo-request,direct-inquiry,93,2,1
+Tundra Hosting,tundra.example,hosting,doc-visit,api-docs,42,5,0
+Umber Studios,umber.example,gaming,review-read,g2-reviews-aloware,30,3,0
+Volt Mobility,volt.example,mobility-saas,webinar,vertical-playbook,40,4,0
+Westport Marine,westport.example,marine,homepage,brand-search,15,1,0
+Xenon Robotics,xenon.example,robotics,pricing-page,product-pricing,76,11,0
+Yellow Apparel,yellow.example,retail-apparel,homepage,brand-search,8,1,0
+Zephyr Wellness,zephyr.example,wellness,doc-visit,api-docs,32,3,0

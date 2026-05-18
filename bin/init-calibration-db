@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Initialise the calibration SQLite DB from data/calibration-schema.sql.
+# Idempotent — safe to run multiple times.
+#
+# Usage: bin/init-calibration-db [--reset]
+
+set -euo pipefail
+
+ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}}"
+DB="$ROOT/data/calibration.sqlite"
+SCHEMA="$ROOT/data/calibration-schema.sql"
+
+if [ "${1:-}" = "--reset" ]; then
+  echo "[init-calibration-db] removing existing DB at $DB"
+  rm -f "$DB"
+fi
+
+if [ ! -f "$SCHEMA" ]; then
+  echo "[init-calibration-db] schema missing: $SCHEMA" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "$DB")"
+sqlite3 "$DB" < "$SCHEMA"
+echo "[init-calibration-db] ok: $DB"
+echo "[init-calibration-db] tables: $(sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type='table';" | tr '\n' ' ')"
+echo "[init-calibration-db] views:  $(sqlite3 "$DB" "SELECT name FROM sqlite_master WHERE type='view';" | tr '\n' ' ')"

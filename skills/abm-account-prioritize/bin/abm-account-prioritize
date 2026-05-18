@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""abm-account-prioritize — score and tier a target-account list against canonical ICP.
+
+Reads a target-accounts CSV (company, industry, size, tech_stack, signals) and
+the client's pinned ICP layer. Produces a ranked CSV with per-feature scores,
+composite score, tier (1A / 1B / 2 / defer), and one-line rationale per account.
+
+Usage:
+    abm-account-prioritize --client <client> --accounts <csv> --category-maturity <mature|emerging|hybrid>
+                           [--icp-version <ver>] [--top-n <int>] [--output <path>]
+
+Exit codes:
+    0 — ranking complete, CSV + summary written
+    1 — preflight refused (substrate gap)
+    2 — input file missing or invalid
+    3 — refused (e.g., >15% accounts in tier 1A)
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+
+# ---- Scoring weights (can be tuned; defaults match SKILL.md spec) ----
+
+WEIGHTS = {
+    "icp_fit": 0.35,
+    "tech_stack": 0.20,
+    "trigger_recency": 0.20,
+    "engagement_depth": 0.15,
+    "strategic_value": 0.10,
+}
+
+# Tier thresholds on the 0-100 normalized composite score
+TIER_BANDS = [
+    ("1A", 75, 100),
+    ("1B", 55, 74),
+    ("2", 35, 54),
+    ("defer", 0, 34),
+]
+
+# Refuse if more than this fraction of accounts ends up in 1A.
+TIER_1A_MAX_FRACTION = 0.15
+
+
+# ---- Substrate readers ----
+
+def read_icp_layer(client: str) -> dict[str, Any]:
+    """Read pinned ICP definition from clients/<client>/icp/.
+
+    Returns a dict with 'industries', 'sizes', 'geos', 'tech_signals',
+    'anti_industries' parsed loosely from substrate. Falls back to an
+    empty profile if the layer is bare; preflight checks for existence.
+    """
+    icp_dir = SUBSTRATE_ROOT / "clients" / client / "icp"
+    profile = {
+        "industries": [],
+        "sizes": [],  # employee bands like "50-200", "200-1000"
+        "geos": [],
+        "tech_signals_positive": [],  # tech-stack matches that signal fit
+        "tech_signals_negative": [],  # tech-stack matches that disqualify
+        "anti_industries": [],
+        "raw_paths": [],
+    }
+    if not icp_dir.is_dir():
+        return profile
+    # Read 00-INDEX.md first (canonical), then any *.md under icp/
+    candidates = []
+    if (icp_dir / "00-INDEX.md").exists():
+        candidates.append(icp_dir / "00-INDEX.md")
+    for f in sorted(icp_dir.glob("*.md")):
+        if f not in candidates:
+            candidates.append(f)
+    for f in candidates:
+        profile["raw_paths"].append(str(f.relative_to(SUBSTRATE_ROOT)))
+        text = f.read_text(encoding="utf-8")
+        # Look for industry / size / geo lists inside common substrate shapes:
+        # "industries: [SaaS, fintech, ...]" or bullet "- SaaS"
+        for line in text.splitlines():
+            l = line.strip().lower()
+            m = re.match(r"^industries?\s*:\s*(.*)$", l)
+            if m and m.group(1):
+                profile["industries"].extend(_split_list(m.group(1)))
+            m = re.match(r"^anti[_-]?industries?\s*:\s*(.*)$", l)
+            if m and m.group(1):
+                profile["anti_industries"].extend(_split_list(m.group(1)))
+            m = re.match(r"^sizes?\s*:\s*(.*)$", l)
+            if m and m.group(1):
+                profile["sizes"].extend(_split_list(m.group(1)))
+            m = re.match(r"^geos?\s*:\s*(.*)$", l)
+            if m and m.group(1):
+                profile["geos"].extend(_split_list(m.group(1)))
+            m = re.match(r"^tech[_\s-]?signals?[_\s-]?positive\s*:\s*(.*)$", l)
+            if m and m.group(1):
+                profile["tech_signals_positive"].extend(_split_list(m.group(1)))
+            m = re.match(r"^tech[_\s-]?signals?[_\s-]?negative\s*:\s*(.*)$", l)
+            if m and m.group(1):
+                profile["tech_signals_negative"].extend(_split_list(m.group(1)))
+    # De-duplicate, lowercase
+    for k in ("industries", "sizes", "geos", "tech_signals_positive",
+             "tech_signals_negative", "anti_industries"):
+        profile[k] = list({v.strip().lower() for v in profile[k] if v.strip()})
+    return profile
+
+
+def _split_list(s: str) -> list[str]:
+    """Split a YAML-list-ish string into clean tokens.
+
+    Handles: "[a, b, c]", "a, b, c", "a; b; c". Strips brackets and quotes.
+    """
+    s = s.strip()
+    s = s.strip("[]")
+    parts = re.split(r"[,;]", s)
+    return [re.sub(r"^[\"'\s]+|[\"'\s]+$", "", p) for p in parts if p.strip()]
+
+
+def read_competitive_signals(client: str) -> dict[str, list[str]]:
+    """Read competitor + complementary-tool registry from competitive layer.
+
+    Returns {'competitors': [...], 'complementary': [...]} as lowercased lists.
+    Used to score tech-stack signals.
+    """
+    comp_dir = SUBSTRATE_ROOT / "clients" / client / "competitive"
+    out = {"competitors": [], "complementary": []}
+    if not comp_dir.is_dir():
+        return out
+    for f in comp_dir.rglob("*.md"):
+        text = f.read_text(encoding="utf-8").lower()
+        for line in text.splitlines():
+            m = re.match(r"^\s*-\s*competitor\s*:\s*(.+)$", line.strip())
+            if m:
+                out["competitors"].append(m.group(1).strip())
+            m = re.match(r"^\s*-\s*complementary\s*:\s*(.+)$", line.strip())
+            if m:
+                out["complementary"].append(m.group(1).strip())
+    # Also add any battle-card filename slugs as competitors
+    bc_dir = comp_dir / "battle-cards"
+    if bc_dir.is_dir():
+        for f in bc_dir.glob("*.md"):
+            slug = f.stem.lower()
+            if slug not in out["competitors"]:
+                out["competitors"].append(slug)
+    return out
+
+
+def read_recent_triggers(client: str, window_days: int = 90) -> dict[str, dict]:
+    """Read sales/triggers/<date>.md files within window; return {company_lower: {event_type, event_date, summary}}.
+
+    The trigger files are produced by sales-trigger-event-watch.
+    """
+    trigger_dir = SUBSTRATE_ROOT / "clients" / client / "sales" / "triggers"
+    out: dict[str, dict] = {}
+    if not trigger_dir.is_dir():
+        return out
+    cutoff = datetime.now(timezone.utc).timestamp() - (window_days * 86400)
+    for f in sorted(trigger_dir.glob("*.md"), reverse=True):
+        if f.stat().st_mtime < cutoff:
+            continue
+        text = f.read_text(encoding="utf-8")
+        # Parse trigger entries: lines like "- account: <Company> | event: <type> | date: <YYYY-MM-DD> | summary: <text>"
+        for line in text.splitlines():
+            if "|" not in line:
+                continue
+            parts = [p.strip() for p in line.lstrip("- ").split("|")]
+            entry = {}
+            for p in parts:
+                if ":" in p:
+                    k, v = p.split(":", 1)
+                    entry[k.strip().lower()] = v.strip()
+            company = entry.get("account") or entry.get("company")
+            if company:
+                # First wins (most recent because we iterate sorted-reverse)
+                out.setdefault(company.lower(), entry)
+    return out
+
+
+def read_intent_feed(client: str) -> dict[str, int]:
+    """Read intent-feed engagement scores per account (lowercased).
+
+    File: clients/<client>/sales/intent-feed/latest.csv with columns
+    company, total_score (0-100). Returns {company_lower: score}.
+    """
+    feed = SUBSTRATE_ROOT / "clients" / client / "sales" / "intent-feed" / "latest.csv"
+    out: dict[str, int] = {}
+    if not feed.is_file():
+        return out
+    with feed.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            company = (row.get("company") or row.get("account") or "").strip().lower()
+            score_str = (row.get("total_score") or row.get("score") or "0").strip()
+            try:
+                out[company] = int(float(score_str))
+            except ValueError:
+                continue
+    return out
+
+
+# ---- Per-account feature scoring ----
+
+def score_icp_fit(account: dict, icp: dict) -> tuple[float, str]:
+    """Return (0-1 score, rationale)."""
+    industry = (account.get("industry") or "").strip().lower()
+    size = (account.get("size") or "").strip().lower()
+    geo = (account.get("geo") or account.get("country") or "").strip().lower()
+
+    if industry and industry in icp["anti_industries"]:
+        return 0.0, f"anti-ICP industry ({industry})"
+
+    score = 0.0
+    parts = []
+    # Industry match: 0.5 weight inside ICP-fit
+    if not icp["industries"]:
+        # Without ICP industry pinning, give neutral 0.5
+        score += 0.5 * 0.6
+        parts.append("industry: ICP-not-pinned")
+    elif industry and any(_loose_match(industry, ind) for ind in icp["industries"]):
+        score += 0.6
+        parts.append(f"industry-match ({industry})")
+    else:
+        parts.append(f"industry-miss ({industry or 'unknown'})")
+
+    # Size match: 0.3 weight
+    if not icp["sizes"]:
+        score += 0.3 * 0.5
+        parts.append("size: ICP-not-pinned")
+    elif size and any(_size_in_band(size, band) for band in icp["sizes"]):
+        score += 0.3
+        parts.append(f"size-match ({size})")
+    else:
+        parts.append(f"size-miss ({size or 'unknown'})")
+
+    # Geo match: 0.1 weight
+    if not icp["geos"]:
+        score += 0.1
+    elif geo and any(_loose_match(geo, g) for g in icp["geos"]):
+        score += 0.1
+        parts.append(f"geo-match ({geo})")
+    return min(score, 1.0), "; ".join(parts)
+
+
+def _loose_match(a: str, b: str) -> bool:
+    """Loose string match: substring either direction or token overlap."""
+    a, b = a.strip().lower(), b.strip().lower()
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    a_tokens = set(re.split(r"[\s\-_/]+", a))
+    b_tokens = set(re.split(r"[\s\-_/]+", b))
+    return bool(a_tokens & b_tokens) and len(a_tokens & b_tokens) >= min(len(a_tokens), len(b_tokens), 2) / 2
+
+
+def _size_in_band(size: str, band: str) -> bool:
+    """Match a size string ('250 employees', '500') against a band ('200-1000', '50+').
+
+    Returns True if the parsed numeric size falls inside the band.
+    """
+    n = _parse_size(size)
+    if n is None:
+        # Try string match (e.g., "mid-market", "smb")
+        return size.lower().strip() == band.lower().strip()
+    band = band.strip()
+    if "-" in band:
+        try:
+            lo, hi = band.split("-", 1)
+            return int(lo) <= n <= int(hi)
+        except ValueError:
+            return False
+    if band.endswith("+"):
+        try:
+            return n >= int(band[:-1])
+        except ValueError:
+            return False
+    try:
+        # Single number band: tolerate +/- 50%
+        target = int(band)
+        return abs(n - target) <= max(target * 0.5, 50)
+    except ValueError:
+        return False
+
+
+def _parse_size(size: str) -> int | None:
+    m = re.search(r"(\d{1,5})", size.replace(",", ""))
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def score_tech_stack(account: dict, comp: dict) -> tuple[float, str]:
+    """Return (0-1 score, rationale).
+
+    Stack contains a competitor → strong displacement signal (0.9-1.0).
+    Stack contains a complementary tool → buyer signal (0.6-0.7).
+    Stack contains neither → neutral 0.3.
+    Empty stack → 0.2 (uncertain).
+    """
+    stack_raw = (account.get("tech_stack") or account.get("stack") or "").strip().lower()
+    if not stack_raw:
+        return 0.2, "tech-stack unknown"
+    stack_tokens = set(re.split(r"[,;|]+", stack_raw))
+    stack_tokens = {t.strip() for t in stack_tokens if t.strip()}
+
+    # Look for competitors in stack (displacement signal)
+    competitor_hits = [c for c in comp["competitors"] if any(c in t or t in c for t in stack_tokens)]
+    if competitor_hits:
+        return 0.95, f"displacement-signal (uses competitor: {', '.join(competitor_hits[:2])})"
+
+    # Look for complementary tools (intent signal)
+    complementary_hits = [c for c in comp["complementary"] if any(c in t or t in c for t in stack_tokens)]
+    if complementary_hits:
+        return 0.65, f"intent-signal (uses complementary: {', '.join(complementary_hits[:2])})"
+
+    return 0.3, "tech-stack neutral (no competitor or complementary tool)"
+
+
+def score_trigger_recency(account: dict, triggers: dict) -> tuple[float, str]:
+    """Return (0-1 score, rationale).
+
+    Within 30 days: 0.9-1.0. Within 60 days: 0.6. Within 90 days: 0.4.
+    Older or missing: 0.0-0.2.
+    """
+    company = (account.get("company") or "").strip().lower()
+    if not company or company not in triggers:
+        return 0.0, "no recent trigger"
+
+    entry = triggers[company]
+    date_str = entry.get("date") or entry.get("event_date") or ""
+    try:
+        event_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return 0.3, f"trigger-detected (date unparseable: {date_str})"
+
+    age_days = (datetime.now(timezone.utc) - event_dt).days
+    event_type = entry.get("event") or entry.get("type") or "unknown"
+
+    if age_days <= 30:
+        return 1.0, f"fresh trigger: {event_type} ({age_days}d)"
+    if age_days <= 60:
+        return 0.7, f"recent trigger: {event_type} ({age_days}d)"
+    if age_days <= 90:
+        return 0.4, f"in-window trigger: {event_type} ({age_days}d)"
+    return 0.1, f"stale trigger: {event_type} ({age_days}d)"
+
+
+def score_engagement_depth(account: dict, intent: dict) -> tuple[float, str]:
+    """Return (0-1 score, rationale)."""
+    company = (account.get("company") or "").strip().lower()
+    # Use intent feed score if present
+    if company in intent:
+        s = intent[company]
+        # intent score is 0-100; normalize
+        return min(s / 100.0, 1.0), f"intent-score: {s}/100"
+
+    # Fallback: parse signals column for engagement signals
+    signals = (account.get("signals") or "").strip().lower()
+    if not signals:
+        return 0.0, "no engagement data"
+
+    score = 0.0
+    parts = []
+    for keyword, weight in [
+        ("g2", 0.3),
+        ("review", 0.3),
+        ("doc-visit", 0.4),
+        ("ad-click", 0.2),
+        ("homepage", 0.2),
+        ("pricing-page", 0.5),
+        ("demo-request", 0.9),
+        ("webinar", 0.4),
+    ]:
+        if keyword in signals:
+            score = min(score + weight, 1.0)
+            parts.append(keyword)
+
+    return score, f"signals: {', '.join(parts)}" if parts else "no engagement signals"
+
+
+def score_strategic_value(account: dict) -> tuple[float, str]:
+    """Return (0-1 score, rationale).
+
+    Reads explicit columns: strategic, named_account, logo_value (low/med/high),
+    vertical_leader (true/false).
+    """
+    score = 0.0
+    parts = []
+
+    flag = (account.get("strategic") or account.get("named_account") or "").strip().lower()
+    if flag in ("true", "yes", "1", "named", "named-account"):
+        score += 0.5
+        parts.append("named-account")
+
+    logo = (account.get("logo_value") or "").strip().lower()
+    if logo == "high":
+        score += 0.3
+        parts.append("high-logo")
+    elif logo == "med" or logo == "medium":
+        score += 0.15
+        parts.append("med-logo")
+
+    vlead = (account.get("vertical_leader") or "").strip().lower()
+    if vlead in ("true", "yes", "1"):
+        score += 0.2
+        parts.append("vertical-leader")
+
+    if score == 0.0:
+        return 0.3, "no strategic flags (default)"
+    return min(score, 1.0), "; ".join(parts)
+
+
+# ---- Composite + tier ----
+
+def composite_score(features: dict[str, float]) -> float:
+    """Weighted sum, returns 0-100."""
+    raw = sum(features[k] * WEIGHTS[k] for k in WEIGHTS)
+    return round(raw * 100, 1)
+
+
+def assign_tier(score: float) -> str:
+    for tier, lo, hi in TIER_BANDS:
+        if lo <= score <= hi:
+            return tier
+    return "defer"
+
+
+def percentile_normalize(scores: list[float]) -> list[float]:
+    """Map raw scores to a 0-100 percentile-anchored band, but keep absolute
+    floor — accounts that score truly low (<35) stay at <35 even if they're
+    top of a thin batch. This prevents a tiny low-quality batch from getting
+    artificially inflated to 1A.
+    """
+    if not scores:
+        return []
+    sorted_scores = sorted(scores)
+    out = []
+    for s in scores:
+        # Find rank
+        rank = sum(1 for x in sorted_scores if x < s) / len(scores)
+        # Blend raw + percentile (60/40 toward raw to preserve absolute floor)
+        blended = 0.6 * s + 0.4 * (rank * 100)
+        out.append(round(blended, 1))
+    return out
+
+
+# ---- Main ----
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Score and tier a target-account list against canonical ICP.")
+    p.add_argument("--client", required=True)
+    p.add_argument("--accounts", required=True, help="Path to target-accounts CSV")
+    p.add_argument("--category-maturity", required=True,
+                   choices=["mature", "emerging", "hybrid"],
+                   help="Picks position from outbound-vs-inbound-budget contradiction")
+    p.add_argument("--icp-version", default=None)
+    p.add_argument("--top-n", type=int, default=100)
+    p.add_argument("--output", default=None)
+    p.add_argument("--force", action="store_true", help="Override tier-1A cap and ICP-staleness checks")
+    args = p.parse_args()
+
+    # ---- Preflight ----
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        print(f"REFUSED: client root missing — {client_root}", file=sys.stderr)
+        print("  fix: run 'substrate refresh-knowledge' or create the client substrate first.", file=sys.stderr)
+        return 1
+    icp_dir = client_root / "icp"
+    if not icp_dir.is_dir() and not (client_root / "icp.md").is_file():
+        print(f"REFUSED: ICP layer missing at clients/{args.client}/icp/", file=sys.stderr)
+        print("  fix: run substrate icp-cut --client " + args.client, file=sys.stderr)
+        return 1
+
+    accounts_path = Path(args.accounts).resolve()
+    if not accounts_path.is_file():
+        print(f"REFUSED: accounts CSV not found — {accounts_path}", file=sys.stderr)
+        return 2
+
+    # ---- Load substrate ----
+    icp = read_icp_layer(args.client)
+    comp = read_competitive_signals(args.client)
+    triggers = read_recent_triggers(args.client)
+    intent = read_intent_feed(args.client)
+
+    print(f"[abm-account-prioritize] client={args.client} maturity={args.category_maturity}", file=sys.stderr)
+    print(f"  ICP: {len(icp['industries'])} industries, {len(icp['sizes'])} size bands, "
+          f"{len(icp['anti_industries'])} anti-industries, paths={icp['raw_paths']}", file=sys.stderr)
+    print(f"  Competitive: {len(comp['competitors'])} competitors, {len(comp['complementary'])} complementary", file=sys.stderr)
+    print(f"  Triggers (90d window): {len(triggers)} accounts", file=sys.stderr)
+    print(f"  Intent feed: {len(intent)} accounts", file=sys.stderr)
+
+    # ---- Load accounts ----
+    accounts: list[dict[str, Any]] = []
+    with accounts_path.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            print("REFUSED: accounts CSV has no header row", file=sys.stderr)
+            return 2
+        required = {"company", "industry", "size"}
+        missing = required - {c.lower() for c in reader.fieldnames}
+        if missing:
+            print(f"REFUSED: accounts CSV missing required columns: {sorted(missing)}", file=sys.stderr)
+            return 2
+        for row in reader:
+            # lowercase keys
+            accounts.append({k.lower(): v for k, v in row.items()})
+
+    if not accounts:
+        print("REFUSED: accounts CSV has no rows", file=sys.stderr)
+        return 2
+
+    print(f"  Accounts loaded: {len(accounts)}", file=sys.stderr)
+
+    # ---- Score ----
+    scored: list[dict[str, Any]] = []
+    raw_composites: list[float] = []
+    for acc in accounts:
+        features = {}
+        rationales = {}
+        features["icp_fit"], rationales["icp_fit"] = score_icp_fit(acc, icp)
+        features["tech_stack"], rationales["tech_stack"] = score_tech_stack(acc, comp)
+        features["trigger_recency"], rationales["trigger_recency"] = score_trigger_recency(acc, triggers)
+        features["engagement_depth"], rationales["engagement_depth"] = score_engagement_depth(acc, intent)
+        features["strategic_value"], rationales["strategic_value"] = score_strategic_value(acc)
+        composite = composite_score(features)
+        raw_composites.append(composite)
+        scored.append({
+            "account": acc,
+            "features": features,
+            "rationales": rationales,
+            "composite_raw": composite,
+        })
+
+    # Percentile-blend to produce final 0-100 score
+    final_scores = percentile_normalize(raw_composites)
+    for i, s in enumerate(scored):
+        s["composite"] = final_scores[i]
+        s["tier"] = assign_tier(final_scores[i])
+
+    # ---- Tier 1A cap check ----
+    tier_1a_count = sum(1 for s in scored if s["tier"] == "1A")
+    tier_1a_fraction = tier_1a_count / len(scored)
+    if tier_1a_fraction > TIER_1A_MAX_FRACTION and not args.force:
+        # Demote excess to 1B
+        scored.sort(key=lambda x: -x["composite"])
+        cap = max(1, int(len(scored) * TIER_1A_MAX_FRACTION))
+        for i, s in enumerate(scored):
+            if i >= cap and s["tier"] == "1A":
+                s["tier"] = "1B"
+        print(f"  tier-1A cap applied: {tier_1a_count} → {cap} (cap = {TIER_1A_MAX_FRACTION:.0%})", file=sys.stderr)
+
+    # Sort by composite desc
+    scored.sort(key=lambda x: -x["composite"])
+
+    # ---- Truncate to top-N ----
+    output_rows = scored[:args.top_n]
+
+    # ---- Write CSV ----
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if args.output:
+        out_csv = Path(args.output).resolve()
+    else:
+        out_dir = client_root / "sales" / "account-rankings"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_csv = out_dir / f"{today}-ranked.csv"
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build column set: original account columns + score columns + tier + rationale
+    base_cols = list(accounts[0].keys())
+    score_cols = [f"score_{k}" for k in WEIGHTS] + ["composite", "tier", "rationale"]
+    all_cols = base_cols + score_cols
+
+    with out_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=all_cols)
+        writer.writeheader()
+        for s in output_rows:
+            row = dict(s["account"])
+            for k in WEIGHTS:
+                row[f"score_{k}"] = round(s["features"][k], 3)
+            row["composite"] = s["composite"]
+            row["tier"] = s["tier"]
+            row["rationale"] = " | ".join(f"{k}: {v}" for k, v in s["rationales"].items() if v)
+            writer.writerow(row)
+
+    # ---- Summary markdown ----
+    summary_path = out_csv.with_suffix(".summary.md")
+    tier_counts = {t: sum(1 for s in scored if s["tier"] == t) for t, _, _ in TIER_BANDS}
+    contradiction_position = {
+        "mature": "saturated category — Reed/Klettke/Gerhardt position; outbound is supplemental, inbound dominates",
+        "emerging": "emerging category — Vajre/Roberge/Lacy position; outbound creates the category, inbound is enablement",
+        "hybrid": "hybrid — mode-flagged per account; tier-1A leans outbound, tier-2 leans inbound",
+    }[args.category_maturity]
+
+    summary = [
+        f"# Account ranking — {today}",
+        "",
+        f"**Client:** {args.client}",
+        f"**Total accounts scored:** {len(scored)}",
+        f"**Output CSV:** `{out_csv.relative_to(SUBSTRATE_ROOT) if str(out_csv).startswith(str(SUBSTRATE_ROOT)) else out_csv}`",
+        f"**ICP version:** {args.icp_version or 'pinned-default'}",
+        f"**Category maturity:** {args.category_maturity}",
+        "",
+        "## Contradiction-resolution log",
+        "",
+        f"- `con_outbound-vs-inbound-budget`: applied **{args.category_maturity}** position — {contradiction_position}",
+        f"- `con_personalization-vs-scale`: tier 1A → hand-personalize (per Holland/Nelson); tier 2 → scaled cadence (per Barrows/Bertuzzi/Roberge); tier 1B → hybrid",
+        "",
+        "## Weighting",
+        "",
+        "| Feature | Weight |",
+        "|---|---|",
+    ]
+    for k, w in WEIGHTS.items():
+        summary.append(f"| {k} | {w:.2f} |")
+
+    summary += [
+        "",
+        "## Tier distribution",
+        "",
+        "| Tier | Count | Fraction | Recommended pursuit |",
+        "|---|---|---|---|",
+    ]
+    pursuit_map = {
+        "1A": "AE-led, hand-personalize, multithread on trigger",
+        "1B": "SDR-AE pair, hybrid cadence (smart-vars + 1-2 hand sentences)",
+        "2": "SDR pool, scaled cadence, smart variables",
+        "defer": "do not pursue this cycle; revisit in 90 days",
+    }
+    for t, _, _ in TIER_BANDS:
+        c = tier_counts[t]
+        frac = c / len(scored) if scored else 0.0
+        summary.append(f"| {t} | {c} | {frac:.1%} | {pursuit_map[t]} |")
+
+    summary += [
+        "",
+        "## Top accounts per tier (top 5)",
+        "",
+    ]
+    for t, _, _ in TIER_BANDS:
+        in_tier = [s for s in scored if s["tier"] == t][:5]
+        if not in_tier:
+            continue
+        summary.append(f"### Tier {t}")
+        summary.append("")
+        summary.append("| Account | Industry | Size | Composite | Headline rationale |")
+        summary.append("|---|---|---|---|---|")
+        for s in in_tier:
+            a = s["account"]
+            # Pick the highest-signal rationale to surface
+            top_r = max(s["rationales"].items(), key=lambda kv: s["features"][kv[0]])
+            summary.append(
+                f"| {a.get('company', '?')} | {a.get('industry', '?')} | {a.get('size', '?')} | "
+                f"{s['composite']} | {top_r[0]}: {top_r[1]} |"
+            )
+        summary.append("")
+
+    summary += [
+        "## Hand-off",
+        "",
+        "Next step: feed this CSV into `substrate outbound-sequence-design` for tier-1A and tier-1B accounts.",
+        "Tier-2 accounts can be batch-loaded into the SDR cadence tool with the smart-variable mode.",
+        "",
+        "## Substrate cited",
+        "",
+    ]
+    for path in icp["raw_paths"]:
+        summary.append(f"- `{path}`")
+    summary.append("")
+    summary.append(f"## Patterns grounded")
+    summary.append("")
+    summary.append("- `knowledge/patterns/account-not-lead-as-unit.md`")
+    summary.append("- `knowledge/patterns/trigger-events-beat-cadence-blast.md`")
+    summary.append("")
+    summary.append("## Contradictions resolved")
+    summary.append("")
+    summary.append("- `knowledge/contradictions/outbound-vs-inbound-budget.md` (position: " + args.category_maturity + ")")
+    summary.append("- `knowledge/contradictions/personalization-vs-scale.md` (position: tiered — 1A hand, 2 scaled)")
+
+    summary_path.write_text("\n".join(summary), encoding="utf-8")
+
+    print(f"\n[abm-account-prioritize] ranked: {out_csv}", file=sys.stderr)
+    print(f"[abm-account-prioritize] summary: {summary_path}", file=sys.stderr)
+    print(f"[abm-account-prioritize] tier counts: {tier_counts}", file=sys.stderr)
+
+    print(f"PASS: {len(scored)} accounts ranked → {out_csv.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

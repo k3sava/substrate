@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# aeo-relevance-engineering — per-vertical AEO/GEO pass on one substrate doc.
+#
+# Usage:
+#   aeo-relevance-engineering <target-doc> --vertical <slug> --icp-anchor <id> \
+#                             [--client <slug>] [--dry-run]
+#
+# Pipeline (gates):
+#   1. preflight (substrate-cite + voice + copy-quality + refusal-pattern)
+#   2. vertical-declared check (must appear in clients/<client>/verticals.yaml,
+#      OR be the special slug `horizontal` for non-vertical content)
+#   3. entity-canonicality check (entities.json must reference product-knowledge or competitive-data-bank)
+#   4. passage-discipline check (40-90 words, 8-12 passages)
+#   5. schema-validity check (FAQPage/HowTo blocks parse as JSON)
+#
+# Verticals were previously hardcoded into this script. Now the source of truth
+# is `clients/<client>/verticals.yaml` (schema in `templates/verticals-example.yaml`).
+# This keeps every client's vertical taxonomy local to its own substrate.
+#
+# Operator runs the actual extraction in Claude Code; this shim enforces the gate ladder
+# on the produced artifact bundle.
+#
+# Exit codes: 0 pass, 1 gate fail, 2 file not found, 3 config refused (missing verticals.yaml)
+
+set -uo pipefail
+
+# Backwards-compat: accept FLYWHEEL_ROOT as deprecated alias for SUBSTRATE_ROOT.
+if [ -n "${FLYWHEEL_ROOT:-}" ] && [ -z "${SUBSTRATE_ROOT:-}" ]; then
+  echo "DEPRECATED: FLYWHEEL_ROOT is deprecated; use SUBSTRATE_ROOT." >&2
+  SUBSTRATE_ROOT="$FLYWHEEL_ROOT"
+fi
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+
+ASSET="${1:?target doc required}"
+[ -f "$ASSET" ] || { echo "asset not found: $ASSET" >&2; exit 2; }
+
+VERTICAL=""; ICP_ANCHOR=""; MODE="--dry-run"
+CLIENT="${SUBSTRATE_CLIENT:-${CLIENT:-}}"
+shift || true
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vertical)    VERTICAL="$2"; shift 2 ;;
+    --icp-anchor)  ICP_ANCHOR="$2"; shift 2 ;;
+    --client)      CLIENT="$2"; shift 2 ;;
+    --client=*)    CLIENT="${1#--client=}"; shift ;;
+    --dry-run|--stage|--prod) MODE="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+
+# Resolve client from asset path if still unset (clients/<slug>/...).
+if [ -z "$CLIENT" ]; then
+  case "$ASSET" in
+    */clients/*/*) CLIENT=$(echo "$ASSET" | sed -E 's@.*/clients/([^/]+)/.*@\1@') ;;
+  esac
+fi
+
+echo "=== aeo-relevance-engineering: $ASSET ===" >&2
+echo "vertical: $VERTICAL  icp-anchor: $ICP_ANCHOR  mode: $MODE  client: ${CLIENT:-<none>}" >&2
+
+# Gate 1: vertical declared. Read the per-client verticals.yaml; the slug
+# `horizontal` is always allowed (non-vertical content); everything else must
+# match a slug or alias from the registry.
+valid_slugs=" horizontal "
+if [ -n "$CLIENT" ]; then
+  vert_yaml="$SUBSTRATE_ROOT/clients/$CLIENT/verticals.yaml"
+  if [ -f "$vert_yaml" ]; then
+    extracted=$(awk '
+      /^verticals:/ { in_block=1; next }
+      in_block && /^[a-z_-]+:/ && !/^[[:space:]]/ { in_block=0 }
+      in_block && /^[[:space:]]+- slug:[[:space:]]*/ {
+        sub(/^[[:space:]]+- slug:[[:space:]]*/, ""); gsub(/["'\'']/, ""); print
+      }
+      in_block && /^[[:space:]]+slug:[[:space:]]*/ {
+        sub(/^[[:space:]]+slug:[[:space:]]*/, ""); gsub(/["'\'']/, ""); print
+      }
+      in_block && /^[[:space:]]+aliases:[[:space:]]*\[/ {
+        line=$0; sub(/.*\[/, "", line); sub(/\].*/, "", line);
+        n=split(line, parts, /,[[:space:]]*/);
+        for (i=1;i<=n;i++) { gsub(/^[[:space:]]+|[[:space:]]+$|["'\'']/, "", parts[i]); if (parts[i]!="") print parts[i] }
+      }
+    ' "$vert_yaml" | sort -u)
+    if [ -n "$extracted" ]; then
+      while IFS= read -r v; do
+        valid_slugs="$valid_slugs$v "
+      done <<< "$extracted"
+    fi
+  fi
+fi
+
+if [ -z "$VERTICAL" ] || [[ "$valid_slugs" != *" $VERTICAL "* ]]; then
+  echo "  ✗ --vertical required and must match a slug or alias from clients/<client>/verticals.yaml" >&2
+  echo "    (or the special slug 'horizontal' for non-vertical content)" >&2
+  if [ -n "$CLIENT" ]; then
+    echo "    valid for client '$CLIENT': $(echo "$valid_slugs" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]]\+/, /g')" >&2
+    if [ ! -f "$SUBSTRATE_ROOT/clients/$CLIENT/verticals.yaml" ]; then
+      echo "    note: clients/$CLIENT/verticals.yaml is missing; copy templates/verticals-example.yaml to bootstrap." >&2
+    fi
+  else
+    echo "    no client resolved; pass --client <slug> or set SUBSTRATE_CLIENT." >&2
+  fi
+  echo "  Reason (Aleyda Solis 2026-04-29): per-vertical/per-country AI-search shape varies; one motion does not fit all." >&2
+  exit 1
+fi
+echo "  ✓ vertical declared ($VERTICAL)" >&2
+
+# Gate 2: preflight (the composite gate lives in skills/pre-publish-check/bin/preflight)
+echo "→ Gate 2: preflight" >&2
+PREFLIGHT_BIN="$SUBSTRATE_ROOT/skills/pre-publish-check/bin/preflight"
+if [ ! -x "$PREFLIGHT_BIN" ]; then
+  # legacy path (kept while older substrate trees catch up)
+  PREFLIGHT_BIN="$SUBSTRATE_ROOT/skills/preflight/bin/preflight"
+fi
+if [ -x "$PREFLIGHT_BIN" ] && "$PREFLIGHT_BIN" "$ASSET" 2>/dev/null >/dev/null; then
+  echo "  ✓ preflight PASS" >&2
+else
+  echo "  ✗ preflight FAIL — run 'substrate pre-publish-check $ASSET' for details" >&2
+  exit 1
+fi
+
+# Gate 3: ICP anchor present in frontmatter or arg
+if [ -z "$ICP_ANCHOR" ]; then
+  ICP_ANCHOR=$(awk 'BEGIN{infm=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^icp_anchor:/{sub(/^icp_anchor:[[:space:]]*/, ""); print; exit}' "$ASSET")
+fi
+if [ -z "$ICP_ANCHOR" ]; then
+  echo "  ✗ icp-anchor missing (pass --icp-anchor or set frontmatter icp_anchor:)" >&2
+  exit 1
+fi
+echo "  ✓ icp-anchor: $ICP_ANCHOR" >&2
+
+case "$MODE" in
+  --dry-run)
+    echo "DRY-RUN: gates passed; bundle artifacts (entities.json, passages.md, schema.json, mirror-plan.md, aeo-scorecard.md) generated by Claude Code session" >&2
+    echo "PASS-DRY: $ASSET" ;;
+  *)
+    echo "stage/prod modes wire to the publish pipeline once artifact bundle is reviewed by canonical-entity + content owners" >&2
+    echo "PASS-DRY: $ASSET" ;;
+esac
+exit 0

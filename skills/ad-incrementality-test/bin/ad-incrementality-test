@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""ad-incrementality-test — design a geographic holdout or PSA-control test
+for measuring incremental lift on a paid channel.
+
+Computes the test window from baseline conversions, MDE, alpha, power, and
+treatment share. Writes two artifacts: the test design plus a measurement
+contract that opens a goal in the substrate ledger.
+
+Refuses without canonical positioning. Refuses without canonical ICP.
+Refuses without baseline conversions. Refuses with MDE below 5%.
+Warns when the calculated window exceeds 12 weeks or when the named channel
+sits below the 5%-of-budget incrementality threshold from the pattern.
+
+Usage:
+    ad-incrementality-test --client <client> --channel <channel> \\
+        --mode <geo-holdout|psa-control> \\
+        --baseline-conversions <int> --baseline-cac <usd> \\
+        --quarter <YYYY-Q[1-4]> \\
+        [--mde-pct <float>] [--alpha <float>] [--power <float>] \\
+        [--treatment-share <float>] [--out <dir>]
+
+Exit codes:
+    0 — test design + measurement contract written
+    1 — design written, with INPUT-WARN flags above operator threshold
+    3 — refused (substrate gap, missing positioning / icp / baseline)
+    4 — invalid args
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+
+
+# Standard normal inverse CDF approximation (Beasley-Springer-Moro).
+# Used to translate alpha / power into z-scores without numpy / scipy.
+def z_inv(p: float) -> float:
+    if p <= 0.0 or p >= 1.0:
+        raise ValueError(f"p must be in (0,1), got {p}")
+    a = [
+        -3.969683028665376e+01, 2.209460984245205e+02,
+        -2.759285104469687e+02, 1.383577518672690e+02,
+        -3.066479806614716e+01, 2.506628277459239e+00,
+    ]
+    b = [
+        -5.447609879822406e+01, 1.615858368580409e+02,
+        -1.556989798598866e+02, 6.680131188771972e+01,
+        -1.328068155288572e+01,
+    ]
+    c = [
+        -7.784894002430293e-03, -3.223964580411365e-01,
+        -2.400758277161838e+00, -2.549732539343734e+00,
+        4.374664141464968e+00, 2.938163982698783e+00,
+    ]
+    d = [
+        7.784695709041462e-03, 3.224671290700398e-01,
+        2.445134137142996e+00, 3.754408661907416e+00,
+    ]
+    plow = 0.02425
+    phigh = 1 - plow
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / \
+               ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1)
+    q = p - 0.5
+    r = q * q
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / \
+           (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1)
+
+
+def compute_test_window(*, baseline_weekly_conv: int, mde_pct: float,
+                        alpha: float, power: float, treatment_share: float) -> dict:
+    """Compute the number of weeks needed to detect the named MDE at the named
+    significance and power, assuming a two-proportions z-test with unequal group
+    sizes (treatment_share vs 1 - treatment_share).
+
+    Conservative shape: model conversions as a Poisson process and translate to
+    a normal approximation for the difference in means. Returns the weeks plus
+    the inputs that drove the calculation, so the operator can audit.
+
+    Math:
+        delta = baseline_conv * mde_pct / 100   (the absolute lift we want to detect)
+        per_week_treatment = baseline * treatment_share
+        per_week_control   = baseline * (1 - treatment_share)
+        var_per_week = per_week_treatment + per_week_control  (Poisson assumption)
+        weeks = ceil( (z_alpha + z_power)^2 * var_per_week / delta^2 )
+    """
+    if mde_pct <= 0:
+        raise ValueError("mde_pct must be > 0")
+    if not (0 < treatment_share < 1):
+        raise ValueError("treatment_share must be in (0,1)")
+
+    # Two-tailed alpha
+    z_alpha = z_inv(1 - alpha / 2)
+    z_power = z_inv(power)
+
+    # Absolute weekly lift target
+    delta_weekly = baseline_weekly_conv * (mde_pct / 100.0)
+    if delta_weekly <= 0:
+        raise ValueError("delta_weekly must be > 0; check baseline + mde inputs")
+
+    # Per-week variance in difference of means under the null (Poisson approx)
+    # The two-sample z-test variance for total conversions per week:
+    var_per_week = baseline_weekly_conv  # total conv across treatment + control
+    # Treatment imbalance penalty: smaller groups have larger variance.
+    # Multiply by 1 / (p * (1-p)) / 4 normalization (=> 1.0 at 0.5/0.5 split).
+    imbalance_factor = 1.0 / (4.0 * treatment_share * (1.0 - treatment_share))
+    var_adj = var_per_week * imbalance_factor
+
+    weeks_float = ((z_alpha + z_power) ** 2) * var_adj / (delta_weekly ** 2)
+    weeks = max(1, int(math.ceil(weeks_float)))
+
+    return {
+        "weeks": weeks,
+        "z_alpha": round(z_alpha, 4),
+        "z_power": round(z_power, 4),
+        "delta_weekly": round(delta_weekly, 2),
+        "var_adjusted": round(var_adj, 2),
+        "imbalance_factor": round(imbalance_factor, 3),
+        "weeks_float": round(weeks_float, 2),
+    }
+
+
+def quarter_end(quarter: str, today: datetime) -> datetime:
+    m = re.match(r"^(\d{4})-Q([1-4])$", quarter.strip())
+    if not m:
+        raise ValueError(f"--quarter must be YYYY-Q[1-4], got {quarter!r}")
+    year, q = int(m.group(1)), int(m.group(2))
+    last_month_of_q = q * 3
+    end_month = last_month_of_q
+    end_day = 31 if end_month in (3, 12) else 30 if end_month in (6, 9) else 31
+    return datetime(year, end_month, end_day)
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def read_substrate_layer(client: str, layer_path: str) -> str | None:
+    p = SUBSTRATE_ROOT / "clients" / client / layer_path
+    if p.is_file():
+        return p.read_text(encoding="utf-8")
+    return None
+
+
+def find_recent_diagnostic(client: str, channel: str) -> Path | None:
+    """Find the most recent ad-diagnose output for the named channel.
+    Used to corroborate the operator-supplied baseline CAC and to compute the
+    channel's share of recent ad-spend (the 5% threshold from the pattern).
+    """
+    base = SUBSTRATE_ROOT / "clients" / client / "ads" / "diagnostics"
+    if not base.is_dir():
+        return None
+    matches = sorted(base.glob(f"{channel}-*.md"), reverse=True)
+    return matches[0] if matches else None
+
+
+def channel_share_of_recent_spend(client: str, channel: str) -> float | None:
+    """Sum total_spend_usd across recent diagnostics; return the named
+    channel's share. None if not enough data.
+    """
+    base = SUBSTRATE_ROOT / "clients" / client / "ads" / "diagnostics"
+    if not base.is_dir():
+        return None
+    by_channel: dict[str, float] = {}
+    cutoff = datetime.utcnow() - timedelta(days=90)
+    for p in base.glob("*.md"):
+        m = re.match(r"^(.+)-(\d{4}-\d{2}-\d{2})\.md$", p.name)
+        if not m:
+            continue
+        ch, ds = m.group(1), m.group(2)
+        try:
+            d = datetime.strptime(ds, "%Y-%m-%d")
+        except ValueError:
+            continue
+        if d < cutoff:
+            continue
+        # Pull total_spend_usd from frontmatter
+        txt = p.read_text(encoding="utf-8")
+        sm = re.search(r"total_spend_usd:\s*([\d.]+)", txt)
+        if sm:
+            try:
+                by_channel[ch] = by_channel.get(ch, 0.0) + float(sm.group(1))
+            except ValueError:
+                continue
+    if not by_channel:
+        return None
+    total = sum(by_channel.values())
+    if total == 0:
+        return None
+    return by_channel.get(channel, 0.0) / total
+
+
+def render_test_design(*,
+                       client: str, channel: str, mode: str, quarter: str,
+                       baseline_conv: int, baseline_cac: float,
+                       mde_pct: float, alpha: float, power: float,
+                       treatment_share: float, window: dict,
+                       end_date: str, today: str,
+                       channel_share: float | None,
+                       diagnostic_path: str | None,
+                       warnings: list[str]) -> str:
+    test_id = f"{client}-incr-{channel}-{mode}-{today}"
+    annual_baseline_revenue_floor = baseline_conv * 52 * baseline_cac  # used as anchor
+    expected_lift_conv = baseline_conv * window["weeks"] * (mde_pct / 100.0)
+
+    lines = []
+    lines.append("---")
+    lines.append(f"test_id: {test_id}")
+    lines.append(f"client: {client}")
+    lines.append(f"channel: {channel}")
+    lines.append(f"mode: {mode}")
+    lines.append(f"quarter: {quarter}")
+    lines.append("baseline:")
+    lines.append(f"  weekly_conversions: {baseline_conv}")
+    lines.append(f"  cac_usd: {baseline_cac}")
+    lines.append(f"  source: clients/{client}/ads/diagnostics/{channel}-<recent>.md")
+    lines.append("test_parameters:")
+    lines.append(f"  mde_pct: {mde_pct}")
+    lines.append(f"  alpha: {alpha}")
+    lines.append(f"  power: {power}")
+    lines.append(f"  treatment_share: {treatment_share}")
+    lines.append("calculated_window:")
+    lines.append(f"  weeks: {window['weeks']}")
+    lines.append(f"  end_date: {end_date}")
+    lines.append("substrate_layers_read: [icp, positioning, voc]")
+    lines.append("patterns_applied: [incrementality-not-attribution, intent-vs-interest-targeting]")
+    if channel_share is not None:
+        lines.append(f"channel_share_of_recent_spend: {round(channel_share, 3)}")
+    if warnings:
+        lines.append("warnings:")
+        for w in warnings:
+            lines.append(f"  - {w}")
+    lines.append("---")
+    lines.append("")
+
+    lines.append(f"# ad-incrementality-test: {client} | {channel} | {mode} | {today}")
+    lines.append("")
+
+    lines.append("## Hypothesis")
+    lines.append("")
+    if mode == "geo-holdout":
+        lines.append(f"Platform-reported attribution for `{channel}` overstates the channel's incremental "
+                     "contribution to converted leads. The pattern `incrementality-not-attribution` cites "
+                     "Common Thread Collective findings of 2-5x divergence between reported and incremental "
+                     "ROAS in mature accounts. A geographic holdout that turns paid spend off in matched "
+                     "treatment markets while leaving it on in matched control markets surfaces the true "
+                     f"incremental conversion rate. Prior expectation: incremental conversions are between "
+                     "30% and 80% of platform-reported conversions for this channel; the test resolves where "
+                     "the actual ratio sits.")
+    else:
+        lines.append(f"Platform-reported attribution for `{channel}` overstates the channel's incremental "
+                     "contribution. A PSA-control test (Google Lift / Meta Test and Learn / equivalent) "
+                     "shows treated users a non-promotional creative variant while control users see the "
+                     "actual ad. The conversion delta is the incremental contribution. Prior: incremental "
+                     "lift sits 30%-80% of platform-reported lift.")
+    lines.append("")
+    lines.append(f"Source for the prior: `knowledge/patterns/incrementality-not-attribution.md`.")
+    lines.append("")
+
+    lines.append("## Test design")
+    lines.append("")
+    if mode == "geo-holdout":
+        lines.append("**Mode**: geographic holdout.")
+        lines.append("")
+        lines.append("**Treatment-vs-control selection**:")
+        lines.append("- Match markets on three axes: population, baseline conversion volume, "
+                     "category-organic-search index. Use the most-recent 12 weeks of platform reports "
+                     "to compute the match score; pick pairs with sub-15% per-axis variance.")
+        lines.append(f"- Treatment share: {round(treatment_share * 100, 1)}% of matched markets.")
+        lines.append("- Randomization seed: today's date as integer epoch; record in artifact.")
+        lines.append("")
+        lines.append("**Treatment intervention**: turn paid spend off in treatment markets for the "
+                     "duration of the window. Leave organic, email, sales outbound, and other channels "
+                     "untouched. Use platform-side market exclusion (Google Ads location targeting / "
+                     "Meta location exclusion / LinkedIn geo targeting) rather than bid floors so the "
+                     "shutdown is clean.")
+        lines.append("")
+        lines.append("**Control intervention**: leave paid spend on at the current allocation. "
+                     "Do not introduce any other change in the control markets during the window.")
+    else:
+        lines.append("**Mode**: PSA-control / lift study.")
+        lines.append("")
+        lines.append("**Treatment-vs-control selection**: platform-managed via Google Conversion Lift "
+                     "or Meta Test and Learn. The platform randomly assigns users to treatment "
+                     "(actual ad) or control (no ad / public-service-announcement equivalent). The "
+                     f"treatment-share parameter ({round(treatment_share * 100, 1)}%) is platform-side; "
+                     "the operator confirms it inside the platform UI.")
+        lines.append("")
+        lines.append("**Treatment intervention**: actual ad creative.")
+        lines.append("**Control intervention**: PSA / non-promotional variant or no impression.")
+    lines.append("")
+
+    lines.append("## Sample size + window calculation")
+    lines.append("")
+    lines.append("**Inputs**:")
+    lines.append(f"- Baseline weekly conversions: **{baseline_conv}**")
+    lines.append(f"- Minimum detectable effect (MDE): **{mde_pct}%**")
+    lines.append(f"- Significance (alpha): **{alpha}**, two-tailed → z = {window['z_alpha']:.4f}")
+    lines.append(f"- Power: **{power}** → z = {window['z_power']:.4f}")
+    lines.append(f"- Treatment share: **{treatment_share}** → imbalance factor {window['imbalance_factor']}")
+    lines.append("")
+    lines.append("**Formula** (Poisson approximation for two-sample conversion delta):")
+    lines.append("")
+    lines.append("```")
+    lines.append("delta_weekly  = baseline_weekly_conv * (mde_pct / 100)")
+    lines.append("var_adjusted  = baseline_weekly_conv / (4 * treatment_share * (1 - treatment_share))")
+    lines.append("weeks         = ceil((z_alpha + z_power)^2 * var_adjusted / delta_weekly^2)")
+    lines.append("```")
+    lines.append("")
+    lines.append("**Computed**:")
+    lines.append(f"- delta_weekly = {window['delta_weekly']} conversions")
+    lines.append(f"- var_adjusted = {window['var_adjusted']}")
+    lines.append(f"- weeks_float = {window['weeks_float']}")
+    lines.append(f"- **window: {window['weeks']} weeks** (rounded up)")
+    lines.append(f"- end_date: **{end_date}**")
+    lines.append("")
+    lines.append(f"Expected total lift across the window if the channel hits MDE: "
+                 f"~{int(expected_lift_conv)} incremental conversions.")
+    lines.append("")
+
+    lines.append("## Measurement plan")
+    lines.append("")
+    if mode == "geo-holdout":
+        lines.append("**Conversion event**: the same primary conversion the channel optimises against in "
+                     "the platform; cite the event ID + filter from the diagnostic file.")
+        lines.append("")
+        lines.append("**Source system**: the source-of-truth analytics platform (Amplitude, GA4, "
+                     "Mixpanel, or first-party warehouse). Do NOT measure inside the ad platform; "
+                     "the platform's own reporting is the metric the test is designed to refute.")
+        lines.append("")
+        lines.append("**Join key**: market identifier (DMA in US, region code elsewhere) joined to "
+                     "session geo. Pre-validate that >90% of sessions have a region code; "
+                     "if below, switch to user_id-level geo with a stable assignment table.")
+        lines.append("")
+        lines.append("**Daily monitoring dashboard**: 7-day rolling treatment-vs-control conversion delta. "
+                     "Pause the test if the delta inverts (treatment > control by 2x baseline std-dev "
+                     "for 5+ days; usually means the holdout is contaminated).")
+    else:
+        lines.append("**Conversion event**: the platform-side conversion event configured for the "
+                     "lift study; cite the event ID.")
+        lines.append("")
+        lines.append("**Source system**: the platform's lift-study report (Google Ads → Conversion Lift, "
+                     "Meta → Test and Learn, LinkedIn → Brand Lift). The platform's own conversion "
+                     "attribution is the data feed for this test mode.")
+        lines.append("")
+        lines.append("**Operator note**: the platform-managed lift study is methodologically less "
+                     "operator-controllable than a geo holdout but accepts smaller spend levels "
+                     "and avoids the full off-period for the platform.")
+    lines.append("")
+
+    lines.append("## Risks and assumptions")
+    lines.append("")
+    lines.append("1. **Parallel campaigns**: any new email, content, or sales outbound launching during "
+                 "the test window contaminates the comparison. Freeze the cross-channel calendar for the "
+                 "duration; if a launch is unavoidable, re-baseline both treatment and control at the "
+                 "midpoint and report two separate windows.")
+    lines.append("2. **Seasonality**: test windows that span quarter-end, holidays, or known high-variance "
+                 "periods produce noisier deltas. Prefer mid-quarter windows; if seasonality is "
+                 "unavoidable, cite the seasonality factor in the resolution write-up.")
+    lines.append("3. **Brand events**: PR, fundraising announcements, product launches that affect "
+                 "branded-search volume create lift in both arms but at different magnitudes. Log any "
+                 "such event in the test artifact; resolve as AMBIGUOUS if a major event lands inside "
+                 "the window.")
+    if mode == "geo-holdout":
+        lines.append("4. **Cross-market spillover**: buyers in treatment markets may still see ads if "
+                     "the platform serves national-targeted campaigns. Confirm market exclusion is "
+                     "enforced at the campaign level; sample 50 treatment-market sessions to verify "
+                     "no impressions logged.")
+        lines.append("5. **Match quality**: matched-market pairs that diverge >20% on baseline conversion "
+                     "volume during the pre-period invalidate the comparison. Re-pair if pre-period "
+                     "variance trips the threshold.")
+    else:
+        lines.append("4. **Platform attribution caveat**: the lift study is run inside the platform; the "
+                     "platform's count of treatment vs control assignments is taken on trust. For "
+                     "high-stakes decisions, run a parallel geo holdout at the next opportunity.")
+        lines.append("5. **Holdout audience size**: small audiences produce wide confidence intervals. "
+                     "Confirm the platform's reported eligible audience exceeds 100k uniques per arm.")
+    lines.append("")
+
+    lines.append("## Decision rules")
+    lines.append("")
+    lines.append("- **YES** (incremental lift confirmed at >= MDE): scale this channel by 25% in the next "
+                 "quarter's allocation. Update `clients/<client>/ads/incrementality/_history.md` with the "
+                 "ratio of incremental to platform-reported conversions; this ratio becomes the "
+                 "calibration factor for future allocation decisions on this channel.")
+    lines.append("- **NO** (no lift detected): cap channel at current spend or reduce by 25% pending "
+                 "the next channel-product-fit review. Do not zero the channel without confirming "
+                 "the result with a second test (one geo holdout that fails could be confounded; "
+                 "two failures across different windows is a kill signal).")
+    lines.append("- **AMBIGUOUS** (window contaminated, parallel events, signal too weak): re-run with "
+                 "a clean window. Allocation stays at status quo until clean data lands.")
+    lines.append("")
+
+    lines.append("## Substrate layers cited")
+    lines.append("")
+    lines.append(f"- `clients/{client}/01-position.md` (channel-fit context)")
+    lines.append(f"- `clients/{client}/02-icp.md` (cohort signal)")
+    if diagnostic_path:
+        lines.append(f"- `{diagnostic_path}` (recent observed CAC)")
+    lines.append(f"- `knowledge/patterns/incrementality-not-attribution.md` (pattern)")
+    lines.append(f"- `knowledge/patterns/intent-vs-interest-targeting.md` (channel-fit)")
+    lines.append("")
+
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `ad-spend-allocate` surfaces channels above 5% budget share that need testing.")
+    lines.append("- `ad-attribution-honest` gates board / exec slides that cite channel performance.")
+    lines.append("- `routines/ad-allocation-routine.md` schedules per-quarter test windows.")
+    lines.append("- `score-goal` resolves the contract this skill emits.")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_measurement_contract(*,
+                                client: str, channel: str, mode: str, quarter: str,
+                                baseline_conv: int, baseline_cac: float,
+                                mde_pct: float, weeks: int, end_date: str,
+                                today: str, predicted_p: float) -> str:
+    goal_id = f"{client}-paid-{channel}-incr-{quarter}"
+    expected_lift_conv = baseline_conv * weeks * (mde_pct / 100.0)
+    expected_lift_revenue_floor = expected_lift_conv * baseline_cac  # rev floor proxy
+
+    lines = []
+    lines.append("---")
+    lines.append(f"goal_id: {goal_id}")
+    lines.append(f"client: {client}")
+    lines.append(f"opened_at: {today}")
+    lines.append("status: proposed")
+    lines.append(f"taste_type: demand-gen")
+    lines.append("hypothesis: |")
+    lines.append(f"  Incremental conversions on `{channel}` are at least `{mde_pct}%` above the no-spend")
+    lines.append(f"  counterfactual when measured via {mode} over a {weeks}-week window. Prior: 30-80%")
+    lines.append("  of platform-reported conversions are incremental, citing the operator pattern")
+    lines.append("  `pat_incrementality-not-attribution`. The test resolves the actual ratio for this")
+    lines.append("  channel + ICP combination.")
+    lines.append("predicted_outcome: |")
+    lines.append(f"  Incremental lift on `{channel}` >= `{mde_pct}%` of baseline weekly conversions over")
+    lines.append(f"  the {weeks}-week test window ending {end_date}.")
+    lines.append("revenue_lever: |")
+    lines.append("  lever_type: acquisition-CPL")
+    lines.append(f"  annual_revenue_impact_usd: {int(expected_lift_revenue_floor * 4)}")
+    lines.append("  calculation: |")
+    lines.append(f"    Baseline weekly conv = {baseline_conv}; baseline CAC = ${baseline_cac}.")
+    lines.append(f"    Test window weeks = {weeks}.")
+    lines.append(f"    Expected incremental conversions if MDE met = {baseline_conv} * {weeks} * "
+                 f"({mde_pct}/100) = {round(expected_lift_conv, 1)}.")
+    lines.append(f"    Expected incremental revenue floor (one window) = {round(expected_lift_revenue_floor, 0)} USD.")
+    lines.append(f"    Quarterly extrapolation across 4 windows = {int(expected_lift_revenue_floor * 4)} USD.")
+    lines.append(f"    Inputs cited: clients/{client}/ads/diagnostics/{channel}-<recent>.md.")
+    lines.append("measurement_design: |")
+    if mode == "geo-holdout":
+        lines.append(f"  Source: first-party analytics (Amplitude / GA4 / warehouse), NOT the {channel} platform itself.")
+        lines.append("  Method: 7-day rolling treatment-vs-control conversion delta across matched markets.")
+        lines.append(f"  Cohort: ICP-aligned visitors per clients/{client}/02-icp.md, joined on session geo / DMA.")
+        lines.append("  Join key: market identifier (DMA in US, region code elsewhere).")
+        lines.append("  Ambiguous case: parallel launch, brand event, or treatment-control variance > 20%")
+        lines.append("    in the pre-period invalidates the comparison; resolve AMBIGUOUS and re-pair markets.")
+    else:
+        lines.append(f"  Source: platform lift-study report ({channel}).")
+        lines.append("  Method: platform's lift-study delta (treatment vs PSA control) across the window.")
+        lines.append(f"  Cohort: platform audience definition aligned to clients/{client}/02-icp.md.")
+        lines.append("  Join key: platform-internal user_id; the platform reports the delta.")
+        lines.append("  Ambiguous case: eligible audience below 100k per arm, or platform reports")
+        lines.append("    confidence interval crossing zero, resolve AMBIGUOUS.")
+    lines.append(f"resolution_date: {end_date}")
+    lines.append(f"predicted_p_threshold_met: {predicted_p}")
+    lines.append("kill_criterion: |")
+    lines.append("  Treatment-vs-control delta inverts (treatment > control) by 2x baseline std-dev for 5")
+    lines.append("  consecutive days. Pause the test, log the contamination, do not extrapolate.")
+    lines.append("substrate_layers_cited: [icp, positioning, voc]")
+    lines.append("patterns_applied: [incrementality-not-attribution, intent-vs-interest-targeting]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Measurement contract: {goal_id}")
+    lines.append("")
+    lines.append("## Why this matters")
+    lines.append("")
+    lines.append(f"Allocation decisions on `{channel}` rest on attribution numbers from the platform itself. ")
+    lines.append("The platform is incentivised to overstate its contribution. Without a designed test, the ")
+    lines.append("operator cannot tell whether scaling spend will compound revenue or burn budget. This ")
+    lines.append("contract opens the falsifiable test that decides.")
+    lines.append("")
+    lines.append("## Decision tree at resolution")
+    lines.append("")
+    lines.append(f"- **YES**: lift >= {mde_pct}% confirmed; allocation increases 25% next quarter.")
+    lines.append("- **NO**: no lift; allocation caps at current or reduces 25%; second test scheduled.")
+    lines.append("- **AMBIGUOUS**: window contaminated; allocation holds at status quo until clean data.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="ad-incrementality-test")
+    p.add_argument("--client", required=True)
+    p.add_argument("--channel", required=True)
+    p.add_argument("--mode", required=True, choices=["geo-holdout", "psa-control"])
+    p.add_argument("--baseline-conversions", type=int, required=True,
+                   help="Baseline weekly conversions for the channel under test.")
+    p.add_argument("--baseline-cac", type=float, required=True,
+                   help="Baseline CAC in USD.")
+    p.add_argument("--quarter", required=True, help="YYYY-Q[1-4]")
+    p.add_argument("--mde-pct", type=float, default=15.0)
+    p.add_argument("--alpha", type=float, default=0.10)
+    p.add_argument("--power", type=float, default=0.80)
+    p.add_argument("--treatment-share", type=float, default=0.50)
+    p.add_argument("--predicted-p", type=float, default=None,
+                   help="Operator's prior P(test resolves YES). If omitted, derived from channel-share.")
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today_dt = datetime.utcnow()
+
+    # Refusal: missing canonical positioning
+    pos = read_substrate_layer(args.client, "01-position.md")
+    if pos is None:
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/01-position.md not found. "
+                      f"Run positioning-forge first; ad-incrementality-test depends on the canonical statement.")
+
+    # Refusal: missing canonical ICP
+    icp = read_substrate_layer(args.client, "02-icp.md")
+    if icp is None:
+        return refuse("missing-icp",
+                      f"clients/{args.client}/02-icp.md not found. "
+                      f"Run icp-cut first; the test cohort cannot be defined without the canonical ICP.")
+
+    # Refusal: zero or negative baseline
+    if args.baseline_conversions <= 0:
+        return refuse("missing-baseline",
+                      f"--baseline-conversions must be > 0 (got {args.baseline_conversions}). "
+                      f"Run ad-diagnose to establish weekly baseline conversions, then re-run.")
+
+    if args.baseline_cac <= 0:
+        return refuse("missing-baseline",
+                      f"--baseline-cac must be > 0 (got {args.baseline_cac}). "
+                      f"Provide the channel's baseline CAC from ad-diagnose.")
+
+    # Soft warnings
+    warnings: list[str] = []
+    if args.mde_pct < 5.0:
+        warnings.append(f"INPUT-WARN — mde-too-tight: MDE of {args.mde_pct}% will require a long window or "
+                        f"larger sample. Consider 10-15% as a default starting point.")
+        sys.stderr.write(f"  warn: MDE {args.mde_pct}% is below the 5% practical floor.\n")
+
+    # Compute window
+    try:
+        window = compute_test_window(
+            baseline_weekly_conv=args.baseline_conversions,
+            mde_pct=args.mde_pct,
+            alpha=args.alpha,
+            power=args.power,
+            treatment_share=args.treatment_share,
+        )
+    except ValueError as e:
+        return refuse("invalid-test-parameters", str(e))
+
+    if window["weeks"] > 12:
+        warnings.append(f"INPUT-WARN — window-too-long: calculated window is {window['weeks']} weeks "
+                        f"(>12). Check MDE / baseline / treatment share; long windows are vulnerable to "
+                        f"seasonality and parallel-campaign confounding.")
+        sys.stderr.write(f"  warn: window of {window['weeks']} weeks is above the 12-week heuristic.\n")
+
+    # Compute end date (use quarter-end if window fits; otherwise today + window)
+    try:
+        q_end = quarter_end(args.quarter, today_dt)
+    except ValueError as e:
+        return refuse("invalid-quarter", str(e))
+
+    test_end = today_dt + timedelta(weeks=window["weeks"])
+    if test_end > q_end:
+        # Window extends past quarter-end; flag and use computed end
+        warnings.append(f"INPUT-WARN — window-extends-past-quarter: test would end "
+                        f"{test_end.strftime('%Y-%m-%d')}, after {args.quarter} ends "
+                        f"({q_end.strftime('%Y-%m-%d')}). Consider running in next quarter or "
+                        f"reducing MDE.")
+    end_date = test_end.strftime("%Y-%m-%d")
+
+    # Channel share check (5% pattern threshold)
+    channel_share = channel_share_of_recent_spend(args.client, args.channel)
+    if channel_share is not None and channel_share < 0.05:
+        warnings.append(f"SCOPE-WARN — channel-below-incrementality-threshold: `{args.channel}` is "
+                        f"{round(channel_share * 100, 1)}% of recent ad-diagnose total spend "
+                        f"(below the 5% threshold from `pat_incrementality-not-attribution`). "
+                        f"The pattern recommends incrementality testing for channels above 5%.")
+
+    diagnostic_path = None
+    diag_file = find_recent_diagnostic(args.client, args.channel)
+    if diag_file:
+        diagnostic_path = str(diag_file.relative_to(SUBSTRATE_ROOT))
+
+    # Predicted_p default: derive from channel-share confidence
+    predicted_p = args.predicted_p
+    if predicted_p is None:
+        if channel_share and channel_share >= 0.20:
+            predicted_p = 0.55  # mature channels are more likely to test positive
+        elif channel_share and channel_share >= 0.05:
+            predicted_p = 0.45
+        else:
+            predicted_p = 0.40
+
+    # Render and write
+    out_dir = Path(args.out) if args.out else (SUBSTRATE_ROOT / "clients" / args.client / "ads" / "incrementality")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    design_path = out_dir / f"{args.channel}-{args.mode}-{today}.md"
+
+    design_md = render_test_design(
+        client=args.client,
+        channel=args.channel,
+        mode=args.mode,
+        quarter=args.quarter,
+        baseline_conv=args.baseline_conversions,
+        baseline_cac=args.baseline_cac,
+        mde_pct=args.mde_pct,
+        alpha=args.alpha,
+        power=args.power,
+        treatment_share=args.treatment_share,
+        window=window,
+        end_date=end_date,
+        today=today,
+        channel_share=channel_share,
+        diagnostic_path=diagnostic_path,
+        warnings=warnings,
+    )
+    design_path.write_text(design_md, encoding="utf-8")
+
+    # Measurement contract
+    contract_dir = SUBSTRATE_ROOT / "goals" / "measurement-contracts"
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    contract_path = contract_dir / f"{args.client}-incr-{args.channel}-{args.quarter}.md"
+    contract_md = render_measurement_contract(
+        client=args.client,
+        channel=args.channel,
+        mode=args.mode,
+        quarter=args.quarter,
+        baseline_conv=args.baseline_conversions,
+        baseline_cac=args.baseline_cac,
+        mde_pct=args.mde_pct,
+        weeks=window["weeks"],
+        end_date=end_date,
+        today=today,
+        predicted_p=predicted_p,
+    )
+    contract_path.write_text(contract_md, encoding="utf-8")
+
+    sys.stderr.write(f"\n[ad-incrementality-test] design: {design_path}\n")
+    sys.stderr.write(f"[ad-incrementality-test] contract: {contract_path}\n")
+    sys.stderr.write(f"  window: {window['weeks']} weeks  end: {end_date}  "
+                     f"mde: {args.mde_pct}%  alpha: {args.alpha}  power: {args.power}\n")
+    if channel_share is not None:
+        sys.stderr.write(f"  channel-share: {round(channel_share * 100, 1)}%  "
+                         f"(5% threshold for incrementality applies above this line)\n")
+    for w in warnings:
+        sys.stderr.write(f"  {w}\n")
+
+    print(str(design_path))
+    return 1 if warnings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

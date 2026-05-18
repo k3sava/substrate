@@ -1,0 +1,91 @@
+# aeo-sources-example.yaml — per-client off-domain monitor list
+#
+# Used by:
+#   - skills/aeo-manual-action (read in --mode measure / monitor / surface-map / action-plan)
+#
+# Drop this file at: clients/<client>/aeo/sources.yaml
+#
+# Per pat_aeo-triangle (Solis + Ray + Hufford + Indig + Gabe), AEO is decided off your
+# domain. The skill polls these surfaces, detects brand-alias mentions, scores sentiment,
+# and computes rolling 30-day medians. Per Lily Ray's published research (74% citation
+# rotation weekly), single-day snapshots are noisy; the skill reads against the rolling
+# median from the citation-log cache.
+
+client: example-client
+last_updated: 2026-05-08
+
+# Brand aliases — every variation a customer might use to refer to the brand.
+# Used for word-boundary matching against feed item titles + descriptions.
+brand_aliases:
+  - example-client
+  - ExampleClient
+  - "Example Client Inc"
+
+sources:
+  # Reddit — subreddits where the buyer cohort posts.
+  reddit:
+    - subreddit: SaaS
+      rss: https://www.reddit.com/r/SaaS/.rss
+      tier: T1
+    - subreddit: smallbusiness
+      rss: https://www.reddit.com/r/smallbusiness/.rss
+      tier: T2
+    - subreddit: customerservice
+      rss: https://www.reddit.com/r/customerservice/.rss
+      tier: T2
+
+  # Hacker News — search-based feed via hnrss.org
+  hackernews:
+    - name: hn-search-brand
+      feed: https://hnrss.org/newest?q=example-client
+      tier: T1
+
+  # General RSS feeds — expert blogs, podcast feeds, niche-forum digests
+  rss_feeds:
+    - name: orbit-media-blog
+      url: https://www.orbitmedia.com/feed/
+      tier: T1
+    - name: search-engine-land
+      url: https://searchengineland.com/feed
+      tier: T1
+
+  # Search queries — Google News RSS exposes search results as a feed
+  search_queries:
+    google_news:
+      - "\"example-client\" review"
+      - "\"example-client\" alternative"
+      - "\"example-client\" vs"
+    duckduckgo:
+      - "example-client review"
+      - "example-client alternative"
+
+  # G2 — reviews RSS if available; profile URL recorded for surface-map
+  g2:
+    profile_url: https://www.g2.com/products/example-client
+    reviews_rss: https://www.g2.com/products/example-client/reviews.rss
+
+  # YouTube — channel search keywords (used for surface-map; no auto-feed)
+  youtube:
+    channel_search:
+      - example-client
+      - "example-client tutorial"
+
+  # Podcasts — Listen Notes search keywords (used for surface-map; no auto-feed)
+  podcasts:
+    listen_notes_query:
+      - example-client
+      - "example-client founder"
+
+# Decay defaults — drives drift watch in the density report
+decay:
+  measurement_decay_days: 30
+  surface_decay_days: 90
+
+# How to use:
+# 1. Edit `brand_aliases` to match the client's brand naming.
+# 2. Replace `subreddit:` and `tier:` values with the cohort's actual subreddits.
+# 3. Add or remove search_queries to match the client's competitive landscape.
+# 4. Run `bin/substrate aeo-manual-action --client <client> --mode measure` weekly.
+# 5. Review the density report at `clients/<client>/aeo/density-reports/<date>.md`.
+# 6. For each unmet target prompt, run `--mode action-plan --prompt-id <id>` to draft
+#    a propagation plan with named owners and falsifiable measures.

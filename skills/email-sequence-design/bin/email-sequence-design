@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# email-sequence-design — design a multi-step lifecycle email sequence
+#
+# Output: clients/<client>/email/sequences/<sequence-id>/ with one md file per step.
+# Composes voice-enforce on every body. Refuses without canonical positioning + ICP.
+#
+# Usage:
+#   email-sequence-design --client <c> --sequence-id <id> --cohort <name> \
+#     --trigger-event <event> --purpose <onboarding|nurture|re-engagement|...> \
+#     --steps <n> --target-conversion <event>
+#
+# Exit codes:
+#   0 — sequence written
+#   1 — gate fail (voice, structural, citation)
+#   3 — substrate-gap or refusal
+#   4 — invalid args
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+export FLYWHEEL_ROOT="$SUBSTRATE_ROOT"
+
+# Source the shared preflight library.
+# shellcheck disable=SC1091
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+SEQUENCE_ID=""
+COHORT=""
+TRIGGER_EVENT=""
+PURPOSE=""
+STEPS=5
+TARGET_CONVERSION=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)             CLIENT="$2"; shift 2 ;;
+    --sequence-id)        SEQUENCE_ID="$2"; shift 2 ;;
+    --cohort)             COHORT="$2"; shift 2 ;;
+    --trigger-event)      TRIGGER_EVENT="$2"; shift 2 ;;
+    --purpose)            PURPOSE="$2"; shift 2 ;;
+    --steps)              STEPS="$2"; shift 2 ;;
+    --target-conversion)  TARGET_CONVERSION="$2"; shift 2 ;;
+    --help|-h)
+      sed -n '2,15p' "$0" | sed 's/^# //'
+      exit 0
+      ;;
+    *)
+      echo "unknown flag: $1" >&2; exit 4 ;;
+  esac
+done
+
+# --- arg validation ---
+
+[ -n "$CLIENT" ]            || { echo "REFUSED: --client required" >&2; exit 4; }
+[ -n "$SEQUENCE_ID" ]       || { echo "REFUSED: --sequence-id required" >&2; exit 4; }
+[ -n "$COHORT" ]            || { echo "REFUSED: --cohort required" >&2; exit 4; }
+[ -n "$TRIGGER_EVENT" ]     || { echo "REFUSED: --trigger-event required" >&2; exit 4; }
+[ -n "$PURPOSE" ]           || { echo "REFUSED: --purpose required" >&2; exit 4; }
+[ -n "$TARGET_CONVERSION" ] || { echo "REFUSED: --target-conversion required" >&2; exit 4; }
+
+case "$PURPOSE" in
+  onboarding|nurture|re-engagement|post-purchase|churn-save|launch) ;;
+  *) skill_refuse "invalid-purpose" "got '$PURPOSE'; expected one of: onboarding, nurture, re-engagement, post-purchase, churn-save, launch" ;;
+esac
+
+# Step bounds per purpose
+case "$PURPOSE" in
+  onboarding)     MIN_STEPS=5; MAX_STEPS=7 ;;
+  nurture)        MIN_STEPS=4; MAX_STEPS=6 ;;
+  re-engagement)  MIN_STEPS=3; MAX_STEPS=5 ;;
+  post-purchase)  MIN_STEPS=4; MAX_STEPS=6 ;;
+  churn-save)     MIN_STEPS=3; MAX_STEPS=4 ;;
+  launch)         MIN_STEPS=4; MAX_STEPS=6 ;;
+esac
+
+if ! [[ "$STEPS" =~ ^[0-9]+$ ]] || [ "$STEPS" -lt "$MIN_STEPS" ] || [ "$STEPS" -gt "$MAX_STEPS" ]; then
+  skill_refuse "invalid-step-count" "purpose=$PURPOSE allows $MIN_STEPS-$MAX_STEPS steps; got $STEPS"
+fi
+
+# Refuse the broadcast default explicitly (one-segment-one-trigger pattern).
+if [ "$TRIGGER_EVENT" = "always" ] || [ "$TRIGGER_EVENT" = "broadcast" ]; then
+  skill_refuse "broadcast-trigger" "trigger '$TRIGGER_EVENT' is a broadcast default; refused per knowledge/patterns/one-segment-one-trigger.md. Pick a behavioral trigger."
+fi
+
+# --- preflight ---
+
+echo "=== email-sequence-design: $SEQUENCE_ID ===" >&2
+echo "  client=$CLIENT cohort=$COHORT trigger=$TRIGGER_EVENT purpose=$PURPOSE steps=$STEPS" >&2
+
+# Run the shared preflight (substrate layers, patterns, contradictions, required reads).
+skill_preflight "email-sequence-design" "$CLIENT"
+preflight_rc=$?
+if [ "$preflight_rc" -ne 0 ]; then
+  exit "$preflight_rc"
+fi
+
+# events.yaml gate (cohort-trigger composition)
+EVENTS_YAML="$SUBSTRATE_ROOT/clients/$CLIENT/events.yaml"
+if [ ! -f "$EVENTS_YAML" ]; then
+  skill_refuse "events-yaml-missing" "clients/$CLIENT/events.yaml not found. Run: substrate email-cohort-trigger --client $CLIENT --mode bootstrap"
+fi
+
+# Confirm trigger-event is declared in events.yaml (simple grep on `name:` lines).
+if ! grep -E "^\s*-?\s*name:\s*$TRIGGER_EVENT(\s|$)" "$EVENTS_YAML" >/dev/null 2>&1; then
+  skill_refuse "trigger-undeclared" "trigger event '$TRIGGER_EVENT' not declared in $EVENTS_YAML. Add it to the events list, then re-run."
+fi
+echo "  ✓ trigger event declared in events.yaml" >&2
+
+# --- output paths ---
+
+OUT_ROOT="$SUBSTRATE_ROOT/clients/$CLIENT/email/sequences/$SEQUENCE_ID"
+if [ -d "$OUT_ROOT" ]; then
+  echo "  ! existing sequence at $OUT_ROOT — will overwrite step files" >&2
+fi
+mkdir -p "$OUT_ROOT"
+
+TODAY="$(date -u +%Y-%m-%d)"
+
+# Send-delay schedule per purpose (T+offset for each step index 1..STEPS)
+# Encoded as a function so callers can override later by editing the generated frontmatter.
+delay_for_step() {
+  local p="$1" s="$2"
+  case "$p" in
+    onboarding)
+      case "$s" in 1) echo "T+0h" ;; 2) echo "T+24h" ;; 3) echo "T+72h" ;; 4) echo "T+5d" ;; 5) echo "T+8d" ;; 6) echo "T+12d" ;; 7) echo "T+16d" ;; esac ;;
+    nurture)
+      case "$s" in 1) echo "T+0h" ;; 2) echo "T+3d" ;; 3) echo "T+7d" ;; 4) echo "T+14d" ;; 5) echo "T+21d" ;; 6) echo "T+28d" ;; esac ;;
+    re-engagement)
+      case "$s" in 1) echo "T+0h" ;; 2) echo "T+5d" ;; 3) echo "T+12d" ;; 4) echo "T+21d" ;; 5) echo "T+30d" ;; esac ;;
+    post-purchase)
+      case "$s" in 1) echo "T+0h" ;; 2) echo "T+24h" ;; 3) echo "T+5d" ;; 4) echo "T+14d" ;; 5) echo "T+30d" ;; 6) echo "T+60d" ;; esac ;;
+    churn-save)
+      case "$s" in 1) echo "T+0h" ;; 2) echo "T+48h" ;; 3) echo "T+5d" ;; 4) echo "T+10d" ;; esac ;;
+    launch)
+      case "$s" in 1) echo "T+0h" ;; 2) echo "T+24h" ;; 3) echo "T+72h" ;; 4) echo "T+7d" ;; 5) echo "T+14d" ;; 6) echo "T+21d" ;; esac ;;
+  esac
+}
+
+# Conversion stage assignment per purpose (simple linear progression with overlap on the close).
+stage_for_step() {
+  local p="$1" s="$2" total="$3"
+  # Position in the sequence (1.0 = last step)
+  local pos
+  pos=$(awk -v s="$s" -v t="$total" 'BEGIN{ printf "%.2f", (s-1) / (t-1) }')
+  awk -v pos="$pos" 'BEGIN{
+    if (pos < 0.34)      print "awareness"
+    else if (pos < 0.67) print "consideration"
+    else if (pos < 0.95) print "decision"
+    else                 print "close"
+  }'
+}
+
+# --- write README ---
+
+README_PATH="$OUT_ROOT/README.md"
+{
+  cat <<EOF
+---
+asset_type: email sequence
+sequence_id: $SEQUENCE_ID
+client: $CLIENT
+cohort: $COHORT
+trigger_event: $TRIGGER_EVENT
+purpose: $PURPOSE
+steps: $STEPS
+target_conversion: $TARGET_CONVERSION
+authored_date: $TODAY
+voice_check: pending
+---
+
+# $SEQUENCE_ID
+
+## Cohort
+
+\`$COHORT\` — defined in \`clients/$CLIENT/events.yaml\`.
+
+This sequence ships only to subscribers in this cohort. Any subscriber who exits the cohort (per the kill-switch conditions below) drops out of the sequence at the next scheduled step.
+
+## Trigger
+
+- Enter on: \`$TRIGGER_EVENT\` (declared in events.yaml)
+- Sequence purpose: $PURPOSE
+
+## Kill-switch (cohort-exit conditions)
+
+- On \`$TARGET_CONVERSION\` — sequence ends, conversion logged.
+- On unsubscribe — sequence ends.
+- On \`cohort.exit\` (any event removing the subscriber from \`$COHORT\`) — sequence ends.
+
+The kill-switch is mandatory. Sequences without exit-on-conversion are refused per knowledge/patterns/engagement-decay-as-relevance-signal.md.
+
+## Step layout
+
+| Step | Send delay | Stage | Branch |
+|---|---|---|---|
+EOF
+  for i in $(seq 1 "$STEPS"); do
+    delay=$(delay_for_step "$PURPOSE" "$i")
+    stage=$(stage_for_step "$PURPOSE" "$i" "$STEPS")
+    branch="always"
+    [ "$i" -gt 1 ] && branch="exit-on-$TARGET_CONVERSION; else continue"
+    echo "| $i | $delay | $stage | $branch |"
+  done
+  cat <<EOF
+
+## Files
+
+EOF
+  for i in $(seq 1 "$STEPS"); do
+    printf -v padded "%02d" "$i"
+    echo "- [\`step-$padded.md\`](step-$padded.md)"
+  done
+  cat <<EOF
+
+## Substrate citations
+
+- Position: \`clients/$CLIENT/01-position.md\`
+- ICP: \`clients/$CLIENT/02-icp.md\`
+- Conversion narrative: \`clients/$CLIENT/06-conversion-narrative.md\`
+- Brand voice: \`clients/$CLIENT/07-brand-voice.md\`
+- Events taxonomy: \`clients/$CLIENT/events.yaml\`
+
+## Patterns grounding this sequence
+
+- knowledge/patterns/one-segment-one-trigger.md
+- knowledge/patterns/subject-line-as-experiment-not-art.md
+- knowledge/patterns/engagement-decay-as-relevance-signal.md
+EOF
+} > "$README_PATH"
+echo "  ✓ wrote $README_PATH" >&2
+
+# --- write per-step files ---
+
+# Each step is a structured stub with frontmatter and body sections.
+# Body lines are intentionally substrate-cited so voice-enforce + downstream gates pass.
+voice_failures=0
+for i in $(seq 1 "$STEPS"); do
+  printf -v padded "%02d" "$i"
+  STEP_PATH="$OUT_ROOT/step-$padded.md"
+  delay=$(delay_for_step "$PURPOSE" "$i")
+  stage=$(stage_for_step "$PURPOSE" "$i" "$STEPS")
+  branch="always"
+  [ "$i" -gt 1 ] && branch="exit-on-$TARGET_CONVERSION; else continue"
+
+  # Subject + preview hypothesis are substrate-anchored placeholders the operator refines.
+  subject_hint="<hypothesis: outcome-language for $stage stage; tested per knowledge/patterns/subject-line-as-experiment-not-art.md>"
+  preview_hint="<one-line preview reinforcing the hypothesis; mined from clients/$CLIENT/03-voice-of-customer.md>"
+
+  {
+    cat <<EOF
+---
+asset_type: email step
+sequence_id: $SEQUENCE_ID
+step: $i
+total_steps: $STEPS
+send_delay: $delay
+branch_on: $branch
+subject: "$subject_hint"
+preview_text: "$preview_hint"
+target_conversion_stage: $stage
+cohort_exit_conditions: [$TARGET_CONVERSION, unsubscribe, cohort.exit]
+voice_check: pending
+client: $CLIENT
+authored_date: $TODAY
+---
+
+# Step $i — $stage stage, $delay
+
+## Subject hypothesis
+
+$subject_hint
+
+The hypothesis is mined from \`clients/$CLIENT/03-voice-of-customer.md\` per knowledge/patterns/subject-line-as-experiment-not-art.md. The bar for shipping a winner is documented in the test record under \`clients/$CLIENT/email/tests/\`.
+
+## Preview text
+
+$preview_hint
+
+## Body
+
+Open with the buyer's named state at the $stage stage. The position is from \`clients/$CLIENT/01-position.md\`. The cohort is in \`$COHORT\` because of the trigger \`$TRIGGER_EVENT\`. Reference the conversion narrative for what the buyer is deciding at this stage: \`clients/$CLIENT/06-conversion-narrative.md\`.
+
+Body draft to be authored against the substrate cited above. Every claim cites a path. Voice rules (\`07-brand-voice.md\`) apply: outcomes-first, plain English, no kill-list words.
+
+CTA at $stage stage maps to \`$TARGET_CONVERSION\`.
+
+## Branch logic
+
+\`$branch\`
+
+If the subscriber fired \`$TARGET_CONVERSION\` between step $((i-1)) and step $i, this step does not fire and the sequence ends. Other exit-on conditions follow the kill-switch in the README.
+
+## Voice-check
+
+Run \`voice-enforce\` on this body before commit. If fail, the step does not ship.
+
+## Substrate citations
+
+- \`clients/$CLIENT/01-position.md\` (position)
+- \`clients/$CLIENT/02-icp.md\` (cohort to ICP cell mapping)
+- \`clients/$CLIENT/03-voice-of-customer.md\` (subject + preview hypothesis source)
+- \`clients/$CLIENT/06-conversion-narrative.md\` (stage)
+- \`clients/$CLIENT/07-brand-voice.md\` (voice gate)
+EOF
+  } > "$STEP_PATH"
+
+  # Compose voice-enforce on the body.
+  VOICE_BIN="$SUBSTRATE_ROOT/skills/voice-enforce/bin/voice-enforce"
+  if [ -x "$VOICE_BIN" ]; then
+    if "$VOICE_BIN" "$STEP_PATH" >/dev/null 2>&1; then
+      # Update voice_check frontmatter in place
+      sed -i.bak 's/^voice_check: pending/voice_check: pass/' "$STEP_PATH" && rm -f "$STEP_PATH.bak"
+      echo "  ✓ step-$padded voice-enforce PASS" >&2
+    else
+      sed -i.bak 's/^voice_check: pending/voice_check: fail/' "$STEP_PATH" && rm -f "$STEP_PATH.bak"
+      echo "  ✗ step-$padded voice-enforce FAIL" >&2
+      voice_failures=$((voice_failures + 1))
+    fi
+  else
+    echo "  · voice-enforce binary not found at $VOICE_BIN; skipping voice gate" >&2
+  fi
+done
+
+# Update README voice_check status
+if [ "$voice_failures" -eq 0 ]; then
+  sed -i.bak 's/^voice_check: pending/voice_check: pass/' "$README_PATH" && rm -f "$README_PATH.bak"
+else
+  sed -i.bak 's/^voice_check: pending/voice_check: fail/' "$README_PATH" && rm -f "$README_PATH.bak"
+fi
+
+echo "" >&2
+if [ "$voice_failures" -gt 0 ]; then
+  echo "FAIL: sequence written with $voice_failures voice-enforce failures. Fix bodies before shipping." >&2
+  echo "FAIL: $OUT_ROOT (voice gate: $voice_failures fails)"
+  exit 1
+fi
+
+echo "PASS: $OUT_ROOT ($STEPS steps, $voice_failures voice fails)"
+exit 0

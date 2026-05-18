@@ -1,0 +1,70 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Build output
+dist/
+build/
+.next/
+.turbo/
+
+# Logs
+*.log
+logs/
+
+# Local
+.env
+.env.local
+.env.*.local
+
+# Workspace
+.workspace/
+
+# Runtime data files staged locally for dashboard generator; not for public repo
+data/*
+!data/calibration-schema.sql
+!data/.gitkeep
+routines/resolution-log.jsonl
+goals/active/
+goals/taste-leaderboard.md
+handoff/worklog-active.md
+slack/node_modules/
+
+# Self-evolution learnings — operator-private digest output; only scaffolding goes public.
+knowledge/learnings/raw/*
+!knowledge/learnings/raw/.gitkeep
+knowledge/learnings/proposals/*.md
+!knowledge/learnings/proposals/.gitkeep
+knowledge/learnings/[0-9]*.md
+knowledge/learnings/.last-run.json
+
+# Backwards-compat symlinks to old bin/ names — local-only convenience, not for public repo
+bin/flywheel
+bin/flywheel-status
+bin/flywheel-dashboard
+
+# Old client-private archive — never commit, never push
+clients/
+
+# Generated measurement contracts (per-client, per-channel) — local working state.
+# The README and any committed example files stay; client-prefixed files are local.
+goals/measurement-contracts/[a-z0-9]*-*.md
+!goals/measurement-contracts/example-*.md
+.vercel

@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""social-fatigue-monitor — analyse per-platform post performance over time;
+detect engagement decay; flag fatigue candidates with first-hypothesis routing.
+
+Reads clients/<client>/social/metrics/<platform>-<YYYY-MM>.csv. Computes a
+4-week-vs-prior-4-week lift on impressions and engagement rate. Classifies decay
+shape (sudden cliff, gradual taper, step-down, stable). Emits a severity-tiered
+report.
+
+Refuses without canonical positioning. Refuses without metrics. Sample-size
+floor is enforced per platform.
+
+Usage:
+    social-fatigue-monitor --client <client>
+                           [--metrics-dir <dir>]
+                           [--window-weeks <int>]
+                           [--decay-threshold-pct <float>]
+                           [--platform <platform>]
+                           [--out <dir>]
+
+Exit codes:
+    0 — flags written; no critical decay
+    1 — flags written; one or more critical-decay flags raised
+    3 — refused (substrate gap, missing positioning, missing metrics)
+    4 — invalid args
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import statistics
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+
+
+# Per-platform sample-size floor (posts per window) below which the report
+# will issue a sample-too-small warning rather than fatigue flags.
+PLATFORM_SAMPLE_FLOOR = {
+    "linkedin": 4,
+    "x": 4,
+    "tiktok": 8,
+    "instagram": 6,
+    "youtube": 4,
+    "threads": 6,
+    "default": 4,
+}
+
+# Typical posting cadence per platform (posts per week) for the cadence note.
+PLATFORM_TYPICAL_CADENCE = {
+    "linkedin": (3, 5),
+    "x": (5, 14),
+    "tiktok": (3, 7),
+    "instagram": (3, 5),
+    "youtube": (1, 3),
+    "threads": (3, 7),
+}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def parse_metrics_filename(name: str) -> tuple[str, str] | None:
+    """Match <platform>-<YYYY-MM>.csv. Returns (platform, year-month) or None."""
+    m = re.match(r"^([a-z][a-z0-9-]*)-(\d{4}-\d{2})\.csv$", name.lower())
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def load_metrics(metrics_dir: Path, platform_filter: str | None) -> dict[str, list[dict]]:
+    """Returns {platform: [row_dict, ...]} sorted by date asc.
+
+    Each row is the CSV row + parsed `_date` (datetime).
+    """
+    by_platform: dict[str, list[dict]] = defaultdict(list)
+    if not metrics_dir.is_dir():
+        return {}
+    for f in sorted(metrics_dir.glob("*.csv")):
+        parsed = parse_metrics_filename(f.name)
+        if not parsed:
+            sys.stderr.write(f"  warn: skipped non-conforming metrics file {f.name}\n")
+            continue
+        platform_from_name, _ = parsed
+        if platform_filter and platform_from_name != platform_filter:
+            continue
+        with f.open(encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            if not reader.fieldnames:
+                continue
+            cols_lower = {c.lower(): c for c in reader.fieldnames}
+            required = {"date", "post_id", "impressions", "engagement_rate"}
+            missing = required - set(cols_lower.keys())
+            if missing:
+                sys.stderr.write(f"  warn: {f.name} missing required columns {sorted(missing)}; skipping\n")
+                continue
+            for row in reader:
+                rl = {k.lower(): v for k, v in row.items()}
+                date_s = (rl.get("date") or "").strip()
+                try:
+                    d = datetime.strptime(date_s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                rl["_date"] = d
+                rl["_source_file"] = f.name
+                # Resolve platform: prefer column over filename
+                plat = (rl.get("platform") or platform_from_name).strip().lower()
+                rl["_platform"] = plat
+                by_platform[plat].append(rl)
+    for plat in by_platform:
+        by_platform[plat].sort(key=lambda r: r["_date"])
+    return dict(by_platform)
+
+
+def to_float(v: str) -> float | None:
+    try:
+        return float((v or "").strip().replace("%", "").replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
+
+
+def split_windows(rows: list[dict], window_weeks: int) -> tuple[list[dict], list[dict]]:
+    """Return (current_window_rows, prior_window_rows) based on the most-recent
+    date in the input. Current = last window_weeks; prior = the window_weeks
+    before that.
+    """
+    if not rows:
+        return [], []
+    most_recent = rows[-1]["_date"]
+    cur_start = most_recent - timedelta(weeks=window_weeks)
+    prior_start = cur_start - timedelta(weeks=window_weeks)
+    cur = [r for r in rows if r["_date"] >= cur_start]
+    prior = [r for r in rows if prior_start <= r["_date"] < cur_start]
+    return cur, prior
+
+
+def window_stats(rows: list[dict]) -> dict:
+    """Compute mean / median for impressions and engagement_rate in a window."""
+    impr = [v for v in (to_float(r.get("impressions", "")) for r in rows) if v is not None]
+    eng = [v for v in (to_float(r.get("engagement_rate", "")) for r in rows) if v is not None]
+    out: dict = {"n": len(rows)}
+    if impr:
+        out["impr_mean"] = round(statistics.mean(impr), 1)
+        out["impr_median"] = round(statistics.median(impr), 1)
+    if eng:
+        out["eng_mean"] = round(statistics.mean(eng), 4)
+        out["eng_median"] = round(statistics.median(eng), 4)
+        if len(eng) > 1:
+            out["eng_stdev"] = round(statistics.pstdev(eng), 4)
+    return out
+
+
+def lift_pct(cur: float | None, prior: float | None) -> float | None:
+    if cur is None or prior is None or prior == 0:
+        return None
+    return round(((cur - prior) / abs(prior)) * 100.0, 1)
+
+
+def classify_decay_shape(weekly_means: list[float]) -> str:
+    """Given a chronological list of weekly engagement-rate means, classify."""
+    if len(weekly_means) < 4:
+        return "insufficient-data"
+    last = weekly_means[-1]
+    prev = weekly_means[-2]
+    earlier = weekly_means[:-2]
+    if not earlier:
+        return "stable"
+    earlier_mean = statistics.mean(earlier)
+    # Sudden cliff: most-recent week dropped >40% from prior week
+    if prev > 0 and ((prev - last) / prev) > 0.40:
+        return "sudden-cliff"
+    # Step-down: most-recent two weeks both well below earlier mean and similar
+    if (earlier_mean > 0
+        and last < 0.7 * earlier_mean
+        and prev < 0.7 * earlier_mean
+        and abs(last - prev) < 0.15 * earlier_mean):
+        return "step-down"
+    # Gradual taper: 4 consecutive weeks of monotonic-or-near decline
+    declining = 0
+    for i in range(len(weekly_means) - 1, 0, -1):
+        if weekly_means[i] < weekly_means[i-1]:
+            declining += 1
+        else:
+            break
+    if declining >= 4:
+        return "gradual-taper"
+    return "stable"
+
+
+def per_week_means(rows: list[dict]) -> list[tuple[datetime, float]]:
+    by_week: dict[datetime, list[float]] = defaultdict(list)
+    for r in rows:
+        d: datetime = r["_date"]
+        # Monday of the ISO week
+        monday = d - timedelta(days=d.weekday())
+        v = to_float(r.get("engagement_rate", ""))
+        if v is not None:
+            by_week[monday].append(v)
+    out = []
+    for k in sorted(by_week.keys()):
+        out.append((k, round(statistics.mean(by_week[k]), 4)))
+    return out
+
+
+def flag_posts(rows: list[dict], decay_threshold_pct: float) -> list[dict]:
+    """Flag posts whose engagement_rate is >1 stdev below the current-window
+    mean OR more than decay_threshold_pct below the median.
+    """
+    eng = [to_float(r.get("engagement_rate", "")) for r in rows]
+    eng_clean = [v for v in eng if v is not None]
+    if len(eng_clean) < 3:
+        return []
+    mean_ = statistics.mean(eng_clean)
+    median_ = statistics.median(eng_clean)
+    stdev_ = statistics.pstdev(eng_clean) if len(eng_clean) > 1 else 0.0
+    flagged: list[dict] = []
+    for r in rows:
+        v = to_float(r.get("engagement_rate", ""))
+        if v is None:
+            continue
+        below_stdev = v < (mean_ - stdev_)
+        below_threshold = median_ > 0 and ((median_ - v) / median_) * 100 > decay_threshold_pct
+        if below_stdev or below_threshold:
+            severity = "advisory"
+            if v < (mean_ - 1.5 * stdev_):
+                severity = "warning"
+            if v < (mean_ - 2 * stdev_):
+                severity = "critical"
+            flagged.append({
+                "post_id": r.get("post_id", ""),
+                "date": r["_date"].strftime("%Y-%m-%d"),
+                "engagement_rate": v,
+                "median_in_window": median_,
+                "mean_in_window": round(mean_, 4),
+                "stdev": round(stdev_, 4),
+                "severity": severity,
+                "source_file": r.get("_source_file", ""),
+                "author": (r.get("author") or "").strip(),
+                "cohort": (r.get("cohort") or "").strip(),
+                "purpose": (r.get("purpose") or "").strip(),
+            })
+    flagged.sort(key=lambda x: ({"critical": 0, "warning": 1, "advisory": 2}[x["severity"]], x["engagement_rate"]))
+    return flagged
+
+
+def author_lane_split(rows: list[dict]) -> dict:
+    """Split engagement rate by personal vs corporate author lane."""
+    personal = [to_float(r.get("engagement_rate", "")) for r in rows
+                if (r.get("author") or "").strip().lower() == "personal"]
+    corporate = [to_float(r.get("engagement_rate", "")) for r in rows
+                 if (r.get("author") or "").strip().lower() == "corporate"]
+    personal = [v for v in personal if v is not None]
+    corporate = [v for v in corporate if v is not None]
+    out: dict = {"personal_n": len(personal), "corporate_n": len(corporate)}
+    if personal:
+        out["personal_mean"] = round(statistics.mean(personal), 4)
+    if corporate:
+        out["corporate_mean"] = round(statistics.mean(corporate), 4)
+    if personal and corporate and out["corporate_mean"] > 0:
+        out["personal_over_corporate_lift_pct"] = lift_pct(out["personal_mean"], out["corporate_mean"])
+    return out
+
+
+def cadence_per_week(rows: list[dict], window_weeks: int) -> float:
+    if not rows:
+        return 0.0
+    return round(len(rows) / max(window_weeks, 1), 2)
+
+
+def render_report(*, client: str, today: str, window_weeks: int,
+                  per_platform: dict, files_read: list[Path]) -> str:
+    flags_critical = sum(1 for p in per_platform.values()
+                         for f in p.get("flagged", []) if f["severity"] == "critical")
+    flags_warning = sum(1 for p in per_platform.values()
+                        for f in p.get("flagged", []) if f["severity"] == "warning")
+    flags_advisory = sum(1 for p in per_platform.values()
+                         for f in p.get("flagged", []) if f["severity"] == "advisory")
+    posts_analysed = sum(p.get("cur_n", 0) for p in per_platform.values())
+
+    lines = []
+    lines.append("---")
+    lines.append("asset_type: audit")
+    lines.append(f"flags_id: {client}-social-fatigue-{today}")
+    lines.append(f"window_weeks: {window_weeks}")
+    lines.append("metrics_read:")
+    for p in files_read[:20]:
+        lines.append(f"  - {p.relative_to(SUBSTRATE_ROOT) if str(p).startswith(str(SUBSTRATE_ROOT)) else p}")
+    lines.append("substrate_layers_read: [positioning, icp]")
+    lines.append("patterns_applied: [native-format-beats-cross-post, creator-not-corporate, social-as-distribution-not-conversion, creative-fatigue-window]")
+    lines.append("flag_summary:")
+    lines.append(f"  platforms_scanned: {len(per_platform)}")
+    lines.append(f"  posts_analysed: {posts_analysed}")
+    lines.append(f"  flags_critical: {flags_critical}")
+    lines.append(f"  flags_warning: {flags_warning}")
+    lines.append(f"  flags_advisory: {flags_advisory}")
+    lines.append("produced_by: social-fatigue-monitor")
+    lines.append("authored_date: " + today)
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# social-fatigue-monitor: {client} | {today}")
+    lines.append("")
+    lines.append(f"Window: {window_weeks} weeks current vs {window_weeks} weeks prior. "
+                 f"Platforms scanned: {len(per_platform)}. Posts analysed: {posts_analysed}.")
+    lines.append("")
+    lines.append("Pattern grounding: per pat_creative-fatigue-window, social creative fatigues on a measurable "
+                 "window; refresh cadence is the lever, not bidding. Per pat_social-as-distribution-not-conversion, "
+                 "the metrics here are cohort-level proxies, not last-click conversion. Per pat_creator-not-corporate, "
+                 "personal accounts reach further than corporate accounts on most B2B social platforms; "
+                 "personal-account posts and corporate-handle posts are on different ranking surfaces and should not "
+                 "be compared on a single average. Per pat_native-format-beats-cross-post, each platform has native "
+                 "rhythms; cross-posted content underperforms native authoring substantially, so platform metrics "
+                 "are read separately and refresh recommendations route to native-format work, not to cross-post.")
+    lines.append("")
+
+    lines.append("## Per-platform decay summary")
+    lines.append("")
+    lines.append("| Platform | Posts (cur) | Posts (prior) | Impr. lift % | Eng-rate lift % | Decay shape |")
+    lines.append("|---|---:|---:|---:|---:|---|")
+    for plat, p in sorted(per_platform.items()):
+        cur_stats = p.get("cur_stats", {})
+        prior_stats = p.get("prior_stats", {})
+        impr_lift = lift_pct(cur_stats.get("impr_mean"), prior_stats.get("impr_mean"))
+        eng_lift = lift_pct(cur_stats.get("eng_mean"), prior_stats.get("eng_mean"))
+        shape = p.get("decay_shape", "stable")
+        impr_s = f"{impr_lift:+.1f}%" if impr_lift is not None else "n/a"
+        eng_s = f"{eng_lift:+.1f}%" if eng_lift is not None else "n/a"
+        lines.append(f"| `{plat}` | {cur_stats.get('n', 0)} | {prior_stats.get('n', 0)} | {impr_s} | {eng_s} | {shape} |")
+    lines.append("")
+
+    lines.append("## Flagged posts")
+    lines.append("")
+    any_flag = False
+    for plat, p in sorted(per_platform.items()):
+        flags = p.get("flagged", [])
+        if not flags:
+            continue
+        any_flag = True
+        lines.append(f"### `{plat}`")
+        lines.append("")
+        for f in flags[:20]:
+            mark = {"critical": "**CRITICAL**", "warning": "WARNING", "advisory": "advisory"}[f["severity"]]
+            lines.append(f"- {mark} `{f['post_id']}` ({f['date']}) — engagement rate "
+                         f"{f['engagement_rate']:.4f} (window mean {f['mean_in_window']:.4f}, "
+                         f"stdev {f['stdev']:.4f})")
+            extras = []
+            if f.get("author"):
+                extras.append(f"author={f['author']}")
+            if f.get("cohort"):
+                extras.append(f"cohort={f['cohort']}")
+            if f.get("purpose"):
+                extras.append(f"purpose={f['purpose']}")
+            if extras:
+                lines.append(f"  - " + ", ".join(extras))
+            lines.append(f"  - source: `{f['source_file']}`")
+        lines.append("")
+    if not any_flag:
+        lines.append("No posts flagged this window.")
+        lines.append("")
+
+    lines.append("## Decay shape per platform")
+    lines.append("")
+    for plat, p in sorted(per_platform.items()):
+        shape = p.get("decay_shape", "stable")
+        weekly = p.get("weekly_means", [])
+        lines.append(f"### `{plat}`")
+        lines.append("")
+        lines.append(f"Shape: **{shape}**.")
+        lines.append("")
+        if weekly:
+            recent = weekly[-8:]
+            lines.append("Recent weekly engagement-rate means (last 8 weeks):")
+            lines.append("")
+            for week_start, m in recent:
+                lines.append(f"- {week_start.strftime('%Y-%m-%d')}: {m:.4f}")
+            lines.append("")
+
+    lines.append("## Author-lane comparison (personal vs corporate)")
+    lines.append("")
+    for plat, p in sorted(per_platform.items()):
+        a = p.get("author_split", {})
+        if not a:
+            continue
+        lines.append(f"### `{plat}`")
+        lines.append("")
+        if a.get("personal_n", 0) and a.get("corporate_n", 0):
+            lift = a.get("personal_over_corporate_lift_pct")
+            lines.append(f"- Personal posts: n={a['personal_n']}, mean engagement rate "
+                         f"{a.get('personal_mean', 0):.4f}")
+            lines.append(f"- Corporate posts: n={a['corporate_n']}, mean engagement rate "
+                         f"{a.get('corporate_mean', 0):.4f}")
+            if lift is not None:
+                lines.append(f"- Personal-over-corporate lift: {lift:+.1f}%")
+                if lift > 100:
+                    lines.append("  - Personal accounts are reaching further than corporate accounts on this platform "
+                                 "(per pat_creator-not-corporate). If corporate is being funded as a growth surface, "
+                                 "this is the structural under-performance signal.")
+        elif a.get("personal_n", 0):
+            lines.append(f"- Personal posts only this window (n={a['personal_n']}). "
+                         f"Corporate-handle data not present.")
+        elif a.get("corporate_n", 0):
+            lines.append(f"- Corporate posts only this window (n={a['corporate_n']}). "
+                         f"Personal-account data not present. Per pat_creator-not-corporate, B2B reach "
+                         f"compounds on personal accounts; the program may be allocating to the slower surface.")
+        lines.append("")
+
+    lines.append("## Cadence note")
+    lines.append("")
+    lines.append("| Platform | Posts / week (window) | Typical | Note |")
+    lines.append("|---|---:|---|---|")
+    for plat, p in sorted(per_platform.items()):
+        cad = p.get("cadence_per_week", 0.0)
+        plat_short = plat.split("-")[0]
+        typical = PLATFORM_TYPICAL_CADENCE.get(plat_short, (1, 5))
+        note = "in range"
+        if cad < typical[0]:
+            note = "**below cadence** — production gap"
+        elif cad > typical[1] * 1.5:
+            note = "above cadence — risk of audience fatigue independent of creative fatigue"
+        lines.append(f"| `{plat}` | {cad} | {typical[0]}-{typical[1]} | {note} |")
+    lines.append("")
+    lines.append("Per pat_creative-fatigue-window, falling below the typical cadence is a leading indicator "
+                 "of CAC drift even when current-window engagement is holding. Treat it as a separate signal.")
+    lines.append("")
+
+    lines.append("## Recommended next moves")
+    lines.append("")
+    lines.append("First-hypothesis routing per decay shape:")
+    lines.append("")
+    for plat, p in sorted(per_platform.items()):
+        shape = p.get("decay_shape", "stable")
+        if shape in ("stable", "insufficient-data"):
+            continue
+        lines.append(f"### `{plat}` ({shape})")
+        lines.append("")
+        if shape == "sudden-cliff":
+            lines.append("- First hypothesis: platform-level event (algorithm change, content-policy hit, "
+                         "account-level penalty). Check the platform status and account-health dashboard before "
+                         "reflexively rewriting content.")
+            lines.append("- If platform is clean: route to `social-content-design --purpose hot-take` for a "
+                         "cohort-language refresh.")
+        elif shape == "gradual-taper":
+            lines.append("- First hypothesis: relevance erosion. The cohort has drifted or the message has "
+                         "saturated. Route to `social-listening-themes` for new pain-language and to "
+                         "`social-amplification-test` to test refreshed hooks before scaling.")
+        elif shape == "step-down":
+            lines.append("- First hypothesis: format change or lost comment-velocity. Route to "
+                         "`social-content-design` for a native-format refresh; check whether posting time "
+                         "or platform feature usage shifted (audio off, hashtag count, link placement).")
+        lines.append("")
+
+    lines.append("## Cohort metrics reminder")
+    lines.append("")
+    lines.append("Per pat_social-as-distribution-not-conversion, social drives top-of-funnel awareness. "
+                 "Last-click attribution underweights its real role. Resolve fatigue decisions on cohort "
+                 "metrics, not last-click CAC:")
+    lines.append("")
+    lines.append("- Branded-search lift in the 30-90 days after a campaign refresh.")
+    lines.append("- Direct-traffic lift, audience overlap with closed-won.")
+    lines.append("- Newsletter-from-social conversion via UTM where social is the touch.")
+    lines.append("- Engagement rate per platform per author lane separately; do not aggregate.")
+    lines.append("")
+
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `social-content-design` — generates the refresh drafts the routing recommends.")
+    lines.append("- `social-amplification-test` — runs the hook A/B before a full refresh roll-out.")
+    lines.append("- `social-listening-themes` — feeds new cohort language into the refresh queue.")
+    lines.append("- `routines/social-fatigue-check.md` — the biweekly cadence wrapper.")
+    lines.append("- `knowledge/patterns/native-format-beats-cross-post.md`")
+    lines.append("- `knowledge/patterns/creator-not-corporate.md`")
+    lines.append("- `knowledge/patterns/social-as-distribution-not-conversion.md`")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="social-fatigue-monitor")
+    p.add_argument("--client", required=True)
+    p.add_argument("--metrics-dir", default=None)
+    p.add_argument("--window-weeks", type=int, default=4)
+    p.add_argument("--decay-threshold-pct", type=float, default=25.0)
+    p.add_argument("--platform", default=None)
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    if args.window_weeks < 2 or args.window_weeks > 12:
+        sys.stderr.write("REFUSED: --window-weeks must be between 2 and 12\n")
+        return 4
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        return refuse("client-root-missing",
+                      f"clients/{args.client}/ not found.")
+
+    pos_path = client_root / "01-position.md"
+    if not pos_path.is_file():
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/01-position.md not found.")
+
+    metrics_dir = Path(args.metrics_dir) if args.metrics_dir else (
+        client_root / "social" / "metrics"
+    )
+    if not metrics_dir.is_dir():
+        return refuse("missing-metrics",
+                      f"metrics dir not found at {metrics_dir}. "
+                      f"Add CSV exports per platform-month, or pass --metrics-dir.")
+
+    by_platform = load_metrics(metrics_dir, args.platform)
+    if not by_platform:
+        return refuse("missing-metrics",
+                      f"no usable CSV metrics found in {metrics_dir}. "
+                      f"File names must match <platform>-<YYYY-MM>.csv with required columns "
+                      f"date, post_id, impressions, engagement_rate.")
+
+    # Files actually read
+    files_read = sorted({
+        metrics_dir / r["_source_file"]
+        for rows in by_platform.values()
+        for r in rows
+    })
+
+    # Per-platform analysis
+    per_platform: dict = {}
+    critical_count = 0
+    for plat, rows in by_platform.items():
+        plat_short = plat.split("-")[0]
+        floor = PLATFORM_SAMPLE_FLOOR.get(plat_short, PLATFORM_SAMPLE_FLOOR["default"])
+
+        cur_rows, prior_rows = split_windows(rows, args.window_weeks)
+        cur_stats = window_stats(cur_rows)
+        prior_stats = window_stats(prior_rows)
+        weekly = per_week_means(rows)
+        decay_shape = classify_decay_shape([m for _, m in weekly])
+
+        sample_warn = None
+        if cur_stats.get("n", 0) < floor:
+            sample_warn = (f"sample size {cur_stats.get('n', 0)} < floor {floor} for `{plat}`; "
+                           f"flags suppressed for this platform.")
+            flagged: list[dict] = []
+        else:
+            flagged = flag_posts(cur_rows, args.decay_threshold_pct)
+
+        per_platform[plat] = {
+            "cur_n": cur_stats.get("n", 0),
+            "prior_n": prior_stats.get("n", 0),
+            "cur_stats": cur_stats,
+            "prior_stats": prior_stats,
+            "weekly_means": weekly,
+            "decay_shape": decay_shape,
+            "flagged": flagged,
+            "author_split": author_lane_split(cur_rows),
+            "cadence_per_week": cadence_per_week(cur_rows, args.window_weeks),
+            "sample_warn": sample_warn,
+        }
+        if any(f["severity"] == "critical" for f in flagged) or decay_shape == "sudden-cliff":
+            critical_count += 1
+
+    # Render report
+    out_dir = Path(args.out) if args.out else (client_root / "social" / "fatigue-flags")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{today}.md"
+    md = render_report(
+        client=args.client,
+        today=today,
+        window_weeks=args.window_weeks,
+        per_platform=per_platform,
+        files_read=files_read,
+    )
+    out_path.write_text(md, encoding="utf-8")
+
+    sys.stderr.write(f"\n[social-fatigue-monitor] wrote {out_path}\n")
+    sys.stderr.write(f"  client={args.client}  platforms={len(per_platform)}  "
+                     f"window_weeks={args.window_weeks}\n")
+    for plat, p in per_platform.items():
+        sys.stderr.write(f"  {plat}: cur_n={p['cur_n']}  decay={p['decay_shape']}  "
+                         f"flags={len(p['flagged'])}\n")
+        if p.get("sample_warn"):
+            sys.stderr.write(f"    INPUT-WARN: {p['sample_warn']}\n")
+
+    print(str(out_path))
+
+    if critical_count > 0:
+        sys.stderr.write(f"FAIL-LEVEL: {critical_count} platform(s) showing critical decay; "
+                         f"open the report and route per recommendations.\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

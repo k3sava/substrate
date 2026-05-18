@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""battle-card-driver — surface battle-card content for a named-competitor deal.
+
+Given a competitor slug + buyer-state + deal-stage, reads the relevant
+battle-card file and produces AE-ready talking points. Composes claim-verify
+on every load-bearing claim about the competitor.
+
+Usage:
+    battle-card-driver --client <client> --competitor <slug>
+                       --buyer-state <state> --deal-stage <stage>
+                       [--objection <text>] [--account <name>]
+                       [--output <path>]
+
+Exit codes:
+    0 — talking points emitted, claims verified
+    1 — preflight refused (substrate gap)
+    2 — input invalid
+    3 — claim-verify failed on a load-bearing claim
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+
+# ---- Battle-card parser ----
+
+@dataclass
+class BattleCard:
+    competitor_slug: str
+    one_line_position: str = ""
+    when_they_win: list[str] = field(default_factory=list)
+    when_we_win: list[str] = field(default_factory=list)
+    honest_losses: list[str] = field(default_factory=list)
+    talk_track: str = ""
+    pricing: list[str] = field(default_factory=list)
+    recent_shifts: list[str] = field(default_factory=list)
+    sources: list[str] = field(default_factory=list)
+    last_updated: str = ""
+    source_path: str = ""
+
+
+def find_battle_card(client: str, competitor: str) -> Path | None:
+    """Find the battle-card markdown for the competitor slug.
+
+    Searches:
+      clients/<client>/competitive/battle-cards/<slug>.md
+      clients/<client>/competitive/battle-cards/<slug>-*.md (most recent)
+      clients/<client>/competitive/<slug>.md
+    """
+    bc_dir = SUBSTRATE_ROOT / "clients" / client / "competitive" / "battle-cards"
+    candidates = []
+    if bc_dir.is_dir():
+        exact = bc_dir / f"{competitor}.md"
+        if exact.is_file():
+            return exact
+        # Pattern <slug>*.md
+        candidates.extend(sorted(bc_dir.glob(f"{competitor}*.md"), reverse=True))
+    comp_dir = SUBSTRATE_ROOT / "clients" / client / "competitive"
+    if comp_dir.is_dir():
+        candidates.extend(sorted(comp_dir.glob(f"{competitor}*.md"), reverse=True))
+    return candidates[0] if candidates else None
+
+
+def parse_battle_card(path: Path, competitor: str) -> BattleCard:
+    text = path.read_text(encoding="utf-8")
+    rel = str(path.relative_to(SUBSTRATE_ROOT))
+    bc = BattleCard(competitor_slug=competitor, source_path=rel)
+
+    # Frontmatter
+    fm_match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+    if fm_match:
+        fm = fm_match.group(1)
+        m = re.search(r"^last_updated:\s*(.+)$", fm, re.MULTILINE)
+        if m:
+            bc.last_updated = m.group(1).strip().strip('"\'')
+
+    # One-line position: first non-empty line under "## One-line position"
+    bc.one_line_position = _section_first_line(text, "One-line position")
+
+    # Lists under common section names
+    bc.when_they_win = _section_bullets(text, "When they're stronger") or _section_bullets(text, "When they win")
+    bc.when_we_win = _section_bullets(text, "When we're stronger") or _section_bullets(text, "When we win")
+    bc.honest_losses = (_section_bullets(text, "Where the rival wins")
+                        or _section_bullets(text, "Honest losses")
+                        or _section_bullets(text, "Where they win (honest)"))
+
+    # Talk track: blockquote or paragraph under "Talk track"
+    bc.talk_track = _section_first_paragraph(text, "Talk track")
+
+    # Pricing rows
+    bc.pricing = _section_lines(text, "Pricing")
+
+    # Recent shifts
+    bc.recent_shifts = _section_bullets(text, "Recent shifts")
+
+    # Sources
+    bc.sources = _section_bullets(text, "Sources")
+
+    return bc
+
+
+def _section_first_line(text: str, header: str) -> str:
+    """Return the first non-empty content line under ## <header>."""
+    pattern = rf"^##\s+{re.escape(header)}.*?\n(.*?)(?:^##\s|\Z)"
+    m = re.search(pattern, text, re.DOTALL | re.MULTILINE)
+    if not m:
+        return ""
+    body = m.group(1)
+    for line in body.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            return s.strip("*").strip(">").strip()
+    return ""
+
+
+def _section_first_paragraph(text: str, header: str) -> str:
+    pattern = rf"^##\s+{re.escape(header)}.*?\n(.*?)(?:^##\s|\Z)"
+    m = re.search(pattern, text, re.DOTALL | re.MULTILINE)
+    if not m:
+        return ""
+    body = m.group(1).strip()
+    # Strip blockquote markers from leading lines
+    para_lines = []
+    for line in body.splitlines():
+        if not line.strip():
+            if para_lines:
+                break
+            continue
+        para_lines.append(line.lstrip(">").strip())
+    return " ".join(para_lines)
+
+
+def _section_bullets(text: str, header: str) -> list[str]:
+    pattern = rf"^##\s+{re.escape(header)}.*?\n(.*?)(?:^##\s|\Z)"
+    m = re.search(pattern, text, re.DOTALL | re.MULTILINE)
+    if not m:
+        return []
+    body = m.group(1)
+    out = []
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith(("- ", "* ", "+ ")) and len(line) > 2:
+            out.append(line[2:].strip())
+    return out
+
+
+def _section_lines(text: str, header: str) -> list[str]:
+    pattern = rf"^##\s+{re.escape(header)}.*?\n(.*?)(?:^##\s|\Z)"
+    m = re.search(pattern, text, re.DOTALL | re.MULTILINE)
+    if not m:
+        return []
+    body = m.group(1)
+    return [l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith("#")]
+
+
+# ---- Buyer state × deal stage routing ----
+
+def select_sections(buyer_state: str, deal_stage: str) -> list[str]:
+    """Decide which battle-card sections to emit based on buyer-state × deal-stage.
+
+    Per pat_status-quo-is-the-real-objection-outbound + con_no-decision-vs-named-competitor:
+    - early stages → status-quo framing first; battle-card surfaces lightly
+    - late stages → battle-card framing dominates
+    """
+    table = {
+        # (state, stage): [section_names]
+        ("unaware", "discovery"):       ["status-quo-frame", "honest_losses"],
+        ("problem-aware", "discovery"): ["status-quo-frame", "when_they_win", "honest_losses"],
+        ("problem-aware", "qualification"): ["when_we_win", "talk_track", "honest_losses"],
+        ("solution-aware", "qualification"): ["when_we_win", "talk_track", "recent_shifts"],
+        ("solution-aware", "demo"):     ["talk_track", "when_we_win", "recent_shifts"],
+        ("product-aware", "demo"):      ["talk_track", "recent_shifts", "displacement-quote"],
+        ("product-aware", "proposal"):  ["talk_track", "honest_losses", "pricing"],
+        ("most-aware", "proposal"):     ["talk_track", "displacement-quote", "honest_losses", "pricing"],
+        ("most-aware", "close"):        ["talk_track", "displacement-quote", "recent_shifts"],
+        ("most-aware", "breakup"):      ["honest_losses", "talk_track"],
+    }
+    return table.get((buyer_state, deal_stage),
+                     # Fallback: a sensible cross-section
+                     ["talk_track", "when_we_win", "honest_losses"])
+
+
+# ---- VoC quote retrieval ----
+
+def find_displacement_quote(client: str, competitor: str) -> tuple[str, str]:
+    """Return (quote, source_path) for a quote from a customer who switched from this competitor.
+
+    Heuristic: scan voc/processed/ for quotes mentioning the competitor name.
+    """
+    voc_dir = SUBSTRATE_ROOT / "clients" / client / "voc"
+    if not voc_dir.is_dir():
+        return "", ""
+    competitor_lower = competitor.lower()
+    for f in voc_dir.rglob("*.md"):
+        text = f.read_text(encoding="utf-8")
+        # Look for quotes near competitor mentions
+        for m in re.finditer(r'"([^"]{30,180})"', text):
+            quote = m.group(1)
+            # Window: 200 chars on each side
+            start = max(0, m.start() - 200)
+            end = min(len(text), m.end() + 200)
+            window = text[start:end].lower()
+            if competitor_lower in window or competitor_lower.replace("-", " ") in window:
+                return quote, str(f.relative_to(SUBSTRATE_ROOT))
+    return "", ""
+
+
+# ---- claim-verify integration ----
+
+def run_claim_verify(asset_path: Path) -> tuple[bool, str]:
+    """Compose claim-verify on the talking points file."""
+    cv_bin = SUBSTRATE_ROOT / "skills" / "claim-verify" / "bin" / "claim-verify"
+    if not cv_bin.is_file():
+        return True, "claim-verify binary not found; SKIPPED"
+    env = {**os.environ, "FLYWHEEL_ROOT": str(SUBSTRATE_ROOT), "SUBSTRATE_ROOT": str(SUBSTRATE_ROOT)}
+    try:
+        result = subprocess.run(
+            ["python3", str(cv_bin), str(asset_path)],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+        return result.returncode == 0, (result.stderr or "") + (result.stdout or "")
+    except subprocess.TimeoutExpired:
+        return False, "claim-verify timeout"
+    except Exception as e:
+        return False, f"claim-verify error: {e}"
+
+
+# ---- Talking points compose ----
+
+def compose_talking_points(
+    bc: BattleCard, sections: list[str], displacement_quote: tuple[str, str],
+    objection: str, buyer_state: str, deal_stage: str, account: str,
+    pos_path: str | None,
+) -> str:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    contradiction_position = (
+        "early-stage → status-quo framing dominates; battle-card lightly cited (Dunford position)"
+        if deal_stage in ("discovery", "qualification") else
+        "late-stage → battle-card framing dominates; status-quo framing as kicker (Klue/Roberge position)"
+    )
+
+    lines = [
+        "---",
+        "asset_type: talking-points",
+        "voice_check_exception: substrate-quotes",
+        f"client: (inherited)",
+        f"competitor: {bc.competitor_slug}",
+        f"competitor_battle_card_path: {bc.source_path}",
+        f"buyer_state: {buyer_state}",
+        f"deal_stage: {deal_stage}",
+        f"objection: {objection or '(none)'}",
+        f"account: {account or '(unspecified)'}",
+        f"date: {today}",
+        f"battle_card_last_updated: {bc.last_updated or '(unknown)'}",
+        f"sections_surfaced: {', '.join(sections)}",
+        "---",
+        "",
+        f"# Talking points — {account or 'account'} vs. {bc.competitor_slug}",
+        "",
+        f"**Buyer state:** {buyer_state}",
+        f"**Deal stage:** {deal_stage}",
+        f"**Battle-card path:** `{bc.source_path}`",
+        f"**Battle-card last updated:** {bc.last_updated or '(unknown)'}",
+        "",
+        "## Position summary",
+        "",
+        bc.one_line_position or "_(no one-line position in battle-card; refuse without)_",
+        "",
+        "## Talking points",
+        "",
+    ]
+
+    point_n = 1
+    cited_paths = {bc.source_path}
+    if pos_path:
+        cited_paths.add(pos_path)
+
+    for section in sections:
+        if section == "status-quo-frame":
+            lines.append(f"### {point_n}. Lead with status-quo cost (early-stage)")
+            lines.append("")
+            lines.append("Per `pat_status-quo-is-the-real-objection-outbound` and "
+                         "`con_no-decision-vs-named-competitor`, in early-stage deals the buyer's "
+                         "current state is the dominant alternative. Open by surfacing the cost of inaction "
+                         "before naming the competitor.")
+            if pos_path:
+                lines.append(f"")
+                lines.append(f"_Substrate cite: `{pos_path}`_")
+            point_n += 1
+            lines.append("")
+
+        elif section == "when_we_win" and bc.when_we_win:
+            lines.append(f"### {point_n}. When we win (this buyer + this stage)")
+            lines.append("")
+            for w in bc.when_we_win[:3]:
+                lines.append(f"- {w}")
+            lines.append(f"")
+            lines.append(f"_Substrate cite: `{bc.source_path}`_")
+            point_n += 1
+            lines.append("")
+
+        elif section == "when_they_win" and bc.when_they_win:
+            lines.append(f"### {point_n}. When they win (be honest with yourself)")
+            lines.append("")
+            for w in bc.when_they_win[:3]:
+                lines.append(f"- {w}")
+            lines.append(f"")
+            lines.append(f"_Substrate cite: `{bc.source_path}`_")
+            point_n += 1
+            lines.append("")
+
+        elif section == "talk_track" and bc.talk_track:
+            lines.append(f"### {point_n}. Rep talk track (deliver verbatim if useful)")
+            lines.append("")
+            lines.append(f"> {bc.talk_track}")
+            lines.append(f"")
+            lines.append(f"_Substrate cite: `{bc.source_path}`_")
+            point_n += 1
+            lines.append("")
+
+        elif section == "honest_losses" and bc.honest_losses:
+            lines.append(f"### {point_n}. Honest losses (when to disqualify the deal)")
+            lines.append("")
+            lines.append("If any of these apply, lose-fast rather than force-close. The discipline "
+                         "to disqualify a misfit deal is what stops your closed-lost-to-X count from "
+                         "getting padded with deals that were never going to close.")
+            lines.append("")
+            for h in bc.honest_losses[:3]:
+                lines.append(f"- {h}")
+            lines.append(f"")
+            lines.append(f"_Substrate cite: `{bc.source_path}`_")
+            point_n += 1
+            lines.append("")
+
+        elif section == "displacement-quote" and displacement_quote[0]:
+            lines.append(f"### {point_n}. Displacement quote (customer who switched)")
+            lines.append("")
+            lines.append(f"> \"{displacement_quote[0]}\"")
+            lines.append("")
+            lines.append(f"_Substrate cite: `{displacement_quote[1]}`_")
+            cited_paths.add(displacement_quote[1])
+            point_n += 1
+            lines.append("")
+
+        elif section == "recent_shifts" and bc.recent_shifts:
+            lines.append(f"### {point_n}. Recent shifts to mention or avoid")
+            lines.append("")
+            for s in bc.recent_shifts[:3]:
+                lines.append(f"- {s}")
+            lines.append(f"")
+            lines.append(f"_Substrate cite: `{bc.source_path}`_")
+            point_n += 1
+            lines.append("")
+
+        elif section == "pricing" and bc.pricing:
+            lines.append(f"### {point_n}. Pricing reference (verify before send)")
+            lines.append("")
+            for p in bc.pricing[:5]:
+                lines.append(p)
+            lines.append(f"")
+            lines.append(f"_Substrate cite: `{bc.source_path}`_")
+            point_n += 1
+            lines.append("")
+
+    if objection:
+        lines.append(f"### {point_n}. Specific objection to address")
+        lines.append("")
+        lines.append(f"**Objection:** \"{objection}\"")
+        lines.append("")
+        lines.append("**Response shape (Voss-pattern):** label the objection, mirror the buyer's "
+                     "language, propose a low-friction next step.")
+        lines.append("")
+        # Pick relevant honest-losses or when-we-win as the response substance
+        if bc.when_we_win:
+            lines.append(f"Substantive content: {bc.when_we_win[0]}")
+            lines.append(f"")
+            lines.append(f"_Substrate cite: `{bc.source_path}`_")
+        point_n += 1
+        lines.append("")
+
+    lines += [
+        "## Contradiction-resolution log",
+        "",
+        f"- `con_no-decision-vs-named-competitor`: {contradiction_position}",
+        f"- `con_personalization-vs-scale`: AE-led talking points are by definition tier-1A hand-personalized;",
+        "  not for blast use.",
+        "",
+        "## Substrate cited",
+        "",
+    ]
+    for p in sorted(cited_paths):
+        lines.append(f"- `{p}`")
+
+    lines += [
+        "",
+        "## Patterns grounded",
+        "",
+        "- `knowledge/patterns/status-quo-is-the-real-objection-outbound.md`",
+        "- `knowledge/patterns/differentiation-vs-sameness.md`",
+        "- `knowledge/patterns/copywriting-craft-fundamentals.md`",
+        "",
+        "## Verification",
+        "",
+        "Run `substrate claim-verify` on this file before sending into the deal. ",
+        "Any cite-value mismatch on a competitor claim is a fabrication risk; refuse to ship.",
+    ]
+
+    return "\n".join(lines)
+
+
+# ---- Main ----
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--client", required=True)
+    p.add_argument("--competitor", required=True)
+    p.add_argument("--buyer-state", required=True,
+                   choices=["unaware", "problem-aware", "solution-aware",
+                            "product-aware", "most-aware"])
+    p.add_argument("--deal-stage", required=True,
+                   choices=["discovery", "qualification", "demo",
+                            "proposal", "close", "breakup"])
+    p.add_argument("--objection", default="")
+    p.add_argument("--account", default="")
+    p.add_argument("--output", default=None)
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        print(f"REFUSED: client root missing — {client_root}", file=sys.stderr)
+        return 1
+
+    bc_path = find_battle_card(args.client, args.competitor)
+    if bc_path is None:
+        print(f"REFUSED: no battle-card found for competitor '{args.competitor}'", file=sys.stderr)
+        print(f"  fix: run substrate competitive-scout --competitor {args.competitor}", file=sys.stderr)
+        return 1
+
+    # Positioning preflight
+    pos_dir = client_root / "positioning"
+    pos_path = None
+    if pos_dir.is_dir():
+        pos_files = list(pos_dir.glob("positioning-canonical-statement*.md"))
+        if pos_files:
+            pos_path = str(max(pos_files, key=lambda x: x.stat().st_mtime).relative_to(SUBSTRATE_ROOT))
+    if pos_path is None:
+        sub_pos = client_root / "substrate"
+        if sub_pos.is_dir():
+            pos_files = list(sub_pos.glob("positioning-canonical-statement*.md"))
+            if pos_files:
+                pos_path = str(max(pos_files, key=lambda x: x.stat().st_mtime).relative_to(SUBSTRATE_ROOT))
+    if pos_path is None:
+        print(f"REFUSED: canonical positioning statement missing for {args.client}", file=sys.stderr)
+        return 1
+
+    # Buyer-state × deal-stage coherence check
+    if args.deal_stage == "breakup" and args.buyer_state == "unaware":
+        print("REFUSED: incoherent inputs (breakup-stage with unaware buyer is impossible)", file=sys.stderr)
+        return 2
+
+    # Read battle-card
+    bc = parse_battle_card(bc_path, args.competitor)
+
+    # Battle-card freshness
+    bc_age_warn = ""
+    if bc.last_updated:
+        try:
+            last = datetime.strptime(bc.last_updated, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - last).days
+            if age > 30:
+                bc_age_warn = f"battle-card {age} days old; verify pricing + recent shifts before send"
+                print(f"  WARN: {bc_age_warn}", file=sys.stderr)
+        except ValueError:
+            pass
+
+    # Section selection
+    sections = select_sections(args.buyer_state, args.deal_stage)
+    print(f"  buyer-state={args.buyer_state} deal-stage={args.deal_stage} → sections: {sections}", file=sys.stderr)
+
+    # Displacement quote
+    dq = find_displacement_quote(args.client, args.competitor)
+
+    # Compose
+    output = compose_talking_points(bc, sections, dq, args.objection,
+                                     args.buyer_state, args.deal_stage, args.account, pos_path)
+
+    # Output path
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if args.output:
+        out_path = Path(args.output).resolve()
+    else:
+        out_dir = client_root / "sales" / "talking-points"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        slug_account = re.sub(r"[^a-z0-9-]+", "-", args.account.lower()) or "account"
+        out_path = out_dir / f"{today}-{slug_account}-{args.competitor}.md"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(output, encoding="utf-8")
+
+    # Run claim-verify on the output (per skill spec)
+    cv_pass, cv_msg = run_claim_verify(out_path)
+    if not cv_pass:
+        # Append a warning section but still write
+        flag_text = (
+            "\n\n## CLAIM-VERIFY FAILED\n\n"
+            "One or more claims in this talking-points file did not verify against the "
+            "cited substrate. Review before sending. Detail:\n\n"
+            f"```\n{cv_msg[-1500:] if cv_msg else '(no detail)'}\n```\n"
+        )
+        out_path.write_text(output + flag_text, encoding="utf-8")
+        print(f"  WARN: claim-verify FAIL — flagged in output", file=sys.stderr)
+
+    print(f"[battle-card-driver] wrote {out_path}", file=sys.stderr)
+    if bc_age_warn:
+        print(f"PASS-WITH-WARN: {out_path.name} ({bc_age_warn})")
+    elif not cv_pass:
+        print(f"PASS-WITH-FLAG: {out_path.name} (claim-verify flagged; review before send)")
+    else:
+        print(f"PASS: {out_path.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""context-curate — Layer 8 reconciliation: monitor context decay across all clients.
+
+Reads every context file's frontmatter (`last_updated` + `decay_period_days`),
+compares against today, flags stale layers. Outputs a single audit report; can
+also post a Slack alert when run with --slack-alert.
+
+Usage:
+    substrate context-curate                   # all clients, dry-print
+    substrate context-curate --client <slug>   # one client
+    substrate context-curate --slack-alert     # also post to Slack
+    substrate context-curate --json            # machine-readable
+
+Output:
+    - knowledge/intel/context-decay-<date>.md
+    - knowledge/intel/context-decay-<date>.json (with --json)
+    - Slack post to #substrate-decay-watch (with --slack-alert)
+
+Exit codes:
+    0 — all context fresh
+    1 — some files stale (run reports them)
+    2 — error reading
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(os.environ.get("SUBSTRATE_ROOT") or os.environ.get("FLYWHEEL_ROOT") or Path(__file__).resolve().parents[3])
+
+
+def parse_frontmatter(path: Path) -> dict:
+    """Extract YAML frontmatter from a markdown file. Returns dict or {}."""
+    try:
+        text = path.read_text(errors="replace")
+    except Exception:
+        return {}
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    fm_text = text[3:end].strip()
+    # Cheap YAML parser: only top-level key: value pairs we care about
+    out = {}
+    for line in fm_text.splitlines():
+        m = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*?)\s*$", line)
+        if m:
+            key, val = m.group(1), m.group(2)
+            # Strip quotes
+            val = val.strip('"').strip("'")
+            out[key] = val
+    return out
+
+
+def audit_context(context_dir: Path, today: datetime) -> list[dict]:
+    """Walk context dir; for each .md file with last_updated + decay_period_days, compute staleness."""
+    findings = []
+    if not context_dir.exists():
+        return findings
+    for md in context_dir.rglob("*.md"):
+        if md.name.startswith("00-INDEX"):
+            continue  # the index itself isn't context
+        fm = parse_frontmatter(md)
+        if not fm:
+            continue
+        last_updated = fm.get("last_updated")
+        decay_period_days = fm.get("decay_period_days")
+        if not last_updated or not decay_period_days:
+            continue
+        try:
+            last = datetime.fromisoformat(str(last_updated)).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        try:
+            decay_days = int(re.search(r"\d+", str(decay_period_days)).group())
+        except Exception:
+            continue
+        deadline = last + timedelta(days=decay_days)
+        days_overdue = (today - deadline).days
+        rel_path = md.relative_to(SUBSTRATE_ROOT)
+        finding = {
+            "file": str(rel_path),
+            "last_updated": last_updated,
+            "decay_period_days": decay_days,
+            "deadline": deadline.date().isoformat(),
+            "days_overdue": days_overdue,
+            "is_stale": days_overdue > 0,
+            "layer": fm.get("layer", "unknown"),
+            "ownership": fm.get("ownership", "unknown"),
+        }
+        findings.append(finding)
+    return findings
+
+
+def render_markdown(findings: list[dict], today: datetime) -> str:
+    stale = [f for f in findings if f["is_stale"]]
+    fresh = [f for f in findings if not f["is_stale"]]
+    lines = [
+        f"---",
+        f"title: context decay audit — {today.date().isoformat()}",
+        f"date: {today.date().isoformat()}",
+        f"total_files: {len(findings)}",
+        f"stale: {len(stale)}",
+        f"fresh: {len(fresh)}",
+        f"audience: context owners + Layer 8 reconciliation cron",
+        f"---",
+        f"",
+        f"# Context Decay Audit — {today.date().isoformat()}",
+        f"",
+        f"{len(findings)} context files audited; **{len(stale)} stale** ({len(fresh)} fresh).",
+        f"",
+    ]
+    if stale:
+        lines.extend(["## Stale layers (action required)", ""])
+        lines.append("| File | Layer | Owner | Days overdue | Last updated |")
+        lines.append("|---|---|---|---:|---|")
+        for f in sorted(stale, key=lambda x: -x["days_overdue"]):
+            lines.append(
+                f"| `{f['file']}` | {f['layer']} | {f['ownership']} | "
+                f"{f['days_overdue']} | {f['last_updated']} |"
+            )
+        lines.append("")
+    if fresh:
+        lines.extend(["## Fresh layers (no action needed)", ""])
+        lines.append("| File | Layer | Days until decay | Last updated |")
+        lines.append("|---|---|---:|---|")
+        for f in sorted(fresh, key=lambda x: x["days_overdue"]):
+            days_until = -f["days_overdue"]
+            lines.append(
+                f"| `{f['file']}` | {f['layer']} | {days_until} | {f['last_updated']} |"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
+def main():
+    p = argparse.ArgumentParser(description="context-curate: Layer 8 decay monitor")
+    p.add_argument("--client", help="single client (default: all clients)")
+    p.add_argument("--json", action="store_true", help="emit JSON alongside md")
+    p.add_argument("--slack-alert", action="store_true", help="post to #substrate-decay-watch (or operator-configured channel)")
+    p.add_argument("--out-dir", default="knowledge/intel", help="output dir relative to SUBSTRATE_ROOT")
+    args = p.parse_args()
+
+    today = datetime.now(timezone.utc)
+    findings = []
+
+    clients_dir = SUBSTRATE_ROOT / "clients"
+    if args.client:
+        target = clients_dir / args.client / "context"
+        findings.extend(audit_context(target, today))
+    else:
+        for client_dir in clients_dir.glob("*/"):
+            sub = client_dir / "context"
+            if sub.exists():
+                findings.extend(audit_context(sub, today))
+
+    out_dir = SUBSTRATE_ROOT / args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    md_path = out_dir / f"context-decay-{today.date().isoformat()}.md"
+    md_path.write_text(render_markdown(findings, today))
+    print(f"wrote {md_path}", file=sys.stderr)
+
+    if args.json:
+        json_path = out_dir / f"context-decay-{today.date().isoformat()}.json"
+        json_path.write_text(json.dumps({
+            "date": today.date().isoformat(),
+            "findings": findings,
+        }, indent=2))
+        print(f"wrote {json_path}", file=sys.stderr)
+
+    stale = [f for f in findings if f["is_stale"]]
+    print(f"audited {len(findings)} files; {len(stale)} stale", file=sys.stderr)
+
+    if args.slack_alert and stale:
+        slack_webhook = os.environ.get("SLACK_DECAY_WATCH_WEBHOOK")
+        if slack_webhook:
+            try:
+                import urllib.request, urllib.parse
+                lines = [f"⚠️ {len(stale)} context file(s) past decay window"]
+                for f in sorted(stale, key=lambda x: -x["days_overdue"])[:5]:
+                    lines.append(f"  • `{f['file']}` ({f['days_overdue']}d overdue, owner: {f['ownership']})")
+                payload = json.dumps({"text": "\n".join(lines)}).encode()
+                req = urllib.request.Request(
+                    slack_webhook,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(req, timeout=10)
+                print("posted Slack alert", file=sys.stderr)
+            except Exception as exc:
+                print(f"Slack alert failed: {exc}", file=sys.stderr)
+        else:
+            print("SLACK_DECAY_WATCH_WEBHOOK not set; skip Slack alert", file=sys.stderr)
+
+    sys.exit(0 if not stale else 1)
+
+
+if __name__ == "__main__":
+    main()

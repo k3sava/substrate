@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+"""analytics-pull, pull data from named source systems into per-client substrate.
+
+Reads clients/<client>/analytics/sources.yaml (refuses without it). Per declared
+source, fetches the previous calendar month's data and lands a schema-mapped CSV
+plus manifest under clients/<client>/analytics/<source>/<YYYY-MM>.csv.
+
+When API keys are present (env-var-named per source), the skill calls the live
+API; when absent, it falls back to mock-mode and emits realistic seed data so
+downstream skills can be smoke-tested before live credentials land. Mock-mode is
+also forced by --mock.
+
+Source CSV schemas (all sources lower-snake_case columns):
+
+  amplitude: event_id, user_id, event_name, ts, session_id, country, device_type, property_*
+  posthog:   event_id, distinct_id, event_name, ts, session_id, person_id, property_*
+  mixpanel:  event_id, distinct_id, event_name, ts, session_id, property_*
+  hubspot:   object_id, object_type, event_type, ts, owner_id, property_*
+  stripe:    event_id, customer_id, event_type, ts, currency, amount_cents, plan_id, status
+  segment:   event_id, user_id, anonymous_id, event_name, ts, source, property_*
+  ga4:       event_id, client_id, event_name, ts, session_id, property_*
+
+Usage:
+    analytics-pull --client <client>                 # pull all sources, prev month
+    analytics-pull --client <client> --source amplitude
+    analytics-pull --client <client> --source amplitude --month 2026-04
+    analytics-pull --client <client> --mock          # force mock-mode
+    analytics-pull --client <client> --dry-run       # print intent only
+
+Exit codes:
+    0, all declared sources pulled or skipped with documented fallback
+    1, partial pull (some sources failed; manifest captures which)
+    3, refused (substrate gap, missing sources.yaml)
+    4, invalid args
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import random
+import re
+import sys
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+# --- per-source CSV schemas -------------------------------------------------
+
+SOURCE_SCHEMAS: dict[str, list[str]] = {
+    "amplitude": [
+        "event_id", "user_id", "event_name", "ts", "session_id",
+        "country", "device_type",
+    ],
+    "posthog": [
+        "event_id", "distinct_id", "event_name", "ts", "session_id", "person_id",
+    ],
+    "mixpanel": [
+        "event_id", "distinct_id", "event_name", "ts", "session_id",
+    ],
+    "hubspot": [
+        "object_id", "object_type", "event_type", "ts", "owner_id",
+    ],
+    "stripe": [
+        "event_id", "customer_id", "event_type", "ts", "currency",
+        "amount_cents", "plan_id", "status",
+    ],
+    "segment": [
+        "event_id", "user_id", "anonymous_id", "event_name", "ts", "source",
+    ],
+    "ga4": [
+        "event_id", "client_id", "event_name", "ts", "session_id",
+    ],
+}
+
+# Per-source standard property columns appended after schema base columns.
+# Real APIs return many more; the seed shape names the load-bearing properties.
+SOURCE_PROPERTIES: dict[str, list[str]] = {
+    "amplitude": ["property_plan", "property_team_size", "property_signup_source", "property_persona"],
+    "posthog": ["property_plan", "property_team_size", "property_signup_source", "property_persona"],
+    "mixpanel": ["property_plan", "property_team_size", "property_signup_source", "property_persona"],
+    "hubspot": ["property_lifecycle_stage", "property_lead_source", "property_industry", "property_company_size"],
+    "stripe": [],  # Stripe schema is fixed; properties live in metadata.
+    "segment": ["property_plan", "property_team_size", "property_signup_source", "property_persona"],
+    "ga4": ["property_page_path", "property_referrer", "property_signup_source", "property_persona"],
+}
+
+# Env-var name per source for the API key. mock-mode triggers when missing.
+SOURCE_API_KEY_ENV: dict[str, str] = {
+    "amplitude": "AMPLITUDE_API_KEY",
+    "posthog": "POSTHOG_API_KEY",
+    "mixpanel": "MIXPANEL_API_KEY",
+    "hubspot": "HUBSPOT_API_KEY",
+    "stripe": "STRIPE_API_KEY",
+    "segment": "SEGMENT_API_KEY",
+    "ga4": "GA4_API_KEY",
+}
+
+# Mock event vocabularies per source. These are the events a healthy SaaS
+# product fires; the seed generator picks from these to build realistic data.
+MOCK_EVENT_VOCAB: dict[str, list[tuple[str, float]]] = {
+    "amplitude": [
+        ("signup", 0.10), ("onboarding_started", 0.07), ("onboarding_completed", 0.06),
+        ("first_value_event", 0.08), ("session_active", 0.40), ("invited_teammate", 0.04),
+        ("upgrade_initiated", 0.02), ("paid_started", 0.02), ("feature_advanced_used", 0.06),
+        ("subscription_renewed", 0.03), ("subscription_cancelled", 0.01), ("support_ticket_filed", 0.02),
+        ("nps_survey_submitted", 0.01), ("dashboard_viewed", 0.05), ("export_initiated", 0.03),
+    ],
+    "posthog": [
+        ("$pageview", 0.30), ("$autocapture", 0.20), ("signup", 0.08),
+        ("onboarding_completed", 0.06), ("first_value_event", 0.07), ("session_active", 0.20),
+        ("upgrade_initiated", 0.02), ("paid_started", 0.02), ("feature_used", 0.05),
+    ],
+    "mixpanel": [
+        ("Sign Up", 0.08), ("Onboarding Started", 0.06), ("Onboarding Completed", 0.05),
+        ("First Value", 0.08), ("Session Active", 0.40), ("Invite Sent", 0.04),
+        ("Upgrade", 0.03), ("Subscription Started", 0.02), ("Feature Used", 0.10),
+        ("Cancel Subscription", 0.01), ("Support Contact", 0.02), ("NPS Submitted", 0.01),
+    ],
+    "hubspot": [
+        # event_type values; object_type is on the row.
+        ("contact_created", 0.20), ("form_submitted", 0.15), ("deal_created", 0.10),
+        ("deal_stage_changed", 0.20), ("deal_closed_won", 0.05), ("deal_closed_lost", 0.05),
+        ("email_opened", 0.10), ("email_clicked", 0.05), ("ticket_opened", 0.05),
+        ("ticket_resolved", 0.05),
+    ],
+    "stripe": [
+        # event_type per Stripe API.
+        ("customer.created", 0.10), ("customer.subscription.created", 0.10),
+        ("invoice.paid", 0.40), ("invoice.payment_failed", 0.05),
+        ("customer.subscription.updated", 0.15), ("customer.subscription.deleted", 0.05),
+        ("charge.succeeded", 0.10), ("charge.refunded", 0.02), ("payment_method.attached", 0.03),
+    ],
+    "segment": [
+        ("Page Viewed", 0.30), ("Track", 0.20), ("Identify", 0.15),
+        ("Signed Up", 0.05), ("First Value Event", 0.05), ("Subscription Started", 0.02),
+        ("Feature Used", 0.10), ("Session Active", 0.13),
+    ],
+    "ga4": [
+        ("page_view", 0.40), ("session_start", 0.20), ("first_visit", 0.05),
+        ("scroll", 0.10), ("user_engagement", 0.10), ("sign_up", 0.05),
+        ("login", 0.05), ("purchase", 0.05),
+    ],
+}
+
+# --- minimal yaml parser (zero-dep) -----------------------------------------
+
+def load_yaml(path: Path) -> dict | None:
+    try:
+        import yaml  # type: ignore[import-not-found]
+        return yaml.safe_load(path.read_text())
+    except ImportError:
+        pass
+    text = path.read_text()
+    return _parse_minimal_yaml(text)
+
+
+def _parse_minimal_yaml(text: str) -> dict:
+    root: dict = {}
+    stack: list[tuple[int, dict | list]] = [(-1, root)]
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = re.sub(r"(\s)#.*$", r"\1", raw).rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            value_part = stripped[2:].strip()
+            if isinstance(parent, list):
+                if ":" in value_part and not value_part.endswith(":"):
+                    k, _, v = value_part.partition(":")
+                    new_map = {k.strip(): _scalar(v.strip())}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+                elif value_part:
+                    parent.append(_scalar(value_part))
+                else:
+                    new_map = {}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+            i += 1
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if not val:
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines):
+                    next_line = lines[j]
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent > indent and next_line.strip().startswith("- "):
+                        new_list: list = []
+                        if isinstance(parent, dict):
+                            parent[key] = new_list
+                        stack.append((indent, new_list))
+                    else:
+                        new_map = {}
+                        if isinstance(parent, dict):
+                            parent[key] = new_map
+                        stack.append((indent, new_map))
+            else:
+                if isinstance(parent, dict):
+                    parent[key] = _scalar_or_inline(val)
+        i += 1
+    return root
+
+
+def _scalar(v: str):
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    if v.startswith("'") and v.endswith("'"):
+        return v[1:-1]
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    if v.lower() in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    if re.fullmatch(r"-?\d+\.\d+", v):
+        return float(v)
+    return v
+
+
+def _scalar_or_inline(v: str):
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        if not inner:
+            return []
+        return [_scalar(p.strip()) for p in inner.split(",")]
+    if v.startswith("{") and v.endswith("}"):
+        inner = v[1:-1].strip()
+        out: dict = {}
+        if not inner:
+            return out
+        for pair in inner.split(","):
+            if ":" in pair:
+                k, _, vv = pair.partition(":")
+                out[k.strip()] = _scalar(vv.strip())
+        return out
+    return _scalar(v)
+
+
+# --- core operations --------------------------------------------------------
+
+def refuse(reason: str, detail: str = "") -> int:
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    return 3
+
+
+def previous_month_label(today: datetime | None = None) -> str:
+    today = today or datetime.now(timezone.utc)
+    first_of_month = today.replace(day=1)
+    last_of_prev = first_of_month - timedelta(days=1)
+    return last_of_prev.strftime("%Y-%m")
+
+
+def month_window(month_label: str) -> tuple[datetime, datetime]:
+    """Return [start, end_exclusive] for a YYYY-MM month label."""
+    m = re.fullmatch(r"(\d{4})-(\d{2})", month_label)
+    if not m:
+        raise ValueError(f"month must be YYYY-MM, got {month_label!r}")
+    y, mo = int(m.group(1)), int(m.group(2))
+    start = datetime(y, mo, 1, tzinfo=timezone.utc)
+    if mo == 12:
+        end = datetime(y + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        end = datetime(y, mo + 1, 1, tzinfo=timezone.utc)
+    return start, end
+
+
+def stable_seed(client: str, source: str, month: str) -> int:
+    h = hashlib.sha256(f"{client}|{source}|{month}".encode()).hexdigest()
+    return int(h[:8], 16)
+
+
+def weighted_pick(rng: random.Random, vocab: list[tuple[str, float]]) -> str:
+    r = rng.random()
+    acc = 0.0
+    for name, weight in vocab:
+        acc += weight
+        if r <= acc:
+            return name
+    return vocab[-1][0]
+
+
+def gen_mock_amplitude(client: str, source: str, month: str, n_users: int, events_per_user: tuple[int, int]) -> list[dict]:
+    rng = random.Random(stable_seed(client, source, month))
+    start, end = month_window(month)
+    span_seconds = int((end - start).total_seconds())
+    countries = ["US", "GB", "IN", "DE", "FR", "AU", "BR", "CA", "JP"]
+    devices = ["desktop", "mobile", "tablet"]
+    plans = ["trial", "starter", "growth", "scale", "enterprise"]
+    sources_list = ["organic", "paid-search", "referral", "direct", "social", "email"]
+    personas = ["sdr-lead", "ops-lead", "founder-led", "rev-ops-pro", "csm-lead"]
+    vocab = MOCK_EVENT_VOCAB[source]
+    rows: list[dict] = []
+    for u in range(n_users):
+        user_id = f"u_{u:05d}"
+        country = rng.choice(countries)
+        device = rng.choice(devices)
+        n_events = rng.randint(*events_per_user)
+        plan = rng.choice(plans)
+        team_size = rng.choice([1, 2, 3, 5, 8, 13, 25, 50])
+        signup_source = rng.choice(sources_list)
+        persona = rng.choice(personas)
+        for e in range(n_events):
+            event_name = weighted_pick(rng, vocab)
+            ts = start + timedelta(seconds=rng.randint(0, span_seconds))
+            session_id = f"s_{u:05d}_{e // 5:03d}"
+            event_id = f"ev_{u:05d}_{e:04d}"
+            row = {
+                "event_id": event_id,
+                "user_id": user_id,
+                "event_name": event_name,
+                "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "session_id": session_id,
+                "country": country,
+                "device_type": device,
+                "property_plan": plan,
+                "property_team_size": str(team_size),
+                "property_signup_source": signup_source,
+                "property_persona": persona,
+            }
+            rows.append(row)
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
+def gen_mock_posthog(client: str, source: str, month: str, n_users: int, events_per_user: tuple[int, int]) -> list[dict]:
+    rng = random.Random(stable_seed(client, source, month))
+    start, end = month_window(month)
+    span = int((end - start).total_seconds())
+    plans = ["trial", "starter", "growth", "scale"]
+    sources_list = ["organic", "paid-search", "referral", "direct", "social"]
+    personas = ["sdr-lead", "ops-lead", "founder-led", "rev-ops-pro"]
+    vocab = MOCK_EVENT_VOCAB[source]
+    rows: list[dict] = []
+    for u in range(n_users):
+        distinct_id = f"d_{u:05d}"
+        person_id = f"p_{u:05d}"
+        plan = rng.choice(plans)
+        signup_source = rng.choice(sources_list)
+        persona = rng.choice(personas)
+        team_size = rng.choice([1, 2, 5, 10, 25])
+        n_events = rng.randint(*events_per_user)
+        for e in range(n_events):
+            event_name = weighted_pick(rng, vocab)
+            ts = start + timedelta(seconds=rng.randint(0, span))
+            rows.append({
+                "event_id": f"ph_{u:05d}_{e:04d}",
+                "distinct_id": distinct_id,
+                "event_name": event_name,
+                "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "session_id": f"phs_{u:05d}_{e // 5}",
+                "person_id": person_id,
+                "property_plan": plan,
+                "property_team_size": str(team_size),
+                "property_signup_source": signup_source,
+                "property_persona": persona,
+            })
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
+def gen_mock_mixpanel(client: str, source: str, month: str, n_users: int, events_per_user: tuple[int, int]) -> list[dict]:
+    rng = random.Random(stable_seed(client, source, month))
+    start, end = month_window(month)
+    span = int((end - start).total_seconds())
+    plans = ["Trial", "Starter", "Growth", "Scale"]
+    sources_list = ["organic", "paid-search", "referral", "direct"]
+    personas = ["sdr-lead", "ops-lead", "founder-led"]
+    vocab = MOCK_EVENT_VOCAB[source]
+    rows: list[dict] = []
+    for u in range(n_users):
+        distinct_id = f"mp_{u:05d}"
+        plan = rng.choice(plans)
+        signup_source = rng.choice(sources_list)
+        persona = rng.choice(personas)
+        team_size = rng.choice([1, 2, 5, 10])
+        n_events = rng.randint(*events_per_user)
+        for e in range(n_events):
+            event_name = weighted_pick(rng, vocab)
+            ts = start + timedelta(seconds=rng.randint(0, span))
+            rows.append({
+                "event_id": f"mpe_{u:05d}_{e:04d}",
+                "distinct_id": distinct_id,
+                "event_name": event_name,
+                "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "session_id": f"mps_{u:05d}_{e // 4}",
+                "property_plan": plan,
+                "property_team_size": str(team_size),
+                "property_signup_source": signup_source,
+                "property_persona": persona,
+            })
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
+def gen_mock_hubspot(client: str, source: str, month: str, n_objects: int, events_per_object: tuple[int, int]) -> list[dict]:
+    rng = random.Random(stable_seed(client, source, month))
+    start, end = month_window(month)
+    span = int((end - start).total_seconds())
+    object_types = ["contact", "deal", "company", "ticket"]
+    lifecycle_stages = ["subscriber", "lead", "marketing-qualified-lead", "sales-qualified-lead", "opportunity", "customer"]
+    sources_list = ["organic-search", "paid-search", "referral", "social", "direct", "email-marketing"]
+    industries = ["SaaS", "FinTech", "Healthcare", "Retail", "Manufacturing", "Media"]
+    company_sizes = ["1-10", "11-50", "51-200", "201-500", "501-1000", "1001+"]
+    vocab = MOCK_EVENT_VOCAB[source]
+    rows: list[dict] = []
+    for o in range(n_objects):
+        object_id = f"hs_{o:05d}"
+        object_type = rng.choice(object_types)
+        owner_id = f"ow_{rng.randint(0, 9):02d}"
+        lifecycle = rng.choice(lifecycle_stages)
+        lead_src = rng.choice(sources_list)
+        industry = rng.choice(industries)
+        size = rng.choice(company_sizes)
+        n_events = rng.randint(*events_per_object)
+        for e in range(n_events):
+            event_type = weighted_pick(rng, vocab)
+            ts = start + timedelta(seconds=rng.randint(0, span))
+            rows.append({
+                "object_id": object_id,
+                "object_type": object_type,
+                "event_type": event_type,
+                "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "owner_id": owner_id,
+                "property_lifecycle_stage": lifecycle,
+                "property_lead_source": lead_src,
+                "property_industry": industry,
+                "property_company_size": size,
+            })
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
+def gen_mock_stripe(client: str, source: str, month: str, n_customers: int, events_per_customer: tuple[int, int]) -> list[dict]:
+    rng = random.Random(stable_seed(client, source, month))
+    start, end = month_window(month)
+    span = int((end - start).total_seconds())
+    plan_amounts = {
+        "starter_monthly": 4900,
+        "growth_monthly": 19900,
+        "scale_monthly": 49900,
+        "enterprise_monthly": 199900,
+        "starter_annual": 49000,
+        "growth_annual": 199000,
+        "scale_annual": 499000,
+    }
+    plan_ids = list(plan_amounts.keys())
+    statuses = ["succeeded", "failed", "refunded", "pending"]
+    vocab = MOCK_EVENT_VOCAB[source]
+    rows: list[dict] = []
+    for c in range(n_customers):
+        customer_id = f"cus_{c:08d}"
+        plan_id = rng.choice(plan_ids)
+        plan_amount = plan_amounts[plan_id]
+        n_events = rng.randint(*events_per_customer)
+        for e in range(n_events):
+            event_type = weighted_pick(rng, vocab)
+            ts = start + timedelta(seconds=rng.randint(0, span))
+            # Stripe amount semantics: paid invoices and charge events carry amounts;
+            # cancellations / customer.created carry zero.
+            if "paid" in event_type or "succeeded" in event_type:
+                amount = plan_amount
+                status = "succeeded"
+            elif "failed" in event_type:
+                amount = plan_amount
+                status = "failed"
+            elif "refunded" in event_type:
+                amount = -plan_amount
+                status = "refunded"
+            else:
+                amount = 0
+                status = "n/a"
+            rows.append({
+                "event_id": f"evt_{c:08d}_{e:04d}",
+                "customer_id": customer_id,
+                "event_type": event_type,
+                "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "currency": "usd",
+                "amount_cents": str(amount),
+                "plan_id": plan_id,
+                "status": status,
+            })
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
+def gen_mock_segment(client: str, source: str, month: str, n_users: int, events_per_user: tuple[int, int]) -> list[dict]:
+    rng = random.Random(stable_seed(client, source, month))
+    start, end = month_window(month)
+    span = int((end - start).total_seconds())
+    sub_sources = ["website", "ios-app", "android-app", "marketing-site", "in-product"]
+    plans = ["trial", "starter", "growth", "scale"]
+    sources_list = ["organic", "paid-search", "referral", "direct"]
+    personas = ["sdr-lead", "ops-lead", "founder-led"]
+    vocab = MOCK_EVENT_VOCAB[source]
+    rows: list[dict] = []
+    for u in range(n_users):
+        user_id = f"sg_{u:05d}"
+        anon_id = f"anon_{u:05d}"
+        plan = rng.choice(plans)
+        signup_source = rng.choice(sources_list)
+        persona = rng.choice(personas)
+        team_size = rng.choice([1, 2, 5, 10])
+        n_events = rng.randint(*events_per_user)
+        for e in range(n_events):
+            event_name = weighted_pick(rng, vocab)
+            ts = start + timedelta(seconds=rng.randint(0, span))
+            rows.append({
+                "event_id": f"sge_{u:05d}_{e:04d}",
+                "user_id": user_id,
+                "anonymous_id": anon_id,
+                "event_name": event_name,
+                "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "source": rng.choice(sub_sources),
+                "property_plan": plan,
+                "property_team_size": str(team_size),
+                "property_signup_source": signup_source,
+                "property_persona": persona,
+            })
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
+def gen_mock_ga4(client: str, source: str, month: str, n_clients: int, events_per_client: tuple[int, int]) -> list[dict]:
+    rng = random.Random(stable_seed(client, source, month))
+    start, end = month_window(month)
+    span = int((end - start).total_seconds())
+    pages = ["/", "/pricing", "/product", "/blog", "/blog/post-a", "/blog/post-b", "/contact", "/signup", "/login", "/dashboard"]
+    referrers = ["google.com", "twitter.com", "linkedin.com", "(direct)", "newsletter.example.com", "producthunt.com"]
+    sources_list = ["organic", "paid-search", "referral", "direct", "social"]
+    personas = ["sdr-lead", "ops-lead", "founder-led"]
+    vocab = MOCK_EVENT_VOCAB[source]
+    rows: list[dict] = []
+    for c in range(n_clients):
+        client_id = f"GA{rng.randint(1_000_000, 9_999_999)}.{rng.randint(1_000_000, 9_999_999)}"
+        signup_source = rng.choice(sources_list)
+        persona = rng.choice(personas)
+        n_events = rng.randint(*events_per_client)
+        for e in range(n_events):
+            event_name = weighted_pick(rng, vocab)
+            ts = start + timedelta(seconds=rng.randint(0, span))
+            rows.append({
+                "event_id": f"ga_{c:05d}_{e:04d}",
+                "client_id": client_id,
+                "event_name": event_name,
+                "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "session_id": f"gs_{c:05d}_{e // 5}",
+                "property_page_path": rng.choice(pages),
+                "property_referrer": rng.choice(referrers),
+                "property_signup_source": signup_source,
+                "property_persona": persona,
+            })
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
+MOCK_GENERATORS = {
+    "amplitude": lambda c, s, m: gen_mock_amplitude(c, s, m, n_users=120, events_per_user=(20, 80)),
+    "posthog":   lambda c, s, m: gen_mock_posthog(c, s, m, n_users=80, events_per_user=(15, 60)),
+    "mixpanel":  lambda c, s, m: gen_mock_mixpanel(c, s, m, n_users=60, events_per_user=(20, 60)),
+    "hubspot":   lambda c, s, m: gen_mock_hubspot(c, s, m, n_objects=40, events_per_object=(5, 20)),
+    "stripe":    lambda c, s, m: gen_mock_stripe(c, s, m, n_customers=30, events_per_customer=(3, 12)),
+    "segment":   lambda c, s, m: gen_mock_segment(c, s, m, n_users=70, events_per_user=(15, 50)),
+    "ga4":       lambda c, s, m: gen_mock_ga4(c, s, m, n_clients=200, events_per_client=(10, 40)),
+}
+
+
+# --- live API placeholders --------------------------------------------------
+
+def fetch_live(source: str, api_key: str, sources_yaml: dict, month: str) -> list[dict]:
+    """Live API fetch placeholder.
+
+    Real implementations would call:
+      amplitude: GET https://amplitude.com/api/2/export?start={start}&end={end}
+      posthog:   POST https://app.posthog.com/api/projects/<id>/query
+      mixpanel:  GET https://data.mixpanel.com/api/2.0/export
+      hubspot:   GET https://api.hubapi.com/events/v3/events
+      stripe:    GET https://api.stripe.com/v1/events
+      segment:   GET https://api.segmentapis.com/sources/<id>/events
+      ga4:       GA4 Data API (analyticsdata.googleapis.com)
+
+    These calls require source-specific auth, paging, and decompression. To keep
+    the skill zero-dep and not exfiltrate data accidentally during smoke tests,
+    we currently raise NotImplementedError; callers fall back to mock-mode and
+    log the fallback. When live wiring lands, replace this body with the real
+    request. The schema is already mapped per SOURCE_SCHEMAS above.
+    """
+    raise NotImplementedError(
+        f"live fetch for {source} not wired; falling back to mock-mode. "
+        f"Implement this call and return rows in the SOURCE_SCHEMAS[{source}] shape."
+    )
+
+
+# --- declared-events drift check --------------------------------------------
+
+def load_events_taxonomy(client: str) -> tuple[set[str], dict | None]:
+    """Return the set of declared event names from events.yaml, or (empty, None)."""
+    p = SUBSTRATE_ROOT / "clients" / client / "events.yaml"
+    if not p.is_file():
+        return set(), None
+    raw = load_yaml(p) or {}
+    declared = set()
+    events = raw.get("events", []) or []
+    if isinstance(events, list):
+        for ev in events:
+            if isinstance(ev, dict) and "name" in ev:
+                declared.add(ev["name"])
+    return declared, raw
+
+
+def event_field_for_source(source: str) -> str:
+    """Which CSV column holds the event name for a given source."""
+    if source == "stripe" or source == "hubspot":
+        return "event_type"
+    return "event_name"
+
+
+def compute_taxonomy_coverage(rows: list[dict], source: str, declared: set[str]) -> dict:
+    if not rows or not declared:
+        return {"rows_total": len(rows), "rows_declared": 0, "coverage_pct": 0.0, "undeclared_events": []}
+    field = event_field_for_source(source)
+    fired_events: dict[str, int] = {}
+    declared_count = 0
+    for r in rows:
+        ev = r.get(field, "")
+        fired_events[ev] = fired_events.get(ev, 0) + 1
+        if ev in declared:
+            declared_count += 1
+    undeclared = sorted(
+        (ev for ev in fired_events if ev not in declared),
+        key=lambda e: -fired_events[e],
+    )
+    return {
+        "rows_total": len(rows),
+        "rows_declared": declared_count,
+        "coverage_pct": round(declared_count / len(rows) * 100.0, 1) if rows else 0.0,
+        "undeclared_events": [
+            {"event": ev, "count": fired_events[ev]} for ev in undeclared[:20]
+        ],
+        "fired_event_count": len(fired_events),
+    }
+
+
+# --- writers ---------------------------------------------------------------
+
+def write_csv(out_path: Path, rows: list[dict], schema: list[str], properties: list[str]) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cols = schema + properties
+    # Ensure all declared columns exist (fill missing with empty string)
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            filled = {c: row.get(c, "") for c in cols}
+            writer.writerow(filled)
+
+
+def write_manifest(out_path: Path, manifest: dict) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def append_log(log_path: Path, entry_lines: list[str]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if log_path.exists():
+        existing = log_path.read_text(encoding="utf-8")
+    else:
+        existing = ""
+    block = "\n".join(entry_lines) + "\n"
+    log_path.write_text(existing + block, encoding="utf-8")
+
+
+# --- main pipeline ---------------------------------------------------------
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/")
+    sources_yaml = client_root / "analytics" / "sources.yaml"
+    if not sources_yaml.is_file():
+        fails.append(f"sources.yaml missing: clients/{client}/analytics/sources.yaml")
+    return len(fails) == 0, fails
+
+
+def select_sources(requested: str, sources_yaml: dict) -> list[str]:
+    declared = sources_yaml.get("sources") or {}
+    if isinstance(declared, list):
+        # list-of-maps form: [{name: amplitude, ...}, ...]
+        names = [s.get("name") for s in declared if isinstance(s, dict) and s.get("name")]
+    elif isinstance(declared, dict):
+        names = list(declared.keys())
+    else:
+        names = []
+
+    valid_names = [n for n in names if n in SOURCE_SCHEMAS]
+
+    if requested == "all":
+        return valid_names
+    if requested in valid_names:
+        return [requested]
+    if requested in SOURCE_SCHEMAS and requested not in valid_names:
+        # Source is known to the skill but not declared in sources.yaml
+        return []
+    return []
+
+
+def pull_source(client: str, source: str, month: str, sources_yaml: dict, force_mock: bool, dry_run: bool) -> dict:
+    """Pull a single source. Returns a manifest entry."""
+    schema = SOURCE_SCHEMAS[source]
+    props = SOURCE_PROPERTIES[source]
+    api_env = SOURCE_API_KEY_ENV[source]
+    api_key = os.environ.get(api_env, "")
+
+    declared_events, _ = load_events_taxonomy(client)
+
+    out_dir = SUBSTRATE_ROOT / "clients" / client / "analytics" / source
+    csv_path = out_dir / f"{month}.csv"
+    manifest_path = out_dir / f"{month}.manifest.json"
+
+    if dry_run:
+        return {
+            "source": source,
+            "month": month,
+            "csv_path": str(csv_path),
+            "mode": "dry-run",
+            "row_count": 0,
+            "would_write": True,
+        }
+
+    mode = "mock"
+    rows: list[dict] = []
+    fallback_reason = ""
+
+    if force_mock:
+        rows = MOCK_GENERATORS[source](client, source, month)
+        mode = "mock-forced"
+    elif api_key:
+        try:
+            rows = fetch_live(source, api_key, sources_yaml, month)
+            mode = "live"
+        except NotImplementedError as e:
+            rows = MOCK_GENERATORS[source](client, source, month)
+            mode = "mock-fallback"
+            fallback_reason = str(e)
+        except Exception as e:  # noqa: BLE001
+            rows = MOCK_GENERATORS[source](client, source, month)
+            mode = "mock-fallback"
+            fallback_reason = f"live fetch failed: {e}"
+    else:
+        rows = MOCK_GENERATORS[source](client, source, month)
+        mode = "mock"
+        fallback_reason = f"{api_env} not set in env"
+
+    coverage = compute_taxonomy_coverage(rows, source, declared_events)
+
+    write_csv(csv_path, rows, schema, props)
+
+    # Compute distinct user / id count for the manifest
+    id_field = "user_id" if "user_id" in schema else (
+        "distinct_id" if "distinct_id" in schema else (
+            "customer_id" if "customer_id" in schema else (
+                "object_id" if "object_id" in schema else (
+                    "client_id" if "client_id" in schema else "event_id"
+                )
+            )
+        )
+    )
+    distinct_ids = len({r.get(id_field, "") for r in rows})
+
+    if rows:
+        ts_min = min(r["ts"] for r in rows)
+        ts_max = max(r["ts"] for r in rows)
+    else:
+        ts_min = ts_max = ""
+
+    manifest = {
+        "source": source,
+        "client": client,
+        "month": month,
+        "mode": mode,
+        "fallback_reason": fallback_reason,
+        "row_count": len(rows),
+        "distinct_ids": distinct_ids,
+        "id_field": id_field,
+        "ts_min": ts_min,
+        "ts_max": ts_max,
+        "schema": schema + props,
+        "events_taxonomy": coverage,
+        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "api_key_env": api_env,
+        "api_key_present": bool(api_key),
+        "csv_path": str(csv_path.relative_to(SUBSTRATE_ROOT)),
+    }
+    write_manifest(manifest_path, manifest)
+
+    return manifest
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="analytics-pull, source-system data ingest into per-client substrate")
+    p.add_argument("--client", required=True)
+    p.add_argument("--source", default="all")
+    p.add_argument("--month", default=None, help="YYYY-MM, default: previous calendar month")
+    p.add_argument("--mock", action="store_true", help="force mock-mode for all sources")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--strict-substrate", action="store_true", help="hard-refuse on substrate gap")
+    args = p.parse_args()
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        return 3
+
+    month = args.month or previous_month_label()
+    try:
+        month_window(month)
+    except ValueError as e:
+        print(f"REFUSED: invalid-month, {e}", file=sys.stderr)
+        return 4
+
+    sources_yaml_path = SUBSTRATE_ROOT / "clients" / args.client / "analytics" / "sources.yaml"
+    sources_yaml = load_yaml(sources_yaml_path) or {}
+    if not sources_yaml.get("sources"):
+        print(
+            "REFUSED: missing-sources-yaml-entries, "
+            f"clients/{args.client}/analytics/sources.yaml has no `sources:` block.",
+            file=sys.stderr,
+        )
+        return 3
+
+    selected = select_sources(args.source, sources_yaml)
+    if not selected:
+        if args.source == "all":
+            print("REFUSED: no-known-sources-declared", file=sys.stderr)
+            print(f"  declared sources do not match any known schema: {list(SOURCE_SCHEMAS)}", file=sys.stderr)
+            return 3
+        print(f"REFUSED: source-not-declared, {args.source!r} not in sources.yaml", file=sys.stderr)
+        return 3
+
+    print(f"[analytics-pull] client={args.client} month={month} sources={','.join(selected)} mock={args.mock}", file=sys.stderr)
+
+    manifests: list[dict] = []
+    failures: list[str] = []
+    for src in selected:
+        try:
+            m = pull_source(args.client, src, month, sources_yaml, args.mock, args.dry_run)
+            manifests.append(m)
+            print(
+                f"  · {src}: mode={m['mode']} rows={m['row_count']} ids={m['distinct_ids']} "
+                f"coverage={m['events_taxonomy'].get('coverage_pct', 0):.1f}%",
+                file=sys.stderr,
+            )
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{src}: {e}")
+            print(f"  · {src}: FAILED, {e}", file=sys.stderr)
+
+    log_path = SUBSTRATE_ROOT / "clients" / args.client / "analytics" / "_log" / f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}-pull.md"
+    log_lines = [
+        f"## analytics-pull, {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        "",
+        f"- Client: {args.client}",
+        f"- Month: {month}",
+        f"- Sources requested: {args.source}",
+        f"- Sources resolved: {', '.join(selected)}",
+        f"- Mock-forced: {args.mock}",
+        f"- Dry-run: {args.dry_run}",
+        "",
+        "### Results",
+        "",
+    ]
+    for m in manifests:
+        log_lines.append(
+            f"- {m['source']}: mode={m['mode']} rows={m['row_count']} ids={m['distinct_ids']} "
+            f"coverage={m['events_taxonomy'].get('coverage_pct', 0):.1f}% "
+            f"undeclared_events={len(m['events_taxonomy'].get('undeclared_events', []))}"
+        )
+    if failures:
+        log_lines.append("")
+        log_lines.append("### Failures")
+        log_lines.append("")
+        for fail in failures:
+            log_lines.append(f"- {fail}")
+    if not args.dry_run:
+        append_log(log_path, log_lines)
+
+    if failures:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

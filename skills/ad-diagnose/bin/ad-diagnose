@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+"""ad-diagnose — audit an ad-account export against canonical ICP, positioning,
+and the four fatigue / channel-fit patterns. Writes a structured diagnostic
+under clients/<client>/ads/diagnostics/.
+
+Refuses if the canonical ICP or canonical positioning is missing. Refuses if
+the export is empty or missing required headers. The diagnostic file is the
+input to ad-spend-allocate and ad-creative-design.
+
+Usage:
+    ad-diagnose --client <client> --export <path.csv> --channel <channel>
+                [--target-cac <usd>] [--ltv <usd>] [--window <days>]
+                [--out <dir>]
+
+Exit codes:
+    0 — diagnostic written
+    1 — diagnostic ran, written with FAIL flags above threshold
+    2 — input file not found
+    3 — refused (substrate gap, ICP missing, positioning missing, etc.)
+    4 — invalid args
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import statistics
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Substrate root: prefer SUBSTRATE_ROOT (the new convention), fall back to
+# FLYWHEEL_ROOT (the legacy convention used by the shared preflight library)
+# and to walking up from this script's location.
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+
+# Channel-specific fatigue thresholds (per creative-fatigue-window pattern).
+FATIGUE_THRESHOLDS = {
+    "meta-paid-social": {
+        "ctr_decline_pct": 30.0,
+        "ctr_decline_window_days": 14,
+        "frequency_ceiling": 3.0,
+        "cpm_rise_pct": 25.0,
+    },
+    "linkedin-sponsored": {
+        "ctr_decline_pct": 25.0,
+        "ctr_decline_window_days": 21,
+        "frequency_ceiling": 5.0,
+        "cpm_rise_pct": 20.0,
+    },
+    "tiktok": {
+        "ctr_decline_pct": 35.0,
+        "ctr_decline_window_days": 10,
+        "frequency_ceiling": 2.5,
+        "cpm_rise_pct": 30.0,
+    },
+    "google-pmax": {
+        "ctr_decline_pct": 25.0,
+        "ctr_decline_window_days": 21,
+        "frequency_ceiling": None,  # Pmax does not expose frequency
+        "cpm_rise_pct": 25.0,
+    },
+    "google-display": {
+        "ctr_decline_pct": 30.0,
+        "ctr_decline_window_days": 14,
+        "frequency_ceiling": None,
+        "cpm_rise_pct": 25.0,
+    },
+    "x": {
+        "ctr_decline_pct": 30.0,
+        "ctr_decline_window_days": 14,
+        "frequency_ceiling": 3.0,
+        "cpm_rise_pct": 25.0,
+    },
+    "reddit": {
+        "ctr_decline_pct": 30.0,
+        "ctr_decline_window_days": 14,
+        "frequency_ceiling": 3.0,
+        "cpm_rise_pct": 25.0,
+    },
+    # google-search has no fatigue curve in the same shape; the buyer triggers
+    # the impression. We still flag CTR decline as a query-quality signal.
+    "google-search": {
+        "ctr_decline_pct": 40.0,
+        "ctr_decline_window_days": 30,
+        "frequency_ceiling": None,
+        "cpm_rise_pct": 35.0,
+    },
+}
+
+REQUIRED_HEADERS = {"campaign", "impressions", "clicks", "spend", "conversions", "conv_value"}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def read_substrate_layer(client: str, layer_path: str) -> str | None:
+    p = SUBSTRATE_ROOT / "clients" / client / layer_path
+    if p.is_file():
+        return p.read_text(encoding="utf-8")
+    return None
+
+
+def parse_index_freshness(client: str) -> dict[str, str]:
+    """Read the client 00-INDEX freshness table; returns {layer-name: status}."""
+    idx = SUBSTRATE_ROOT / "clients" / client / "00-INDEX.md"
+    if not idx.is_file():
+        return {}
+    out = {}
+    for line in idx.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"\|\s*\d+\s*\|\s*([^|]+?)\s*\|.*\|\s*(active|stale|partial|covered|thin)\s*\|", line)
+        if m:
+            out[m.group(1).strip().lower()] = m.group(2).strip().lower()
+    return out
+
+
+def extract_icp_signals(icp_text: str) -> dict[str, list[str]]:
+    """Pull verticals, roles, company sizes, geos from the ICP layer.
+    Heuristic: looks for headers / fields commonly used in the substrate ICP template.
+    """
+    signals = defaultdict(list)
+    cur_section = None
+    for line in icp_text.splitlines():
+        s = line.strip()
+        if s.startswith("##"):
+            cur_section = s.lstrip("#").strip().lower()
+            continue
+        # Match list items in known sections
+        if cur_section and (s.startswith("-") or s.startswith("*")):
+            value = s.lstrip("-* ").strip()
+            if any(k in cur_section for k in ("vertical", "industry")):
+                signals["verticals"].append(value.lower())
+            elif any(k in cur_section for k in ("role", "title", "persona")):
+                signals["roles"].append(value.lower())
+            elif any(k in cur_section for k in ("size", "stage", "headcount", "company")):
+                signals["sizes"].append(value.lower())
+            elif any(k in cur_section for k in ("geo", "region", "country", "market")):
+                signals["geos"].append(value.lower())
+        # Inline frontmatter-style fields
+        m = re.match(r"^\s*(verticals?|roles?|sizes?|geos?|tech_stack)\s*:\s*\[(.+)\]\s*$", s)
+        if m:
+            key = m.group(1).rstrip("s") + "s"
+            for part in m.group(2).split(","):
+                signals[key].append(part.strip().strip('"').strip("'").lower())
+    return dict(signals)
+
+
+def extract_positioning_phrases(pos_text: str) -> dict[str, list[str]]:
+    """Pull the canonical statement and the load-bearing terms from positioning."""
+    out: dict[str, list[str]] = {"statement": [], "category": [], "anchors": [], "alternatives": []}
+    in_canonical = False
+    for line in pos_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(canonical|the position|statement|positioning)\b", s, re.IGNORECASE):
+            in_canonical = True
+            continue
+        if in_canonical and s.startswith("#"):
+            in_canonical = False
+        if in_canonical and s and not s.startswith("#"):
+            out["statement"].append(s)
+        # Try to pull the Dunford form: "For X, Y is the [category] that [unique value], unlike [alt]."
+        m = re.search(r"\bis the ([A-Za-z][\w\s-]+?) that", s, re.IGNORECASE)
+        if m:
+            out["category"].append(m.group(1).strip().lower())
+        m = re.search(r"\bunlike ([A-Za-z][\w\s,-]+?)(?:\.|$)", s, re.IGNORECASE)
+        if m:
+            for alt in m.group(1).split(","):
+                out["alternatives"].append(alt.strip().lower())
+    # Anchor terms = words 5+ chars that appear in the canonical block, dedup
+    full = " ".join(out["statement"]).lower()
+    anchors = sorted({w for w in re.findall(r"[a-z]{5,}", full)})
+    out["anchors"] = anchors[:30]
+    return out
+
+
+def load_export(path: Path) -> tuple[list[dict], list[str]]:
+    """Returns (rows, missing_headers). Returns ([], []) if file empty."""
+    if not path.is_file():
+        return [], []
+    rows = []
+    with path.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        present = set((reader.fieldnames or []))
+        missing = list(REQUIRED_HEADERS - present)
+        if missing:
+            return [], missing
+        for row in reader:
+            # Normalize numeric fields
+            for k in ("impressions", "clicks", "spend", "conversions", "conv_value", "frequency", "cpm"):
+                if k in row and row[k] not in (None, ""):
+                    try:
+                        row[k] = float(row[k])
+                    except ValueError:
+                        row[k] = 0.0
+                else:
+                    row[k] = 0.0
+            rows.append(row)
+    return rows, []
+
+
+def aggregate_by_campaign(rows: list[dict]) -> list[dict]:
+    """Sum spend / conversions / conv_value per campaign across the window."""
+    agg: dict[str, dict] = defaultdict(lambda: {
+        "spend": 0.0, "impressions": 0.0, "clicks": 0.0,
+        "conversions": 0.0, "conv_value": 0.0, "row_count": 0,
+        "ad_sets": set(), "creative_ids": set(),
+    })
+    for r in rows:
+        c = r.get("campaign", "<unnamed>")
+        agg[c]["spend"] += r["spend"]
+        agg[c]["impressions"] += r["impressions"]
+        agg[c]["clicks"] += r["clicks"]
+        agg[c]["conversions"] += r["conversions"]
+        agg[c]["conv_value"] += r["conv_value"]
+        agg[c]["row_count"] += 1
+        if r.get("ad_set"):
+            agg[c]["ad_sets"].add(r["ad_set"])
+        if r.get("creative_id"):
+            agg[c]["creative_ids"].add(r["creative_id"])
+    out = []
+    for name, a in agg.items():
+        cac = (a["spend"] / a["conversions"]) if a["conversions"] > 0 else None
+        roas = (a["conv_value"] / a["spend"]) if a["spend"] > 0 else None
+        ctr = (a["clicks"] / a["impressions"] * 100) if a["impressions"] > 0 else 0.0
+        out.append({
+            "campaign": name,
+            "spend": round(a["spend"], 2),
+            "impressions": int(a["impressions"]),
+            "clicks": int(a["clicks"]),
+            "conversions": a["conversions"],
+            "conv_value": round(a["conv_value"], 2),
+            "cac": round(cac, 2) if cac is not None else None,
+            "roas": round(roas, 2) if roas is not None else None,
+            "ctr_pct": round(ctr, 3),
+            "ad_set_count": len(a["ad_sets"]),
+            "creative_count": len(a["creative_ids"]),
+        })
+    out.sort(key=lambda x: x["spend"], reverse=True)
+    return out
+
+
+def detect_fatigue_per_creative(rows: list[dict], channel: str) -> list[dict]:
+    """For each creative_id (or campaign+ad_set if creative_id absent), compute
+    CTR, frequency, CPM trend over the window. Flag the ones tripping the
+    channel's fatigue thresholds.
+    """
+    th = FATIGUE_THRESHOLDS.get(channel, FATIGUE_THRESHOLDS["meta-paid-social"])
+    # Group by creative key
+    by_key: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        key = r.get("creative_id") or f"{r.get('campaign', '')}::{r.get('ad_set', '')}"
+        if not r.get("date"):
+            continue
+        try:
+            d = datetime.strptime(r["date"], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+        rec = dict(r)
+        rec["_date"] = d
+        rec["_ctr"] = (r["clicks"] / r["impressions"] * 100) if r["impressions"] > 0 else 0.0
+        by_key[key].append(rec)
+
+    flags = []
+    for key, observations in by_key.items():
+        if len(observations) < 2:
+            continue
+        observations.sort(key=lambda x: x["_date"])
+        # Peak CTR vs latest CTR within the threshold window
+        latest = observations[-1]
+        peak = max(observations, key=lambda x: x["_ctr"])
+        # Only consider decline if the peak preceded the latest
+        if peak["_date"] >= latest["_date"]:
+            decline_pct = 0.0
+        else:
+            window_days = (latest["_date"] - peak["_date"]).days
+            decline_pct = ((peak["_ctr"] - latest["_ctr"]) / peak["_ctr"] * 100) if peak["_ctr"] > 0 else 0.0
+            if window_days > th["ctr_decline_window_days"] * 2:
+                # Don't extrapolate too far; cap the comparison window
+                pass
+
+        latest_freq = latest.get("frequency", 0) or 0
+        latest_cpm = latest.get("cpm", 0) or 0
+        first_cpm = observations[0].get("cpm", 0) or 0
+        cpm_rise_pct = ((latest_cpm - first_cpm) / first_cpm * 100) if first_cpm > 0 else 0.0
+
+        reasons = []
+        if decline_pct >= th["ctr_decline_pct"]:
+            reasons.append(f"CTR decline {decline_pct:.1f}% (threshold {th['ctr_decline_pct']}%)")
+        if th["frequency_ceiling"] and latest_freq >= th["frequency_ceiling"]:
+            reasons.append(f"frequency {latest_freq:.1f} >= {th['frequency_ceiling']}")
+        if cpm_rise_pct >= th["cpm_rise_pct"]:
+            reasons.append(f"CPM rise {cpm_rise_pct:.1f}% (threshold {th['cpm_rise_pct']}%)")
+
+        if reasons:
+            flags.append({
+                "creative_key": key,
+                "campaign": latest.get("campaign", ""),
+                "ad_set": latest.get("ad_set", ""),
+                "creative_id": latest.get("creative_id", ""),
+                "peak_ctr_pct": round(peak["_ctr"], 3),
+                "latest_ctr_pct": round(latest["_ctr"], 3),
+                "ctr_decline_pct": round(decline_pct, 1),
+                "frequency": round(latest_freq, 2),
+                "cpm_rise_pct": round(cpm_rise_pct, 1),
+                "reasons": reasons,
+            })
+    flags.sort(key=lambda x: -len(x["reasons"]))
+    return flags
+
+
+def detect_waste(by_campaign: list[dict], target_cac: float | None) -> list[dict]:
+    """Campaigns burning budget without producing return. Three buckets:
+    1. Spend > 0, conversions == 0 across the entire window.
+    2. CAC > 1.5x target.
+    3. CAC > 2.0x median (when target_cac was inferred).
+    """
+    out = []
+    cacs = [c["cac"] for c in by_campaign if c["cac"] is not None]
+    median_cac = statistics.median(cacs) if cacs else None
+    inferred_target = False
+    if target_cac is None and median_cac is not None:
+        target_cac = median_cac * 2.0
+        inferred_target = True
+
+    for c in by_campaign:
+        flags = []
+        if c["spend"] > 50 and c["conversions"] == 0:
+            flags.append("zero-conversion above 50 spend")
+        if c["cac"] is not None and target_cac is not None:
+            if c["cac"] > target_cac * 1.5:
+                flags.append(f"CAC {c['cac']:.2f} > 1.5x target {target_cac:.2f}")
+        if median_cac is not None and c["cac"] is not None and c["cac"] > median_cac * 2.0:
+            flags.append(f"CAC {c['cac']:.2f} > 2x median {median_cac:.2f}")
+        if flags:
+            out.append({**c, "waste_reasons": flags, "target_inferred": inferred_target})
+    return out
+
+
+def detect_icp_mismatch(by_campaign: list[dict], icp_signals: dict[str, list[str]]) -> list[dict]:
+    """Campaign / ad-set names that point at audiences inconsistent with the
+    canonical ICP. Heuristic: tokenize campaign + ad_set names; check whether
+    any token contradicts ICP signals (wrong vertical, wrong size band, wrong
+    role).
+
+    This is intentionally conservative; the operator confirms before any pause.
+    """
+    out = []
+    icp_verticals = set(icp_signals.get("verticals", []))
+    icp_sizes = set(icp_signals.get("sizes", []))
+    icp_roles = set(icp_signals.get("roles", []))
+    if not (icp_verticals or icp_sizes or icp_roles):
+        return out
+    # Common signals that indicate audience targeting in name
+    suspicious_terms = {
+        "consumer", "b2c", "smb-only", "enterprise-only", "fortune-500", "fortune500",
+        "agencies-only", "freelancers", "students", "personal", "individuals",
+    }
+    for c in by_campaign:
+        name = c["campaign"].lower()
+        flags = []
+        # If the campaign name strongly implies a segment that contradicts ICP
+        for sus in suspicious_terms:
+            if sus in name:
+                # Check whether ICP supports it
+                if not any(sus in v or sus in s or sus in r
+                           for v in icp_verticals
+                           for s in icp_sizes
+                           for r in icp_roles):
+                    flags.append(f"audience term '{sus}' not in canonical ICP")
+        # Vertical mismatch if name contains a vertical-shape token not in ICP
+        for token in re.findall(r"[a-z]{4,}", name):
+            for v in icp_verticals:
+                if v and token == v:
+                    break
+            else:
+                # Token matches a vertical-shape but not in ICP — heuristic
+                if token in {"healthcare", "fintech", "edtech", "ecommerce",
+                             "real-estate", "manufacturing", "retail", "hospitality"}:
+                    if not any(token in v for v in icp_verticals):
+                        flags.append(f"vertical '{token}' in campaign name not in ICP")
+                        break
+        if flags:
+            out.append({**c, "icp_mismatch_reasons": flags})
+    return out
+
+
+def detect_positioning_drift(by_campaign: list[dict],
+                             positioning: dict[str, list[str]]) -> list[dict]:
+    """Campaigns whose names suggest they push messaging that contradicts the
+    canonical positioning. Heuristic: campaign name contains terms that match
+    none of the canonical anchors AND match a known status-quo / off-position
+    framing.
+    """
+    out = []
+    anchors = set(positioning.get("anchors", []))
+    cat = " ".join(positioning.get("category", []))
+    if not anchors:
+        return out
+    drift_terms = {
+        "all-in-one", "everything-in-one-place", "one-platform-fits-all",
+        "any-team", "any-business", "any-size",
+        "cheap", "discount", "lowest-price", "free-forever",
+    }
+    for c in by_campaign:
+        name = c["campaign"].lower()
+        # Tokens 5+ chars that appear in the campaign name
+        tokens = set(re.findall(r"[a-z]{5,}", name))
+        anchor_overlap = tokens & anchors
+        flags = []
+        if not anchor_overlap and c["spend"] > 100:
+            # Spend without surfacing canonical category language
+            flags.append(f"campaign name shares no anchor with canonical positioning ({sorted(list(anchors))[:5]})")
+        for dt in drift_terms:
+            if dt in name:
+                flags.append(f"campaign name uses off-position term '{dt}'")
+        if flags:
+            out.append({**c, "drift_reasons": flags, "canonical_category": cat or "<not extracted>"})
+    return out
+
+
+def channel_fit_note(channel: str, by_campaign: list[dict]) -> str:
+    """Return a one-paragraph note on whether the campaign mix fits the
+    intent-vs-interest pattern for this channel.
+    """
+    intent_channels = {"google-search"}
+    interest_channels = {"meta-paid-social", "linkedin-sponsored", "tiktok", "x", "reddit", "google-display", "google-pmax"}
+    if channel in intent_channels:
+        return ("This channel buys intent. The right KPIs are cost-per-qualified-lead, "
+                "MQL-to-SQL rate, and impression-share for high-intent queries. "
+                "Holding paid-search to brand-awareness KPIs (reach, frequency) is a "
+                "category mistake; the buyer triggered the impression. See pattern: "
+                "intent-vs-interest-targeting.")
+    if channel in interest_channels:
+        return ("This channel buys interest. Last-click CAC undercounts impact; the "
+                "right KPIs are assisted conversions, branded-search lift, cohort-level "
+                "CAC over a 60-90 day window, and audience overlap with closed-won. "
+                "Holding paid-social to direct-response KPIs alone overshoots the cut "
+                "decision against the wrong number. See patterns: "
+                "intent-vs-interest-targeting, incrementality-not-attribution.")
+    return ("Channel mapping unknown; defaulting to interest-channel diagnostic. "
+            "Update FATIGUE_THRESHOLDS in ad-diagnose with channel-specific tuning.")
+
+
+def render_diagnostic_md(*,
+                         client: str,
+                         channel: str,
+                         export_path: str,
+                         window: int,
+                         target_cac: float | None,
+                         ltv: float | None,
+                         by_campaign: list[dict],
+                         waste_flags: list[dict],
+                         fatigue_flags: list[dict],
+                         icp_flags: list[dict],
+                         drift_flags: list[dict],
+                         icp_signals: dict[str, list[str]],
+                         positioning: dict[str, list[str]],
+                         channel_note: str,
+                         today: str) -> str:
+    total_spend = sum(c["spend"] for c in by_campaign)
+    total_conv = sum(c["conversions"] for c in by_campaign)
+    obs_cac = (total_spend / total_conv) if total_conv > 0 else None
+
+    lines = []
+    lines.append("---")
+    lines.append(f"diagnostic_id: {client}-ads-{channel}-{today}")
+    lines.append(f"channel: {channel}")
+    lines.append(f"window: {window}")
+    lines.append(f"export_path: {export_path}")
+    lines.append("substrate_layers_read: [icp, positioning, voc, competitive, brand-voice]")
+    lines.append("patterns_applied: [creative-fatigue-window, intent-vs-interest-targeting, incrementality-not-attribution]")
+    lines.append("contradictions_resolved: [no-decision-vs-named-competitor]")
+    lines.append("diagnostic_summary:")
+    lines.append(f"  total_spend_usd: {round(total_spend, 2)}")
+    lines.append(f"  total_conversions: {round(total_conv, 1)}")
+    lines.append(f"  observed_cac_usd: {round(obs_cac, 2) if obs_cac is not None else 'null'}")
+    lines.append(f"  target_cac_usd: {round(target_cac, 2) if target_cac is not None else 'null'}")
+    lines.append(f"  waste_flag_count: {len(waste_flags)}")
+    lines.append(f"  fatigue_flag_count: {len(fatigue_flags)}")
+    lines.append(f"  icp_mismatch_flag_count: {len(icp_flags)}")
+    lines.append(f"  positioning_drift_flag_count: {len(drift_flags)}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# ad-diagnose: {client} | {channel} | {today}")
+    lines.append("")
+    lines.append("## Executive summary")
+    lines.append("")
+    summary_bits = []
+    if obs_cac and target_cac:
+        delta = (obs_cac - target_cac) / target_cac * 100
+        if delta > 20:
+            summary_bits.append(f"Observed CAC is {delta:+.1f}% off target; the account is paying more per conversion than the target supports.")
+        elif delta < -20:
+            summary_bits.append(f"Observed CAC is {delta:+.1f}% under target; check whether the target is calibrated.")
+        else:
+            summary_bits.append(f"Observed CAC is within 20% of target ({delta:+.1f}%).")
+    if waste_flags:
+        summary_bits.append(f"{len(waste_flags)} campaign(s) flagged for waste; combined spend at risk: ${sum(c['spend'] for c in waste_flags):,.0f}.")
+    if fatigue_flags:
+        summary_bits.append(f"{len(fatigue_flags)} creative(s) flagged for fatigue against {channel} thresholds.")
+    if icp_flags:
+        summary_bits.append(f"{len(icp_flags)} campaign(s) appear to target audiences outside the canonical ICP.")
+    if drift_flags:
+        summary_bits.append(f"{len(drift_flags)} campaign(s) appear to push messaging off the canonical positioning.")
+    if not summary_bits:
+        summary_bits.append("No flags above thresholds. Account in normal operating range; continue regular fatigue monitoring.")
+    for b in summary_bits:
+        lines.append(f"- {b}")
+    lines.append("")
+    lines.append("Source: `clients/" + client + "/02-icp.md`, `clients/" + client + "/01-position.md`, `clients/" + client + "/04-competitive.md`.")
+    lines.append("")
+
+    lines.append("## Per-campaign aggregate")
+    lines.append("")
+    lines.append("| Campaign | Spend | Conv | CAC | Conv-Value | ROAS | CTR% |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    for c in by_campaign:
+        cac_s = f"{c['cac']:.2f}" if c["cac"] is not None else "—"
+        roas_s = f"{c['roas']:.2f}" if c["roas"] is not None else "—"
+        lines.append(f"| `{c['campaign']}` | ${c['spend']:,.2f} | {c['conversions']:.0f} | ${cac_s} | ${c['conv_value']:,.2f} | {roas_s} | {c['ctr_pct']:.2f} |")
+    lines.append("")
+
+    lines.append("## Waste candidates")
+    lines.append("")
+    if not waste_flags:
+        lines.append("None above threshold.")
+    else:
+        lines.append("Threshold: spend > $50 and zero conversions, OR CAC > 1.5x target, OR CAC > 2x median.")
+        lines.append("Source for target: `clients/" + client + "/ads/config/target-cac.yaml` (or inferred 2x median when absent).")
+        lines.append("")
+        for c in waste_flags:
+            lines.append(f"- `{c['campaign']}` (spend ${c['spend']:,.2f}, conv {c['conversions']:.0f}, CAC ${c['cac'] or 0:.2f})")
+            for r in c["waste_reasons"]:
+                lines.append(f"  - {r}")
+            if c.get("target_inferred"):
+                lines.append("  - target CAC was inferred from observed median; calibrate via `clients/" + client + "/ads/config/target-cac.yaml`.")
+    lines.append("")
+
+    lines.append("## Fatigue candidates")
+    lines.append("")
+    th = FATIGUE_THRESHOLDS.get(channel, FATIGUE_THRESHOLDS["meta-paid-social"])
+    lines.append(f"Channel thresholds for `{channel}`:")
+    lines.append(f"- CTR decline >= {th['ctr_decline_pct']}% over {th['ctr_decline_window_days']} days from peak")
+    if th["frequency_ceiling"]:
+        lines.append(f"- Frequency >= {th['frequency_ceiling']}")
+    lines.append(f"- CPM rise >= {th['cpm_rise_pct']}% from window start")
+    lines.append("")
+    lines.append("Pattern grounding: `knowledge/patterns/creative-fatigue-window.md`.")
+    lines.append("")
+    if not fatigue_flags:
+        lines.append("None above threshold.")
+    else:
+        for f in fatigue_flags:
+            lines.append(f"- `{f['creative_key']}` (campaign `{f['campaign']}`)")
+            for r in f["reasons"]:
+                lines.append(f"  - {r}")
+            lines.append(f"  - peak_ctr={f['peak_ctr_pct']}%  latest_ctr={f['latest_ctr_pct']}%  freq={f['frequency']}")
+    lines.append("")
+
+    lines.append("## ICP-mismatch flags")
+    lines.append("")
+    lines.append("Source: `clients/" + client + "/02-icp.md`.")
+    if icp_signals:
+        lines.append("")
+        lines.append("Canonical ICP signals read:")
+        for k, v in icp_signals.items():
+            if v:
+                lines.append(f"- {k}: {', '.join(sorted(set(v))[:8])}")
+        lines.append("")
+    if not icp_flags:
+        lines.append("None above threshold.")
+    else:
+        for c in icp_flags:
+            lines.append(f"- `{c['campaign']}` (spend ${c['spend']:,.2f})")
+            for r in c["icp_mismatch_reasons"]:
+                lines.append(f"  - {r}")
+    lines.append("")
+
+    lines.append("## Positioning-drift flags")
+    lines.append("")
+    lines.append("Source: `clients/" + client + "/01-position.md`.")
+    if positioning.get("statement"):
+        lines.append("")
+        lines.append("Canonical statement (excerpt):")
+        for s in positioning["statement"][:3]:
+            lines.append(f"> {s}")
+        lines.append("")
+    if not drift_flags:
+        lines.append("None above threshold.")
+    else:
+        for c in drift_flags:
+            lines.append(f"- `{c['campaign']}` (spend ${c['spend']:,.2f})")
+            for r in c["drift_reasons"]:
+                lines.append(f"  - {r}")
+            if c.get("canonical_category"):
+                lines.append(f"  - canonical category: {c['canonical_category']}")
+    lines.append("")
+
+    lines.append("## Channel-fit note")
+    lines.append("")
+    lines.append(channel_note)
+    lines.append("")
+
+    lines.append("## Contradiction resolution")
+    lines.append("")
+    lines.append("Pattern reference: `knowledge/contradictions/no-decision-vs-named-competitor.md`.")
+    lines.append("")
+    lines.append("This diagnostic does not pick a global position; it surfaces both. "
+                 "If the account is dominated by competitor-comparison search ads (Position B: "
+                 "battle cards as workflow primitive), the recommendation is to confirm that "
+                 "pipeline losses are competitive (not no-decision) before scaling that spend.")
+    lines.append("If the account is dominated by category-broad prospecting (Position A: "
+                 "no-decision is the real competitor), the recommendation is to ensure the "
+                 "creative establishes the problem-worth-solving before any feature claim.")
+    lines.append("")
+
+    lines.append("## Recommended next moves")
+    lines.append("")
+    moves = []
+    for c in waste_flags[:5]:
+        moves.append((c["spend"], f"PAUSE candidate: `{c['campaign']}` — {c['waste_reasons'][0]}. Cite: clients/{client}/ads/diagnostics/{channel}-{today}.md §waste."))
+    for f in fatigue_flags[:5]:
+        moves.append((0, f"REFRESH candidate: `{f['creative_key']}` — {f['reasons'][0]}. Brief into `ad-creative-design --client {client} --channel {channel}`."))
+    for c in drift_flags[:3]:
+        moves.append((0, f"RE-WRITE candidate: `{c['campaign']}` — {c['drift_reasons'][0]}. Re-brief from `clients/{client}/01-position.md`."))
+    if not moves:
+        moves.append((0, "No structural changes recommended; continue weekly fatigue monitoring."))
+    for _, m in sorted(moves, reverse=True):
+        lines.append(f"- {m}")
+    lines.append("")
+
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `ad-spend-allocate` — consume the per-campaign CAC table and propose channel-level allocation.")
+    lines.append("- `ad-creative-design` — brief replacement creatives from positioning + status-quo + buyer-state.")
+    lines.append("- `ad-fatigue-monitor` — schedule weekly fatigue scan; this diagnostic is the foundational read.")
+    lines.append("- `routines/ad-fatigue-routine.md` — operating cadence for the fatigue scan.")
+    lines.append("- `routines/ad-allocation-routine.md` — quarterly allocation review tied to `goals/ledger.md`.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="ad-diagnose")
+    p.add_argument("--client", required=True)
+    p.add_argument("--export", required=True)
+    p.add_argument("--channel", required=True)
+    p.add_argument("--target-cac", type=float, default=None)
+    p.add_argument("--ltv", type=float, default=None)
+    p.add_argument("--window", type=int, default=30)
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Refusal: missing canonical positioning
+    pos = read_substrate_layer(args.client, "01-position.md")
+    if pos is None:
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/01-position.md not found. "
+                      f"Run positioning-forge first; ad-diagnose has no canonical to gate against.")
+
+    # Refusal: missing canonical ICP
+    icp = read_substrate_layer(args.client, "02-icp.md")
+    if icp is None:
+        return refuse("missing-icp",
+                      f"clients/{args.client}/02-icp.md not found. "
+                      f"Run icp-cut first; ad-diagnose cannot detect ICP-mismatch without it.")
+
+    # Soft check: freshness
+    freshness = parse_index_freshness(args.client)
+    stale = [k for k, v in freshness.items() if v == "stale"]
+    if stale:
+        sys.stderr.write(f"  warn: substrate layers marked stale: {', '.join(stale)} "
+                         f"(see clients/{args.client}/00-INDEX.md). Diagnostic will run; refresh recommended.\n")
+
+    # Refusal: missing or empty export
+    export_path = Path(args.export)
+    if not export_path.is_file():
+        return refuse("export-missing", f"path not found: {args.export}")
+    rows, missing_headers = load_export(export_path)
+    if missing_headers:
+        return refuse("required-header-missing", f"CSV missing required headers: {missing_headers}")
+    if not rows:
+        return refuse("export-empty", f"export file has no data rows: {args.export}")
+
+    # Read substrate signals
+    icp_signals = extract_icp_signals(icp)
+    positioning = extract_positioning_phrases(pos)
+
+    # Aggregate + run detectors
+    by_campaign = aggregate_by_campaign(rows)
+    waste_flags = detect_waste(by_campaign, args.target_cac)
+    fatigue_flags = detect_fatigue_per_creative(rows, args.channel)
+    icp_flags = detect_icp_mismatch(by_campaign, icp_signals)
+    drift_flags = detect_positioning_drift(by_campaign, positioning)
+    note = channel_fit_note(args.channel, by_campaign)
+
+    # Render and write
+    out_dir = Path(args.out) if args.out else (SUBSTRATE_ROOT / "clients" / args.client / "ads" / "diagnostics")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{args.channel}-{today}.md"
+
+    md = render_diagnostic_md(
+        client=args.client,
+        channel=args.channel,
+        export_path=str(export_path),
+        window=args.window,
+        target_cac=args.target_cac,
+        ltv=args.ltv,
+        by_campaign=by_campaign,
+        waste_flags=waste_flags,
+        fatigue_flags=fatigue_flags,
+        icp_flags=icp_flags,
+        drift_flags=drift_flags,
+        icp_signals=icp_signals,
+        positioning=positioning,
+        channel_note=note,
+        today=today,
+    )
+    out_path.write_text(md, encoding="utf-8")
+
+    sys.stderr.write(f"\n[ad-diagnose] wrote {out_path}\n")
+    sys.stderr.write(f"  campaigns: {len(by_campaign)}  waste: {len(waste_flags)}  "
+                     f"fatigue: {len(fatigue_flags)}  icp-mismatch: {len(icp_flags)}  "
+                     f"positioning-drift: {len(drift_flags)}\n")
+
+    print(str(out_path))
+
+    # Exit 1 if any flags above material thresholds (operator review required)
+    flag_total = len(waste_flags) + len(fatigue_flags) + len(icp_flags) + len(drift_flags)
+    if flag_total >= 3:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

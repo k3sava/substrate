@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# substrate-dashboard — regenerate the static dashboard
+#
+# Usage: substrate-dashboard [--open]
+#
+# Reads goals/ledger.md, goals/why-this-matters.yaml, skills/, and clients/<client>/.
+#
+# Configure via env vars:
+#   SUBSTRATE_ROOT — repo root (default: derived from this script's location)
+#   FLYWHEEL_ROOT  — deprecated alias for SUBSTRATE_ROOT (still accepted)
+#   DASHBOARD_OUT  — path to write index.html to (default: $SUBSTRATE_ROOT/dashboard/index.html)
+#   DASHBOARD_URL  — public URL for --open (default: file:// local path)
+
+set -uo pipefail
+
+# Backwards-compat: accept FLYWHEEL_ROOT as deprecated alias for SUBSTRATE_ROOT.
+if [ -n "${FLYWHEEL_ROOT:-}" ] && [ -z "${SUBSTRATE_ROOT:-}" ]; then
+  echo "DEPRECATED: FLYWHEEL_ROOT is deprecated; use SUBSTRATE_ROOT." >&2
+  SUBSTRATE_ROOT="$FLYWHEEL_ROOT"
+fi
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+GEN="$SUBSTRATE_ROOT/dashboard/generate.mjs"
+OUT="${DASHBOARD_OUT:-$SUBSTRATE_ROOT/dashboard/index.html}"
+URL="${DASHBOARD_URL:-file://$OUT}"
+
+if [ ! -f "$GEN" ]; then
+  echo "dashboard generator not found: $GEN" >&2
+  exit 1
+fi
+
+echo "→ regenerating substrate dashboard..." >&2
+node "$GEN" 2>&1 | tail -5
+
+if [ -f "$OUT" ]; then
+  size=$(wc -c < "$OUT" | tr -d ' ')
+  echo "  ✓ wrote $OUT ($size bytes)" >&2
+  echo "  URL: $URL" >&2
+else
+  echo "  ✗ output file missing: $OUT" >&2
+  exit 1
+fi
+
+if [ "${1:-}" = "--open" ]; then
+  open "$URL"
+fi

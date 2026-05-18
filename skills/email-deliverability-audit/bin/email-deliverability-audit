@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# email-deliverability-audit — real DNS lookups for SPF/DKIM/DMARC, severity-tiered findings.
+#
+# Usage:
+#   email-deliverability-audit --client <c> --domain <domain> \
+#     [--subdomains <a,b,c>] [--dkim-selectors <s1,s2,...>] \
+#     [--send-log <path>] [--out <path>]
+#
+# Exit codes:
+#   0 — audit complete, no critical findings
+#   1 — audit complete with critical findings (operator queue)
+#   2 — input file not found
+#   3 — substrate-gap or hard refusal
+#   4 — invalid args
+#   5 — environment error (dig unavailable)
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+export FLYWHEEL_ROOT="$SUBSTRATE_ROOT"
+
+# shellcheck disable=SC1091
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+DOMAIN=""
+SUBDOMAINS=""
+DKIM_SELECTORS_RAW=""
+SEND_LOG=""
+OUT=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)         CLIENT="$2"; shift 2 ;;
+    --domain)         DOMAIN="$2"; shift 2 ;;
+    --subdomains)     SUBDOMAINS="$2"; shift 2 ;;
+    --dkim-selectors) DKIM_SELECTORS_RAW="$2"; shift 2 ;;
+    --send-log)       SEND_LOG="$2"; shift 2 ;;
+    --out)            OUT="$2"; shift 2 ;;
+    --help|-h)        sed -n '2,15p' "$0" | sed 's/^# //'; exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 4 ;;
+  esac
+done
+
+[ -n "$CLIENT" ] || { echo "REFUSED: --client required" >&2; exit 4; }
+[ -n "$DOMAIN" ] || { echo "REFUSED: --domain required" >&2; exit 4; }
+
+# Locate dig (BSD/macOS bundles it; Linux too). Fall back to host on a degraded path.
+DIG_BIN=""
+if command -v dig >/dev/null 2>&1; then
+  DIG_BIN="dig"
+elif command -v host >/dev/null 2>&1; then
+  DIG_BIN="host"
+else
+  echo "REFUSED: dig or host not on PATH; cannot run real DNS lookups" >&2
+  exit 5
+fi
+
+# Default DKIM selector probe list. Operators add via --dkim-selectors.
+DEFAULT_SELECTORS=(selector1 selector2 google k1 k2 k3 mail dkim s1 s2 mandrill mailgun sendgrid postmark amazonses 200608 default smtpapi)
+
+if [ -n "$DKIM_SELECTORS_RAW" ]; then
+  IFS=',' read -r -a DKIM_SELECTORS <<< "$DKIM_SELECTORS_RAW"
+else
+  DKIM_SELECTORS=("${DEFAULT_SELECTORS[@]}")
+fi
+
+# Subdomain split
+SUBDOMAIN_LIST=()
+if [ -n "$SUBDOMAINS" ]; then
+  IFS=',' read -r -a SUBDOMAIN_LIST <<< "$SUBDOMAINS"
+fi
+
+echo "=== email-deliverability-audit: $DOMAIN ===" >&2
+echo "  client=$CLIENT subdomains=${#SUBDOMAIN_LIST[@]} dkim-selectors=${#DKIM_SELECTORS[@]} send-log=${SEND_LOG:-<none>}" >&2
+
+# Preflight (substrate-light skill — only requires BRIEF.md).
+skill_preflight "email-deliverability-audit" "$CLIENT"
+preflight_rc=$?
+if [ "$preflight_rc" -ne 0 ]; then
+  exit "$preflight_rc"
+fi
+
+TODAY="$(date -u +%Y-%m-%d)"
+
+# Output path
+if [ -z "$OUT" ]; then
+  OUT="$SUBSTRATE_ROOT/clients/$CLIENT/email/audits/deliverability-$DOMAIN-$TODAY.md"
+fi
+mkdir -p "$(dirname "$OUT")"
+
+# DNS query helper. Returns the RDATA-only result for TXT queries, one record per line.
+dns_txt() {
+  local target="$1"
+  if [ "$DIG_BIN" = "dig" ]; then
+    dig +short TXT "$target" 2>/dev/null \
+      | sed 's/^"//; s/"$//; s/" "//g'
+  else
+    host -t TXT "$target" 2>/dev/null \
+      | grep "descriptive text" \
+      | sed 's/.*descriptive text //; s/^"//; s/"$//; s/" "//g'
+  fi
+}
+
+dns_a() {
+  local target="$1"
+  if [ "$DIG_BIN" = "dig" ]; then
+    dig +short A "$target" 2>/dev/null
+  else
+    host -t A "$target" 2>/dev/null \
+      | awk '/has address/ { print $NF }'
+  fi
+}
+
+dns_mx() {
+  local target="$1"
+  if [ "$DIG_BIN" = "dig" ]; then
+    dig +short MX "$target" 2>/dev/null
+  else
+    host -t MX "$target" 2>/dev/null \
+      | awk '/mail is handled/ { print $(NF-1), $NF }'
+  fi
+}
+
+# Resolve domain — refuse if it doesn't exist.
+A_RECORDS="$(dns_a "$DOMAIN")"
+MX_RECORDS="$(dns_mx "$DOMAIN")"
+if [ -z "$A_RECORDS" ] && [ -z "$MX_RECORDS" ]; then
+  echo "REFUSED: $DOMAIN does not resolve (no A, no MX). Audit cannot proceed against a non-existent domain." >&2
+  exit 3
+fi
+echo "  ✓ domain resolves (A=$(echo "$A_RECORDS" | head -1), MX=$(echo "$MX_RECORDS" | head -1))" >&2
+
+# --- findings collector ---
+# Each finding is a tab-separated row: severity\tcategory\ttarget\tmessage\tcite
+
+declare -a FINDINGS
+declare -i CRITICAL=0 HIGH=0 MEDIUM=0 LOW=0
+
+add_finding() {
+  local sev="$1" cat="$2" tgt="$3" msg="$4" cite="$5"
+  FINDINGS+=("$sev"$'\t'"$cat"$'\t'"$tgt"$'\t'"$msg"$'\t'"$cite")
+  case "$sev" in
+    critical) CRITICAL=$((CRITICAL+1)) ;;
+    high)     HIGH=$((HIGH+1)) ;;
+    medium)   MEDIUM=$((MEDIUM+1)) ;;
+    low)      LOW=$((LOW+1)) ;;
+  esac
+}
+
+# --- SPF audit ---
+
+audit_spf() {
+  local target="$1"
+  local txt
+  txt="$(dns_txt "$target")"
+  local spf_line
+  spf_line="$(echo "$txt" | grep -E '^v=spf1' | head -1)"
+  if [ -z "$spf_line" ]; then
+    add_finding "high" "spf" "$target" "no SPF record (v=spf1 TXT)" "RFC 7208 §3"
+    return
+  fi
+  echo "    SPF: $spf_line" >&2
+
+  # Lookup count: every include:, a:, mx:, exists:, redirect= and ptr count toward 10-lookup limit.
+  local lookup_count
+  lookup_count="$(echo "$spf_line" \
+    | grep -oE '(^|[[:space:]])(include:|a:|mx:|exists:|redirect=|ptr:)' \
+    | wc -l \
+    | tr -d ' ')"
+  if [ "$lookup_count" -gt 10 ]; then
+    add_finding "critical" "spf" "$target" "SPF record exceeds 10-lookup limit (count=$lookup_count); will permerror" "RFC 7208 §4.6.4"
+  elif [ "$lookup_count" -gt 8 ]; then
+    add_finding "medium" "spf" "$target" "SPF record at $lookup_count lookups; close to permerror limit (10)" "RFC 7208 §4.6.4"
+  fi
+
+  if echo "$spf_line" | grep -qE '(^|[[:space:]])\+all([[:space:]]|$)'; then
+    add_finding "critical" "spf" "$target" "SPF qualifier '+all' (any sender passes); attacker-friendly" "RFC 7208 §4.6.4"
+  elif echo "$spf_line" | grep -qE '(^|[[:space:]])\?all([[:space:]]|$)'; then
+    add_finding "high" "spf" "$target" "SPF qualifier '?all' (neutral); recommend ~all or -all" "RFC 7208 §4.6.4"
+  elif ! echo "$spf_line" | grep -qE '(^|[[:space:]])(\~|\-)all([[:space:]]|$)'; then
+    add_finding "high" "spf" "$target" "SPF record missing -all or ~all qualifier" "RFC 7208 §4.6.4"
+  fi
+}
+
+# --- DKIM audit ---
+
+audit_dkim() {
+  local target="$1"
+  local found=0
+  local found_selectors=()
+  for sel in "${DKIM_SELECTORS[@]}"; do
+    local probe="$sel._domainkey.$target"
+    local txt
+    txt="$(dns_txt "$probe")"
+    if echo "$txt" | grep -qE '^v=DKIM1'; then
+      found=$((found + 1))
+      found_selectors+=("$sel")
+      # Key length check
+      local pubkey
+      pubkey="$(echo "$txt" | grep -oE 'p=[A-Za-z0-9+/=]+' | head -1 | sed 's/^p=//')"
+      if [ -n "$pubkey" ]; then
+        local keylen=${#pubkey}
+        # Base64-encoded RSA public keys: ~216 chars for 1024-bit, ~392 chars for 2048-bit.
+        if [ "$keylen" -lt 250 ]; then
+          add_finding "medium" "dkim" "$probe" "DKIM key appears <2048-bit (base64 length=$keylen); upgrade to 2048-bit RSA" "M3AAWG Email Authentication BCP §3"
+        fi
+      else
+        add_finding "high" "dkim" "$probe" "DKIM record present but no public key (p= empty or revoked)" "RFC 6376"
+      fi
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    add_finding "high" "dkim" "$target" "no DKIM keys found across ${#DKIM_SELECTORS[@]} probed selectors; either no DKIM or non-standard selector" "RFC 6376"
+  else
+    echo "    DKIM: $found selector(s) found: ${found_selectors[*]}" >&2
+  fi
+}
+
+# --- DMARC audit ---
+
+audit_dmarc() {
+  local target="$1"
+  local probe="_dmarc.$target"
+  local txt
+  txt="$(dns_txt "$probe")"
+  local dmarc_line
+  dmarc_line="$(echo "$txt" | grep -E '^v=DMARC1' | head -1)"
+  if [ -z "$dmarc_line" ]; then
+    add_finding "critical" "dmarc" "$probe" "no DMARC record at _dmarc.$target; no policy enforcement, no reporting" "RFC 7489 §6"
+    return
+  fi
+  echo "    DMARC: $dmarc_line" >&2
+
+  local policy
+  policy="$(echo "$dmarc_line" | grep -oE 'p=[a-z]+' | sed 's/^p=//')"
+  case "$policy" in
+    none)       add_finding "high" "dmarc" "$probe" "DMARC policy p=none (monitor only); no enforcement against spoofing" "RFC 7489 §6.3" ;;
+    quarantine) add_finding "low"  "dmarc" "$probe" "DMARC policy p=quarantine; consider escalation to p=reject after monitoring period" "RFC 7489 §6.3" ;;
+    reject)     ;;  # ideal posture
+    *)          add_finding "high" "dmarc" "$probe" "DMARC policy unrecognized: '$policy'" "RFC 7489 §6.3" ;;
+  esac
+
+  # Reporting addresses
+  if ! echo "$dmarc_line" | grep -q 'rua='; then
+    add_finding "high" "dmarc" "$probe" "DMARC missing rua= aggregate reporting target; cannot monitor authentication failures" "RFC 7489 §6.3"
+  fi
+
+  # Subdomain policy
+  if ! echo "$dmarc_line" | grep -q 'sp='; then
+    add_finding "medium" "dmarc" "$probe" "DMARC missing sp= subdomain policy; subdomains inherit p= which may not match intent" "RFC 7489 §6.3"
+  fi
+
+  # Alignment mode (strict vs relaxed)
+  if echo "$dmarc_line" | grep -qE 'adkim=s|aspf=s'; then
+    : # strict — informational
+  fi
+}
+
+# --- run audits ---
+
+declare -a TARGETS=("$DOMAIN")
+if [ "${#SUBDOMAIN_LIST[@]}" -gt 0 ]; then
+  TARGETS+=("${SUBDOMAIN_LIST[@]}")
+fi
+for tgt in "${TARGETS[@]}"; do
+  echo "  → auditing $tgt" >&2
+  audit_spf "$tgt"
+  audit_dkim "$tgt"
+  audit_dmarc "$tgt"
+done
+
+# --- send-log analysis (optional) ---
+
+SEND_LOG_SECTION=""
+if [ -n "$SEND_LOG" ]; then
+  if [ ! -f "$SEND_LOG" ]; then
+    echo "  ! send-log not found: $SEND_LOG (skipping)" >&2
+    SEND_LOG_SECTION="| no send-log provided | | |"
+  else
+    echo "  → analyzing send-log: $SEND_LOG" >&2
+    # Expect header: date,sent,delivered,bounced,complained,opened
+    SEND_LOG_SECTION="$(awk -F',' '
+      NR==1 { for (i=1;i<=NF;i++) col[$i]=i; next }
+      NR>1 {
+        sent += $col["sent"]
+        delivered += $col["delivered"]
+        bounced += $col["bounced"]
+        complained += $col["complained"]
+        opened += $col["opened"]
+      }
+      END {
+        if (sent == 0) { print "| no rows |  |  |"; exit }
+        bounce = (bounced/sent)*100
+        complaint = (complained/delivered)*100
+        open_pct = (opened/delivered)*100
+        printf "| sent | %d | |\n", sent
+        printf "| delivered | %d | |\n", delivered
+        printf "| bounce rate | %.2f%% | thresholds: 2.0%% warn, 5.0%% high (Gmail Postmaster) |\n", bounce
+        printf "| complaint rate | %.3f%% | thresholds: 0.10%% warn, 0.30%% high (Gmail Postmaster) |\n", complaint
+        printf "| open rate | %.1f%% | |\n", open_pct
+      }
+    ' "$SEND_LOG")"
+
+    # Severity flags from send-log
+    BOUNCE_PCT="$(awk -F',' 'NR==1 { for (i=1;i<=NF;i++) col[$i]=i; next } NR>1 { s+=$col["sent"]; b+=$col["bounced"] } END { if (s>0) printf "%.2f", (b/s)*100; else print "0" }' "$SEND_LOG")"
+    COMPLAINT_PCT="$(awk -F',' 'NR==1 { for (i=1;i<=NF;i++) col[$i]=i; next } NR>1 { d+=$col["delivered"]; c+=$col["complained"] } END { if (d>0) printf "%.3f", (c/d)*100; else print "0" }' "$SEND_LOG")"
+
+    if awk "BEGIN{ exit !($BOUNCE_PCT > 5.0) }"; then
+      add_finding "critical" "send-log" "$DOMAIN" "30-day bounce rate $BOUNCE_PCT% exceeds Gmail Postmaster high threshold (5.0%)" "Gmail Postmaster Tools docs"
+    elif awk "BEGIN{ exit !($BOUNCE_PCT > 2.0) }"; then
+      add_finding "high" "send-log" "$DOMAIN" "30-day bounce rate $BOUNCE_PCT% exceeds Gmail Postmaster warn threshold (2.0%)" "Gmail Postmaster Tools docs"
+    fi
+    if awk "BEGIN{ exit !($COMPLAINT_PCT > 0.30) }"; then
+      add_finding "critical" "send-log" "$DOMAIN" "30-day complaint rate $COMPLAINT_PCT% exceeds Gmail Postmaster high threshold (0.30%)" "Gmail Postmaster Tools docs"
+    elif awk "BEGIN{ exit !($COMPLAINT_PCT > 0.10) }"; then
+      add_finding "high" "send-log" "$DOMAIN" "30-day complaint rate $COMPLAINT_PCT% exceeds Gmail Postmaster warn threshold (0.10%)" "Gmail Postmaster Tools docs"
+    fi
+  fi
+fi
+
+# --- write report ---
+
+{
+  cat <<EOF
+---
+asset_type: audit
+audit_type: email-deliverability
+domain: $DOMAIN
+audited_subdomains: [$([ "${#SUBDOMAIN_LIST[@]}" -gt 0 ] && printf '%s, ' "${SUBDOMAIN_LIST[@]}" | sed 's/, $//' || echo "")]
+audit_date: $TODAY
+findings_critical: $CRITICAL
+findings_high: $HIGH
+findings_medium: $MEDIUM
+findings_low: $LOW
+auditor_skill: email-deliverability-audit
+auditor_version: 0.1
+---
+
+# Email deliverability audit, $DOMAIN, $TODAY
+
+## Executive summary
+
+Audited $DOMAIN${SUBDOMAINS:+ and ${#SUBDOMAIN_LIST[@]} subdomain(s)}. SPF, DKIM, and DMARC posture pulled live via DNS. ${SEND_LOG:+Send-log analyzed for the period covered by the input CSV.}
+
+Findings: $CRITICAL critical, $HIGH high, $MEDIUM medium, $LOW low.
+
+The first three actions, ordered by severity, appear in the remediation queue at the bottom of this document.
+
+Per knowledge/patterns/sender-reputation-is-a-domain-asset.md, the sending domain is a multi-year compounding asset. Every finding below is anchored on that frame.
+
+## Authentication posture
+
+| Target | SPF | DKIM | DMARC |
+|---|---|---|---|
+EOF
+  for tgt in "${TARGETS[@]}"; do
+    spf_status="?"
+    dkim_status="?"
+    dmarc_status="?"
+    txt_main="$(dns_txt "$tgt")"
+    if echo "$txt_main" | grep -qE '^v=spf1'; then spf_status="present"; else spf_status="missing"; fi
+    found=0
+    for sel in "${DKIM_SELECTORS[@]}"; do
+      if dns_txt "$sel._domainkey.$tgt" | grep -qE '^v=DKIM1'; then found=$((found+1)); fi
+    done
+    if [ "$found" -gt 0 ]; then dkim_status="$found selector(s)"; else dkim_status="none probed"; fi
+    if dns_txt "_dmarc.$tgt" | grep -qE '^v=DMARC1'; then
+      pol="$(dns_txt "_dmarc.$tgt" | grep -oE 'p=[a-z]+' | sed 's/^p=//' | head -1)"
+      dmarc_status="p=$pol"
+    else
+      dmarc_status="missing"
+    fi
+    echo "| $tgt | $spf_status | $dkim_status | $dmarc_status |"
+  done
+
+  cat <<EOF
+
+## Send-log signals
+
+EOF
+  if [ -n "$SEND_LOG" ]; then
+    echo "| metric | value | note |"
+    echo "|---|---|---|"
+    echo "$SEND_LOG_SECTION"
+  else
+    echo "No \`--send-log\` provided. Re-run with \`--send-log <path>\` to surface bounce-rate and complaint-rate signals against industry thresholds."
+  fi
+
+  cat <<EOF
+
+## Findings by severity
+
+EOF
+  for sev in critical high medium low; do
+    case "$sev" in
+      critical) count=$CRITICAL ;;
+      high)     count=$HIGH ;;
+      medium)   count=$MEDIUM ;;
+      low)      count=$LOW ;;
+    esac
+    if [ "$count" -eq 0 ]; then continue; fi
+    echo "### $sev ($count)"
+    echo ""
+    for f in "${FINDINGS[@]}"; do
+      f_sev="$(echo "$f" | cut -f1)"
+      [ "$f_sev" = "$sev" ] || continue
+      f_cat="$(echo "$f" | cut -f2)"
+      f_tgt="$(echo "$f" | cut -f3)"
+      f_msg="$(echo "$f" | cut -f4)"
+      f_cite="$(echo "$f" | cut -f5)"
+      echo "- **$f_cat / $f_tgt** — $f_msg"
+      echo "  - Reference: $f_cite"
+    done
+    echo ""
+  done
+
+  cat <<EOF
+## Remediation queue
+
+Ordered by severity. Critical findings should be addressed before the next sending wave. High findings within 30 days. Medium findings within 90 days.
+
+EOF
+  i=1
+  for sev in critical high medium low; do
+    for f in "${FINDINGS[@]}"; do
+      f_sev="$(echo "$f" | cut -f1)"
+      [ "$f_sev" = "$sev" ] || continue
+      f_cat="$(echo "$f" | cut -f2)"
+      f_tgt="$(echo "$f" | cut -f3)"
+      f_msg="$(echo "$f" | cut -f4)"
+      echo "$i. [$sev] $f_cat / $f_tgt — $f_msg"
+      i=$((i+1))
+    done
+  done
+
+  cat <<EOF
+
+## Severity rubric
+
+- **Critical**: active deliverability damage. Examples: missing DMARC, +all SPF, SPF lookup overflow, send-log bounce or complaint rates over Gmail Postmaster high thresholds.
+- **High**: compounding damage if unaddressed. Examples: DMARC p=none with no rua reporting, SPF missing -all/~all qualifier, no DKIM detected.
+- **Medium**: posture gap. Examples: 1024-bit DKIM key, missing DMARC sp=, SPF approaching 10-lookup limit.
+- **Low**: best-practice nudge. Examples: DMARC at quarantine (consider escalating to reject after observation), recommended-but-not-required hardening.
+
+## See also
+
+- knowledge/patterns/sender-reputation-is-a-domain-asset.md
+- skills/email-list-hygiene/SKILL.md (list-side complement)
+- skills/email-engagement-decay-watcher/SKILL.md (when decay points at deliverability)
+- routines/email-deliverability-monthly.md
+EOF
+} > "$OUT"
+
+echo "" >&2
+echo "  → wrote $OUT" >&2
+echo "  summary: $CRITICAL critical | $HIGH high | $MEDIUM medium | $LOW low" >&2
+
+if [ "$CRITICAL" -gt 0 ]; then
+  echo "FAIL: $OUT ($CRITICAL critical findings — operator queue)"
+  exit 1
+fi
+echo "PASS: $OUT (no critical findings)"
+exit 0

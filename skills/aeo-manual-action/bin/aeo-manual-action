@@ -1,0 +1,988 @@
+#!/usr/bin/env python3
+"""aeo-manual-action — track off-domain mentions across G2 / Trustpilot / Reddit /
+Hacker News / X-Twitter / blog mentions / YouTube / podcasts.
+
+Real RSS / search-query parsing. Reads clients/<client>/aeo/sources.yaml for the named
+monitor list. Outputs density + sentiment report and a propagation plan.
+
+Modes:
+  surface-map   per-prompt surface enumeration with current presence
+  action-plan   propagation plan keyed to one prompt
+  measure       pull current density, compute rolling medians, flag drift
+  monitor       headless mode (cron / LaunchAgent friendly)
+
+Refuses without:
+  - clients/<client>/aeo/sources.yaml (monitor list)
+  - clients/<client>/aeo/target-prompts.md (prompt anchor)
+
+Patterns applied:
+  - aeo-triangle (presence + relevance + manual-action propagation)
+  - distribution-as-moat (off-domain mirror discipline)
+  - agents-as-product-users (LLMs cite passages from off-domain surfaces)
+  - passage-as-citation-unit (the cited passage often lives off-domain)
+
+Citation churn caveat (Lily Ray): 74% of LLM-cited sources rotate weekly. The skill
+measures rolling 30-day medians, not single-day counts.
+
+Exit codes:
+  0  density report / action plan / surface map written
+  1  written with warnings (decay flag, no fresh mentions)
+  2  network or feed parse error (degraded)
+  3  refused (missing sources.yaml, missing target-prompts.md, missing prompt-id)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import statistics
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+os.environ["SUBSTRATE_ROOT"] = str(SUBSTRATE_ROOT)
+os.environ.setdefault("FLYWHEEL_ROOT", str(SUBSTRATE_ROOT))
+
+
+# ---------- minimal YAML parsing (zero deps) ----------
+
+def parse_minimal_yaml(text: str) -> dict:
+    root: dict = {}
+    stack: list[tuple[int, dict | list]] = [(-1, root)]
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        line = re.sub(r"(\s)#.*$", r"\1", raw).rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            value_part = stripped[2:].strip()
+            if isinstance(parent, list):
+                if ":" in value_part and not value_part.endswith(":"):
+                    k, _, v = value_part.partition(":")
+                    new_map: dict = {k.strip(): _scalar(v.strip())}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+                elif value_part:
+                    parent.append(_scalar(value_part))
+                else:
+                    new_map = {}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+            i += 1
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if not val:
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines):
+                    next_line = lines[j]
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent > indent and next_line.strip().startswith("- "):
+                        new_list: list = []
+                        if isinstance(parent, dict):
+                            parent[key] = new_list
+                        stack.append((indent, new_list))
+                    else:
+                        new_map = {}
+                        if isinstance(parent, dict):
+                            parent[key] = new_map
+                        stack.append((indent, new_map))
+                else:
+                    if isinstance(parent, dict):
+                        parent[key] = {}
+            else:
+                if isinstance(parent, dict):
+                    parent[key] = _scalar_or_inline(val)
+        i += 1
+    return root
+
+
+def _scalar(v: str):
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        return v[1:-1]
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    if v.lower() in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    if re.fullmatch(r"-?\d+\.\d+", v):
+        return float(v)
+    return v
+
+
+def _scalar_or_inline(v: str):
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        if not inner:
+            return []
+        return [_scalar(p.strip()) for p in inner.split(",")]
+    return _scalar(v)
+
+
+def load_yaml(path: Path) -> dict | None:
+    try:
+        import yaml  # type: ignore[import-not-found]
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    except ImportError:
+        pass
+    return parse_minimal_yaml(path.read_text(encoding="utf-8"))
+
+
+# ---------- target-prompts.md parser (mirrors aeo-relevance) ----------
+
+def strip_frontmatter(text: str) -> tuple[dict, str]:
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}, text
+    return {}, text[end + 4:].lstrip()
+
+
+def load_target_prompts(client: str, override: Path | None = None) -> list[dict]:
+    if override and override.is_file():
+        path = override
+    else:
+        path = SUBSTRATE_ROOT / "clients" / client / "aeo" / "target-prompts.md"
+    if not path.is_file():
+        return []
+    text = path.read_text(encoding="utf-8")
+    _, body = strip_frontmatter(text)
+    prompts: list[dict] = []
+    blocks = re.split(r"^##\s+", body, flags=re.MULTILINE)[1:]
+    for block in blocks:
+        lines = block.strip().splitlines()
+        if not lines:
+            continue
+        head = lines[0]
+        m = re.match(r"^([\w\-_.]+)\s*[:\-]?\s*(.+)?$", head)
+        prompt_id = m.group(1) if m else head[:30]
+        intent_label = (m.group(2) or "").strip() if m else ""
+        prompt_text_lines = []
+        source = ""
+        for l in lines[1:]:
+            if l.strip().startswith("Source:") or l.strip().startswith("source:"):
+                source = l.split(":", 1)[1].strip()
+            elif l.strip().startswith("Intent:") or l.strip().startswith("intent:"):
+                if not intent_label:
+                    intent_label = l.split(":", 1)[1].strip()
+            else:
+                prompt_text_lines.append(l)
+        prompts.append({
+            "id": prompt_id, "intent": intent_label,
+            "text": "\n".join(prompt_text_lines).strip(), "source": source,
+        })
+    return prompts
+
+
+# ---------- HTTP / RSS / Atom fetch ----------
+
+DEFAULT_TIMEOUT = 15
+USER_AGENT = "substrate-aeo-manual-action/0.2 (+https://substrate.iamkesava.com)"
+
+
+def fetch_url(url: str, timeout: int = DEFAULT_TIMEOUT) -> tuple[bytes, str | None]:
+    """Fetch a URL. Returns (body, error). Body is empty bytes on error."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
+                                                    "Accept": "application/rss+xml, application/atom+xml, text/xml, application/xml, application/json, text/html"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(), None
+    except urllib.error.HTTPError as e:
+        return b"", f"http {e.code} on {url}"
+    except urllib.error.URLError as e:
+        return b"", f"url error {e.reason} on {url}"
+    except Exception as e:
+        return b"", f"fetch error {e} on {url}"
+
+
+def parse_rss_atom(body: bytes) -> list[dict]:
+    """Parse RSS 2.0 or Atom feed; return list of {title, link, pub_date, summary}."""
+    if not body:
+        return []
+    try:
+        # Strip BOM if present
+        if body[:3] == b"\xef\xbb\xbf":
+            body = body[3:]
+        root = ET.fromstring(body)
+    except ET.ParseError as e:
+        sys.stderr.write(f"  warn: feed parse error: {e}\n")
+        return []
+    items: list[dict] = []
+    # Atom (default namespace handling)
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    if root.tag.endswith("}feed") or root.tag == "feed":
+        for entry in root.findall("atom:entry", ns):
+            title_el = entry.find("atom:title", ns)
+            link_el = entry.find("atom:link", ns)
+            updated_el = entry.find("atom:updated", ns)
+            published_el = entry.find("atom:published", ns)
+            summary_el = entry.find("atom:summary", ns)
+            content_el = entry.find("atom:content", ns)
+            link = ""
+            if link_el is not None:
+                link = link_el.get("href") or (link_el.text or "")
+            items.append({
+                "title": (title_el.text if title_el is not None else "") or "",
+                "link": link,
+                "pub_date": (published_el.text if published_el is not None
+                             else (updated_el.text if updated_el is not None else "")) or "",
+                "summary": (summary_el.text if summary_el is not None
+                            else (content_el.text if content_el is not None else "")) or "",
+            })
+    else:
+        # RSS 2.0
+        channel = root.find("channel")
+        if channel is None:
+            channel = root
+        for item in channel.findall("item"):
+            title_el = item.find("title")
+            link_el = item.find("link")
+            pub_el = item.find("pubDate")
+            desc_el = item.find("description")
+            items.append({
+                "title": (title_el.text if title_el is not None else "") or "",
+                "link": (link_el.text if link_el is not None else "") or "",
+                "pub_date": (pub_el.text if pub_el is not None else "") or "",
+                "summary": (desc_el.text if desc_el is not None else "") or "",
+            })
+    return items
+
+
+def parse_pub_date(raw: str) -> datetime | None:
+    """Parse RFC 822, ISO 8601, and common date formats."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Try ISO 8601
+    for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z",
+                "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"]:
+        try:
+            d = datetime.strptime(raw, fmt)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return d
+        except ValueError:
+            continue
+    # Try RFC 822
+    for fmt in ["%a, %d %b %Y %H:%M:%S %Z", "%a, %d %b %Y %H:%M:%S %z",
+                "%d %b %Y %H:%M:%S %Z", "%d %b %Y %H:%M:%S %z"]:
+        try:
+            d = datetime.strptime(raw, fmt)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return d
+        except ValueError:
+            continue
+    return None
+
+
+# ---------- mention detection + sentiment ----------
+
+POSITIVE_WORDS = {
+    "love", "great", "excellent", "amazing", "fantastic", "best", "awesome",
+    "recommend", "happy", "perfect", "smooth", "intuitive", "easy", "fast",
+    "reliable", "powerful", "useful", "effective", "favorite", "impressed",
+}
+
+NEGATIVE_WORDS = {
+    "hate", "bad", "terrible", "worst", "awful", "broken", "buggy", "slow",
+    "crash", "issue", "problem", "fail", "disappointed", "frustrated", "angry",
+    "expensive", "overpriced", "useless", "confusing", "missing", "lacks",
+    "complaint", "support is bad", "no support", "billing issue",
+}
+
+
+def detect_mentions(items: list[dict], aliases: list[str], window_days: int) -> list[dict]:
+    """For each item in feed, check if any alias is mentioned, attach sentiment + freshness."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    mentions: list[dict] = []
+    aliases_lower = [a.lower() for a in aliases if a]
+    for item in items:
+        text = ((item.get("title") or "") + " " + (item.get("summary") or "")).lower()
+        # Check each alias as a word boundary match
+        matched_alias = None
+        for a in aliases_lower:
+            if not a:
+                continue
+            if re.search(r"\b" + re.escape(a) + r"\b", text):
+                matched_alias = a
+                break
+        if not matched_alias:
+            continue
+        pub_dt = parse_pub_date(item.get("pub_date") or "")
+        if pub_dt and pub_dt < cutoff:
+            continue
+        # Sentiment
+        pos = sum(1 for w in POSITIVE_WORDS if re.search(r"\b" + re.escape(w) + r"\b", text))
+        neg = sum(1 for w in NEGATIVE_WORDS if re.search(r"\b" + re.escape(w) + r"\b", text))
+        if pos > neg + 1:
+            sentiment = "positive"
+        elif neg > pos + 1:
+            sentiment = "negative"
+        else:
+            sentiment = "neutral"
+        mentions.append({
+            "title": item.get("title", "").strip()[:200],
+            "link": item.get("link", "").strip(),
+            "pub_date": item.get("pub_date", "").strip(),
+            "pub_dt": pub_dt.isoformat() if pub_dt else None,
+            "alias_matched": matched_alias,
+            "sentiment": sentiment,
+            "pos_score": pos,
+            "neg_score": neg,
+            "summary_excerpt": (item.get("summary") or "").strip().replace("\n", " ")[:200],
+        })
+    return mentions
+
+
+# ---------- sources iteration ----------
+
+def iterate_sources(sources_yaml: dict) -> list[tuple[str, str, str, str]]:
+    """Yield (surface, name, url, tier) tuples from sources.yaml."""
+    out: list[tuple[str, str, str, str]] = []
+    sources = sources_yaml.get("sources", {}) or {}
+    # Reddit
+    for entry in (sources.get("reddit") or []):
+        if isinstance(entry, dict):
+            name = entry.get("subreddit") or entry.get("name") or "reddit"
+            url = entry.get("rss") or f"https://www.reddit.com/r/{name}/.rss"
+            tier = entry.get("tier") or "T2"
+            out.append(("reddit", str(name), str(url), str(tier)))
+    # Hacker News
+    for entry in (sources.get("hackernews") or []):
+        if isinstance(entry, dict):
+            name = entry.get("name") or "hn"
+            url = entry.get("feed") or entry.get("url") or ""
+            tier = entry.get("tier") or "T1"
+            if url:
+                out.append(("hackernews", str(name), str(url), str(tier)))
+    # RSS Feeds (general blogs / podcasts / etc)
+    for entry in (sources.get("rss_feeds") or []):
+        if isinstance(entry, dict):
+            name = entry.get("name") or "rss"
+            url = entry.get("url") or ""
+            tier = entry.get("tier") or "T2"
+            if url:
+                out.append(("rss", str(name), str(url), str(tier)))
+    # G2 reviews
+    g2 = sources.get("g2") or {}
+    if isinstance(g2, dict) and g2.get("reviews_rss"):
+        out.append(("g2", "reviews", str(g2["reviews_rss"]), "T1"))
+    # Search queries (Google News + DuckDuckGo)
+    sq = sources.get("search_queries") or {}
+    if isinstance(sq, dict):
+        for q in (sq.get("google_news") or []):
+            if isinstance(q, str):
+                # Google News RSS feed for search query
+                qenc = urllib.parse.quote(q)
+                url = f"https://news.google.com/rss/search?q={qenc}&hl=en-US&gl=US&ceid=US:en"
+                out.append(("google_news", q[:60], url, "T1"))
+        for q in (sq.get("duckduckgo") or []):
+            if isinstance(q, str):
+                # DDG does not expose a public RSS for search; we record it as a source-of-truth
+                # placeholder. Operator can wire a real feed later via rss_feeds.
+                out.append(("duckduckgo", q[:60], "https://duckduckgo.com/?q=" + urllib.parse.quote(q),
+                            "T2"))
+    return out
+
+
+# ---------- cache + rolling median ----------
+
+def write_cache(client: str, today: str, surface_results: list[dict]) -> Path:
+    cache_dir = SUBSTRATE_ROOT / "clients" / client / "aeo" / "citation-log"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{today}.json"
+    data = {
+        "client": client,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "surfaces": surface_results,
+    }
+    cache_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return cache_path
+
+
+def load_cache_history(client: str, days: int = 90) -> list[dict]:
+    cache_dir = SUBSTRATE_ROOT / "clients" / client / "aeo" / "citation-log"
+    if not cache_dir.is_dir():
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out: list[dict] = []
+    for f in sorted(cache_dir.glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            captured = data.get("captured_at")
+            if captured:
+                try:
+                    dt = datetime.fromisoformat(captured.replace("Z", "+00:00"))
+                    if dt < cutoff:
+                        continue
+                except ValueError:
+                    pass
+            out.append(data)
+        except (json.JSONDecodeError, OSError):
+            continue
+    return out
+
+
+def compute_rolling_median(history: list[dict], surface_key: str) -> dict | None:
+    """Compute rolling median of mention count + sentiment shares for a given surface."""
+    counts: list[int] = []
+    pos_shares: list[float] = []
+    neg_shares: list[float] = []
+    for snap in history:
+        for s in (snap.get("surfaces") or []):
+            if s.get("surface_key") == surface_key:
+                cnt = s.get("mention_count", 0)
+                counts.append(cnt)
+                if cnt > 0:
+                    pos_shares.append(s.get("pos_share", 0.0))
+                    neg_shares.append(s.get("neg_share", 0.0))
+                break
+    if not counts:
+        return None
+    return {
+        "n": len(counts),
+        "median_count": statistics.median(counts),
+        "median_pos_share": statistics.median(pos_shares) if pos_shares else 0.0,
+        "median_neg_share": statistics.median(neg_shares) if neg_shares else 0.0,
+    }
+
+
+# ---------- mode handlers ----------
+
+def render_density_report(*, client: str, today: str, window_days: int,
+                           surface_results: list[dict], history: list[dict],
+                           brand_aliases: list[str]) -> str:
+    total_mentions = sum(s["mention_count"] for s in surface_results)
+    pos_total = sum(s["positive"] for s in surface_results)
+    neg_total = sum(s["negative"] for s in surface_results)
+    neu_total = sum(s["neutral"] for s in surface_results)
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: aeo-density-report")
+    lines.append("produced_by: aeo-manual-action")
+    lines.append(f"client: {client}")
+    lines.append(f"window_days: {window_days}")
+    lines.append(f"captured_at: {today}")
+    lines.append(f"surfaces_polled: {len(surface_results)}")
+    lines.append(f"total_mentions: {total_mentions}")
+    lines.append("substrate_layers_cited: [positioning, voc, market-context, distribution]")
+    lines.append("patterns_applied: [aeo-triangle, distribution-as-moat, agents-as-product-users, passage-as-citation-unit]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# AEO off-domain density report — {client} | {today}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"Polled **{len(surface_results)} surface(s)** for mentions of "
+                 f"`{', '.join(brand_aliases[:3])}` over the last **{window_days} days**. "
+                 f"Detected **{total_mentions} mention(s)** total: "
+                 f"{pos_total} positive, {neu_total} neutral, {neg_total} negative. "
+                 f"Per Lily Ray's published research (74% of LLM-cited sources rotate weekly), this snapshot is "
+                 "interpreted against rolling medians from the citation-log cache, not as a single-day count.")
+    lines.append("")
+    lines.append("## Brand aliases monitored")
+    lines.append("")
+    for a in brand_aliases:
+        lines.append(f"- `{a}`")
+    lines.append("")
+    lines.append("## Per-surface density")
+    lines.append("")
+    lines.append("| Surface | Name | Tier | Mentions | + | 0 | − | Rolling median (90d) | Drift |")
+    lines.append("|---|---|---|---:|---:|---:|---:|---:|---|")
+    for s in sorted(surface_results, key=lambda x: -x["mention_count"]):
+        rolling = compute_rolling_median(history, s["surface_key"])
+        if rolling and rolling["n"] >= 2:
+            median = rolling["median_count"]
+            if s["mention_count"] > median * 1.3:
+                drift = "↑ above median"
+            elif s["mention_count"] < median * 0.7:
+                drift = "↓ below median"
+            else:
+                drift = "≈ on median"
+            median_str = f"{median:.1f} (n={rolling['n']})"
+        else:
+            drift = "first data point"
+            median_str = "—"
+        lines.append(f"| {s['surface']} | `{s['name']}` | {s['tier']} | {s['mention_count']} | "
+                     f"{s['positive']} | {s['neutral']} | {s['negative']} | {median_str} | {drift} |")
+    lines.append("")
+    lines.append("## Sentiment summary")
+    lines.append("")
+    if total_mentions > 0:
+        pos_pct = pos_total * 100.0 / total_mentions
+        neu_pct = neu_total * 100.0 / total_mentions
+        neg_pct = neg_total * 100.0 / total_mentions
+        lines.append(f"- Positive: **{pos_pct:.0f}%** ({pos_total})")
+        lines.append(f"- Neutral: **{neu_pct:.0f}%** ({neu_total})")
+        lines.append(f"- Negative: **{neg_pct:.0f}%** ({neg_total})")
+        if neg_pct > 30:
+            lines.append("")
+            lines.append(f"⚠️ Negative-mention share above 30% ({neg_pct:.0f}%). Per Glenn Gabe's manual-action "
+                         "research: negative off-domain signals propagate to AI surfaces. Investigate the negative "
+                         "mentions individually; route to support / product if defensible.")
+    else:
+        lines.append("No mentions in the configured surfaces over the window. Either the brand is below the "
+                     "off-domain detection floor, or the configured sources do not cover the right surfaces. "
+                     "Run `--mode surface-map` to enumerate the missing surfaces per target prompt.")
+    lines.append("")
+    lines.append("## Top mentions (most recent)")
+    lines.append("")
+    all_mentions = []
+    for s in surface_results:
+        for m in s.get("mentions", [])[:5]:
+            all_mentions.append({**m, "surface": s["surface"], "surface_name": s["name"]})
+    all_mentions.sort(key=lambda x: x.get("pub_dt") or "", reverse=True)
+    for m in all_mentions[:15]:
+        sentiment_marker = "+" if m["sentiment"] == "positive" else ("−" if m["sentiment"] == "negative" else "0")
+        title = m.get("title", "")[:100]
+        lines.append(f"- [{sentiment_marker}] **{m['surface']}/{m['surface_name']}**: {title}")
+        if m.get("link"):
+            lines.append(f"  - {m['link']}")
+        if m.get("pub_date"):
+            lines.append(f"  - {m['pub_date']}")
+    if not all_mentions:
+        lines.append("- (no mentions surfaced)")
+    lines.append("")
+    lines.append("## Drift watch")
+    lines.append("")
+    decayed: list[str] = []
+    for s in surface_results:
+        rolling = compute_rolling_median(history, s["surface_key"])
+        if rolling and rolling["n"] >= 4 and s["mention_count"] < rolling["median_count"] * 0.5:
+            decayed.append(f"`{s['surface']}/{s['name']}` ({s['mention_count']} now vs median {rolling['median_count']:.1f})")
+    if decayed:
+        lines.append("Surfaces where mention count fell below 50% of the 90-day rolling median:")
+        lines.append("")
+        for d in decayed:
+            lines.append(f"- {d}")
+        lines.append("")
+        lines.append("Per Solis: surfaces that decay drop out of citation eligibility. Schedule a propagation "
+                     "action via `--mode action-plan` for each decayed surface.")
+    else:
+        lines.append("No surfaces below the 50% drift threshold.")
+    lines.append("")
+    lines.append("## Citation churn caveat")
+    lines.append("")
+    lines.append("Per Lily Ray (`pat_aeo-triangle`): 74% of LLM-cited sources rotate weekly. Single-day snapshots "
+                 "are noisy. Treat this report as one observation in a rolling 30-day median; trend matters more "
+                 "than any single number. The cache at `clients/" + client + "/aeo/citation-log/` preserves the "
+                 "history; the median above is computed across the last 90 days of cached snapshots.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/aeo-triangle.md`")
+    lines.append("- `knowledge/patterns/distribution-as-moat.md`")
+    lines.append("- `knowledge/patterns/passage-as-citation-unit.md`")
+    lines.append("- `skills/aeo-tune/` (presence side)")
+    lines.append("- `skills/aeo-relevance/` (relevance side)")
+    return "\n".join(lines)
+
+
+def render_surface_map(*, client: str, prompt: dict, today: str,
+                        sources_yaml: dict, surface_results: list[dict]) -> str:
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: aeo-surface-map")
+    lines.append("produced_by: aeo-manual-action")
+    lines.append(f"client: {client}")
+    lines.append(f"prompt_id: {prompt['id']}")
+    lines.append(f"intent: {prompt.get('intent', '')}")
+    lines.append(f"authored_at: {today}")
+    lines.append("substrate_layers_cited: [positioning, voc, market-context, distribution]")
+    lines.append("patterns_applied: [aeo-triangle, distribution-as-moat, passage-as-citation-unit]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# AEO surface map — `{prompt['id']}`")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"For prompt `{prompt['id']}` ({prompt.get('intent', '')}): **{len(surface_results)} surfaces** "
+                 "configured. Per surface, the action below names what would lift mention density on the surface "
+                 "an LLM actually cites.")
+    lines.append("")
+    lines.append("## Target prompt")
+    lines.append("")
+    lines.append(f"> {prompt['text']}")
+    lines.append("")
+    lines.append("## Surfaces an LLM would cite for this prompt")
+    lines.append("")
+    lines.append("| Surface | Name | Tier | Current mentions | Action type | Lag |")
+    lines.append("|---|---|---|---:|---|---|")
+    action_map = {
+        "reddit": ("comment / write canonical thread", "days"),
+        "hackernews": ("Show HN / community comment", "days"),
+        "rss": ("expert blog post / guest post / pitch", "weeks"),
+        "g2": ("solicit reviews from happy customers; respond to negative ones", "weeks"),
+        "google_news": ("press placement / pitch journalists / earned media", "weeks"),
+        "duckduckgo": ("indirect — mirrors Google + Bing organic", "weeks"),
+        "podcasts": ("podcast guest appearance / sponsorship", "months"),
+        "youtube": ("YouTube channel / influencer interview / sponsored review", "weeks-months"),
+    }
+    for s in surface_results:
+        action, lag = action_map.get(s["surface"], ("write / pitch / comment", "varies"))
+        lines.append(f"| {s['surface']} | `{s['name']}` | {s['tier']} | {s['mention_count']} | {action} | {lag} |")
+    lines.append("")
+    lines.append("## Whitespace surfaces (configured but with zero mentions)")
+    lines.append("")
+    whitespace = [s for s in surface_results if s["mention_count"] == 0]
+    if whitespace:
+        for s in whitespace:
+            action, lag = action_map.get(s["surface"], ("write / pitch / comment", "varies"))
+            lines.append(f"- `{s['surface']}/{s['name']}` (tier {s['tier']}). Action: {action}. Lag: {lag}.")
+    else:
+        lines.append("- No whitespace surfaces in the configured set; the brand has at least one mention on every "
+                     "configured surface.")
+    lines.append("")
+    lines.append("## Surfaces missing from sources.yaml (gap)")
+    lines.append("")
+    lines.append("Per pat_aeo-triangle, the surfaces a typical B2B brand should monitor:")
+    lines.append("")
+    expected = {"reddit", "hackernews", "g2", "google_news", "youtube", "podcasts", "rss"}
+    configured = {s["surface"] for s in surface_results}
+    missing = expected - configured
+    if missing:
+        lines.append("Missing from `sources.yaml`:")
+        lines.append("")
+        for m in sorted(missing):
+            lines.append(f"- `{m}` — add a section to `clients/{client}/aeo/sources.yaml`. See "
+                         "`templates/aeo-sources-example.yaml` for the schema.")
+    else:
+        lines.append("- No expected surfaces missing.")
+    lines.append("")
+    lines.append("## Per-surface propagation play (recommended sequence)")
+    lines.append("")
+    lines.append("1. **Reddit**: identify the canonical subreddit thread; reply with a passage-shaped answer "
+                 "that cites the canonical positioning. 60-90 word response.")
+    lines.append("2. **Hacker News**: time a Show HN around a launch; ensure the canonical positioning is in the "
+                 "HN intro post; reply to top comments with passage-extractable answers.")
+    lines.append("3. **YouTube**: produce a 60-90 second video script for each of the highest-tier passages on "
+                 "the owned domain; pair every owned-domain passage with a YouTube mirror.")
+    lines.append("4. **Expert blog / podcast**: identify 3-5 named experts in the category; pitch a guest "
+                 "appearance or guest post; the appearance is the canonical mirror.")
+    lines.append("5. **G2 / Trustpilot**: ask 5-10 customers per quarter to review; respond to all negative "
+                 "reviews within 48 hours per Glenn Gabe's manual-action research.")
+    lines.append("")
+    lines.append("## Open questions")
+    lines.append("")
+    lines.append("- Which 3 surfaces are highest-leverage for this prompt? (Reddit subreddit, podcast feed, "
+                 "expert blog. Decide based on the cohort the prompt's intent label maps to.)")
+    lines.append("- Who is responsible for each propagation action? Owner names in the action-plan, not anonymous.")
+    lines.append("- What is the falsifiable measure? Mention count delta on the surface, citation delta in "
+                 "`aeo-relevance` against the prompt.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/aeo-triangle.md`")
+    lines.append("- `knowledge/patterns/distribution-as-moat.md`")
+    lines.append(f"- `clients/{client}/aeo/sources.yaml` (the configured monitor list)")
+    lines.append(f"- `clients/{client}/aeo/target-prompts.md`")
+    return "\n".join(lines)
+
+
+def render_action_plan(*, client: str, prompt: dict, today: str,
+                        surface_results: list[dict]) -> str:
+    horizon = (datetime.now(timezone.utc) + timedelta(days=90)).strftime("%Y-%m-%d")
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: aeo-action-plan")
+    lines.append("produced_by: aeo-manual-action")
+    lines.append(f"client: {client}")
+    lines.append(f"prompt_id: {prompt['id']}")
+    lines.append(f"intent: {prompt.get('intent', '')}")
+    lines.append(f"authored_at: {today}")
+    lines.append(f"horizon_resolution: {horizon}")
+    lines.append("substrate_layers_cited: [positioning, voc, market-context, distribution]")
+    lines.append("patterns_applied: [aeo-triangle, distribution-as-moat, agents-as-product-users, passage-as-citation-unit]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# AEO action plan — `{prompt['id']}`")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"Propagation plan keyed to prompt `{prompt['id']}`. Each action names a surface, an action "
+                 f"type, an owner, a deadline, and a falsifiable measure. Plan resolves on **{horizon}** (90-day "
+                 "window per the manual-action measurement default).")
+    lines.append("")
+    lines.append("## Target prompt")
+    lines.append("")
+    lines.append(f"> {prompt['text']}")
+    lines.append("")
+    lines.append("## Actions")
+    lines.append("")
+    lines.append("| # | Surface | Action | Owner | Deadline | Falsifiable measure |")
+    lines.append("|---|---|---|---|---|---|")
+    # Generate suggested actions per surface
+    deadline_map = {"days": 14, "weeks": 30, "weeks-months": 60, "months": 90, "varies": 45}
+    action_specs = {
+        "reddit": ("Write a canonical thread answering the prompt; ensure passage-extractable response", "PMM"),
+        "hackernews": ("Time a Show HN or canonical post around a launch", "founder"),
+        "rss": ("Pitch a guest post on a tier-1 expert blog", "PMM"),
+        "g2": ("Solicit 5-10 customer reviews; respond to all negatives", "Customer Success"),
+        "google_news": ("Pitch journalists for an earned media placement", "PR / comms"),
+        "duckduckgo": ("Indirect: improve owned-domain SEO + Reddit + HN coverage", "growth"),
+        "podcasts": ("Pitch 3 podcast appearances on category-relevant shows", "founder + PMM"),
+        "youtube": ("Produce a 60-90s video for each of the top 3 passages on the owned page", "content"),
+    }
+    counter = 1
+    for s in sorted(surface_results, key=lambda x: x["tier"]):
+        spec, owner = action_specs.get(s["surface"], ("write / pitch / comment", "TBD"))
+        deadline_days = 30
+        target_deadline = (datetime.now(timezone.utc) + timedelta(days=deadline_days)).strftime("%Y-%m-%d")
+        measure = (f"mention count on `{s['name']}` rises by ≥3 vs current ({s['mention_count']}) "
+                   f"within {deadline_days}d AND citation rate on prompt `{prompt['id']}` rises in the next "
+                   "`aeo-relevance --mode gap-analysis` run")
+        lines.append(f"| {counter} | {s['surface']}/`{s['name']}` (tier {s['tier']}) | {spec} | {owner} | {target_deadline} | {measure} |")
+        counter += 1
+    if not surface_results:
+        lines.append("| 1 | (configure sources.yaml first) | run `aeo-manual-action --mode measure` | operator | now | n/a |")
+    lines.append("")
+    lines.append("## Goals to open")
+    lines.append("")
+    lines.append("Per pat_aeo-triangle, off-domain density actions have measurable outcomes. Open one goal per "
+                 "high-leverage surface in `goals/measurement-contracts/`:")
+    lines.append("")
+    for s in surface_results[:3]:
+        if s["tier"] in ("T1", "T2"):
+            lines.append(f"- `{client}-aeo-{s['surface']}-{s['name']}` — predict mention-count delta on the surface; "
+                         "Brier-scored at resolution.")
+    lines.append("")
+    lines.append("## Kill criterion")
+    lines.append("")
+    lines.append("- If the propagation action ships and the mention count on the surface falls vs baseline, "
+                 "diagnose why before continuing. Per Glenn Gabe: a manual action on the surface (Google penalty, "
+                 "moderator removal, deplatform) is a valid hypothesis; the diagnostic surfaces it.")
+    lines.append("- If 60 days elapse without ≥50% of the predicted mention-delta materialising on any surface, "
+                 "pause; route to discovery on whether the surface still indexes for the prompt.")
+    lines.append("")
+    lines.append("## Resolution")
+    lines.append("")
+    lines.append(f"Resolves on {horizon}. Re-run `aeo-manual-action --mode measure --client {client}` and "
+                 f"`aeo-relevance --mode gap-analysis --client {client}`. Compare deltas against this plan.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/aeo-triangle.md`")
+    lines.append("- `knowledge/patterns/distribution-as-moat.md`")
+    lines.append("- `goals/SCHEMA.md`")
+    lines.append(f"- `clients/{client}/aeo/sources.yaml`")
+    return "\n".join(lines)
+
+
+# ---------- main ----------
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="aeo-manual-action — track off-domain mentions")
+    p.add_argument("--client", required=True)
+    p.add_argument("--mode", default="measure",
+                   choices=["surface-map", "action-plan", "measure", "monitor"])
+    p.add_argument("--prompt-id", default=None)
+    p.add_argument("--window-days", type=int, default=30)
+    p.add_argument("--lookback-cache", default=None)
+    p.add_argument("--out", default=None)
+    p.add_argument("--no-fetch", action="store_true",
+                   help="Skip live HTTP fetches (use cached results only)")
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        return refuse(f"client root missing: clients/{args.client}/",
+                      f"run: bin/substrate-bootstrap-prospect {args.client}")
+
+    sources_path = client_root / "aeo" / "sources.yaml"
+    if not sources_path.is_file():
+        return refuse(
+            "missing-monitoring-sources",
+            f"sources.yaml not found at {sources_path}. "
+            "See templates/aeo-sources-example.yaml for the schema. "
+            "Without configured sources, off-domain density is point-in-time guess; "
+            "Lily Ray's research (74% citation rotation) makes that unreliable.",
+        )
+
+    sources_yaml = load_yaml(sources_path) or {}
+    brand_aliases = sources_yaml.get("brand_aliases") or [args.client]
+    if not brand_aliases:
+        return refuse(
+            "missing-brand-aliases",
+            f"sources.yaml at {sources_path} has no brand_aliases. "
+            "Without aliases, the skill cannot detect mentions.",
+        )
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # surface-map and action-plan need a prompt
+    target_prompts = load_target_prompts(args.client)
+    if args.mode in ("surface-map", "action-plan"):
+        if not target_prompts:
+            return refuse(
+                "missing-target-prompts",
+                f"target-prompts.md not found at clients/{args.client}/aeo/target-prompts.md. "
+                "surface-map and action-plan modes need a prompt anchor.",
+            )
+        if not args.prompt_id:
+            return refuse(
+                "missing-prompt-id",
+                f"--prompt-id required for --mode {args.mode}. "
+                f"known prompts: {', '.join(p['id'] for p in target_prompts[:10])}",
+            )
+        prompt = next((p for p in target_prompts if p["id"] == args.prompt_id), None)
+        if not prompt:
+            return refuse(
+                "missing-prompt-id",
+                f"prompt id '{args.prompt_id}' not in target-prompts.md. "
+                f"known: {', '.join(p['id'] for p in target_prompts[:10])}",
+            )
+
+    # ---------- fetch + measure ----------
+    sources_list = iterate_sources(sources_yaml)
+    if not sources_list:
+        return refuse(
+            "missing-monitoring-sources",
+            "sources.yaml has no usable source entries. Add at least one of: reddit, hackernews, "
+            "rss_feeds, search_queries.google_news, g2.reviews_rss.",
+        )
+
+    surface_results: list[dict] = []
+    sys.stderr.write(f"\n[aeo-manual-action] {args.mode} | {args.client} | window={args.window_days}d\n")
+    sys.stderr.write(f"  sources configured: {len(sources_list)}\n")
+    sys.stderr.write(f"  brand aliases: {brand_aliases}\n")
+
+    for surface_kind, name, url, tier in sources_list:
+        surface_key = f"{surface_kind}:{name}"
+        if args.no_fetch:
+            sys.stderr.write(f"  [skip] {surface_kind}/{name} (--no-fetch)\n")
+            mentions = []
+            err = None
+        else:
+            sys.stderr.write(f"  fetching: {surface_kind}/{name} ...\n")
+            body, err = fetch_url(url)
+            if err:
+                sys.stderr.write(f"    warn: {err}\n")
+                mentions = []
+            else:
+                items = parse_rss_atom(body)
+                mentions = detect_mentions(items, brand_aliases, args.window_days)
+                # short polite delay between fetches
+                time.sleep(0.4)
+        positive = sum(1 for m in mentions if m["sentiment"] == "positive")
+        negative = sum(1 for m in mentions if m["sentiment"] == "negative")
+        neutral = sum(1 for m in mentions if m["sentiment"] == "neutral")
+        cnt = len(mentions)
+        result = {
+            "surface": surface_kind,
+            "name": name,
+            "url": url,
+            "tier": tier,
+            "surface_key": surface_key,
+            "mention_count": cnt,
+            "positive": positive,
+            "neutral": neutral,
+            "negative": negative,
+            "pos_share": positive / cnt if cnt else 0.0,
+            "neg_share": negative / cnt if cnt else 0.0,
+            "neu_share": neutral / cnt if cnt else 0.0,
+            "mentions": mentions,
+            "fetch_error": err,
+        }
+        surface_results.append(result)
+        sys.stderr.write(f"    mentions: {cnt} (+{positive} / -{negative} / 0:{neutral})\n")
+
+    # Cache snapshot
+    cache_path = write_cache(args.client, today, surface_results)
+    sys.stderr.write(f"  cached: {cache_path}\n")
+
+    history = load_cache_history(args.client, days=90)
+    sys.stderr.write(f"  cache history: {len(history)} prior snapshot(s)\n")
+
+    # Render per-mode artifact
+    out_dir = Path(args.out) if args.out else None
+
+    if args.mode in ("measure", "monitor"):
+        out_dir = out_dir or (client_root / "aeo" / "density-reports")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{today}.md"
+        out_path.write_text(render_density_report(
+            client=args.client, today=today, window_days=args.window_days,
+            surface_results=surface_results, history=history, brand_aliases=brand_aliases,
+        ), encoding="utf-8")
+        sys.stderr.write(f"  output: {out_path}\n")
+        print(str(out_path))
+        total = sum(s["mention_count"] for s in surface_results)
+        if total == 0:
+            return 1
+        return 0
+
+    if args.mode == "surface-map":
+        out_dir = out_dir or (client_root / "aeo" / "surfaces")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{args.prompt_id}-surface-map.md"
+        out_path.write_text(render_surface_map(
+            client=args.client, prompt=prompt, today=today,
+            sources_yaml=sources_yaml, surface_results=surface_results,
+        ), encoding="utf-8")
+        sys.stderr.write(f"  output: {out_path}\n")
+        print(str(out_path))
+        return 0
+
+    if args.mode == "action-plan":
+        out_dir = out_dir or (client_root / "aeo" / "action-plans")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{args.prompt_id}-{today}.md"
+        out_path.write_text(render_action_plan(
+            client=args.client, prompt=prompt, today=today,
+            surface_results=surface_results,
+        ), encoding="utf-8")
+        sys.stderr.write(f"  output: {out_path}\n")
+        print(str(out_path))
+        return 0
+
+    return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())

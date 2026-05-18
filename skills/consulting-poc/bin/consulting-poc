@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# consulting-poc — orchestrate a 5-day fixed-price POC for a consulting prospect
+#
+# Phases:
+#   bootstrap   create clients/<prospect>/ scaffold from public surface
+#   phase-0     diagnostic audit, fills clients/<prospect>/diagnostics/phase-0-audit.md
+#   phase-1-day-N   produce day N artifact (1=context, 2=positioning, 3=narrative, 4=high-leverage, 5=report)
+#   phase-2     emit Phase-2 engagement options
+#   generate-proposal   fill templates/consulting-proposal.md with the prospect's specifics
+#
+# Usage:
+#   consulting-poc --prospect <slug> --mode <bootstrap|phase-0|phase-1-day-N|phase-2|generate-proposal>
+#
+# Exit:
+#   0 ok, 3 preflight refused, 4 invalid args
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+
+# shellcheck source=../../../bin/lib/skill-preflight.sh
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+PROSPECT=""
+MODE=""
+ARTIFACT_TYPE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prospect) PROSPECT="$2"; shift 2 ;;
+    --mode)     MODE="$2"; shift 2 ;;
+    --artifact) ARTIFACT_TYPE="$2"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+consulting-poc — orchestrates a 5-day fixed-price consulting POC.
+
+Usage:
+  consulting-poc --prospect <slug> --mode <bootstrap|phase-0|phase-1-day-1..5|phase-2|generate-proposal>
+
+Modes:
+  bootstrap          delegate to substrate-bootstrap-prospect to scaffold clients/<slug>/
+  phase-0            run free diagnostic audit (positioning drift, AEO triangle, status-quo, pattern coverage)
+  phase-1-day-1      bootstrap context (frontline-contact + icp-cut + context-curate)
+  phase-1-day-2      positioning + status-quo + dunford-value-frame
+  phase-1-day-3      narrative-strategy + messaging-matrix
+  phase-1-day-4      high-leverage artifact (--artifact lp|content-brief|win-loss-script)
+  phase-1-day-5      diagnostic report + 90-day roadmap + measurement contract
+  phase-2            emit Phase-2 options (embedded / retainer / train-team)
+  generate-proposal  emit a filled proposal-draft.md from the template
+
+See SKILL.md for full spec.
+EOF
+      exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 4 ;;
+  esac
+done
+
+[ -n "$PROSPECT" ] || { echo "ERR: --prospect required" >&2; exit 4; }
+[ -n "$MODE" ] || { echo "ERR: --mode required" >&2; exit 4; }
+
+CLIENT_ROOT="$SUBSTRATE_ROOT/clients/$PROSPECT"
+
+case "$MODE" in
+  bootstrap)
+    exec "$SUBSTRATE_ROOT/bin/substrate-bootstrap-prospect" "$PROSPECT"
+    ;;
+  phase-0|phase-1-day-1|phase-1-day-2|phase-1-day-3|phase-1-day-4|phase-1-day-5|phase-2|generate-proposal)
+    if [ ! -d "$CLIENT_ROOT" ]; then
+      skill_refuse "missing-prospect-bootstrap" "run: consulting-poc --prospect $PROSPECT --mode bootstrap"
+    fi
+    # Day-4 needs an artifact type
+    if [ "$MODE" = "phase-1-day-4" ] && [ -z "$ARTIFACT_TYPE" ]; then
+      echo "ERR: phase-1-day-4 needs --artifact <lp|content-brief|win-loss-script|...>" >&2
+      exit 4
+    fi
+    # Day-5 refuses if fewer than 3 calls logged
+    if [ "$MODE" = "phase-1-day-5" ]; then
+      call_count=$(find "$CLIENT_ROOT/voc/inbox" -type f -name "*.md" 2>/dev/null | wc -l | tr -d ' ')
+      if [ "$call_count" -lt 3 ]; then
+        skill_refuse "frontline-contact-floor" "logged calls: $call_count (need 3+). The skill frontline-as-pmm-substrate refuses to ship a report without it."
+      fi
+    fi
+    skill_preflight consulting-poc "$PROSPECT" || exit 3
+    skill_emit_prompt consulting-poc "$PROSPECT" "$MODE" "${ARTIFACT_TYPE:-}"
+    ;;
+  *) echo "unknown mode: $MODE" >&2; exit 4 ;;
+esac

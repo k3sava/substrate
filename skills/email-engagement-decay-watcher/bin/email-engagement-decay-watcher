@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# email-engagement-decay-watcher — flag sequences whose open/click rates declined >threshold over rolling 4-week windows.
+#
+# Usage:
+#   email-engagement-decay-watcher --client <c> [--metrics-dir <path>] [--threshold <pct>] [--out <path>] [--sequence <id>]
+#
+# Reads CSVs at <metrics-dir>/<sequence-id>-<YYYY-MM>.csv with schema:
+#   date,sequence_id,step,sent,delivered,opened,clicked,unsubscribed,complained,bounced
+#
+# Emits a structured decay report per sequence, with:
+#   - prior 4w vs current 4w open/click/complaint/bounce rates
+#   - relative lift on each
+#   - decay shape classification (sudden cliff / gradual taper / step-down)
+#   - first hypothesis (relevance / deliverability / upstream-blocking / cohort-change)
+#   - recommended next skill
+#
+# Exit codes:
+#   0 — no critical decay alerts
+#   1 — at least one critical decay alert
+#   3 — preflight refusal (missing-metrics, schema-mismatch on all sequences)
+#   4 — invalid args
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+export FLYWHEEL_ROOT="$SUBSTRATE_ROOT"
+
+# shellcheck disable=SC1091
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+METRICS_DIR=""
+THRESHOLD=25
+OUT=""
+SINGLE_SEQUENCE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)        CLIENT="$2"; shift 2 ;;
+    --metrics-dir)   METRICS_DIR="$2"; shift 2 ;;
+    --threshold)     THRESHOLD="$2"; shift 2 ;;
+    --out)           OUT="$2"; shift 2 ;;
+    --sequence)      SINGLE_SEQUENCE="$2"; shift 2 ;;
+    --help|-h)       sed -n '2,15p' "$0" | sed 's/^# //'; exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 4 ;;
+  esac
+done
+
+[ -n "$CLIENT" ] || { echo "REFUSED: --client required" >&2; exit 4; }
+
+[ -n "$METRICS_DIR" ] || METRICS_DIR="$SUBSTRATE_ROOT/clients/$CLIENT/email/metrics"
+
+if [ ! -d "$METRICS_DIR" ]; then
+  skill_refuse "missing-metrics" "metrics dir not found: $METRICS_DIR. Operator commits weekly CSVs at $METRICS_DIR/<sequence-id>-<YYYY-MM>.csv."
+fi
+
+TODAY="$(date -u +%Y-%m-%d)"
+[ -n "$OUT" ] || OUT="$SUBSTRATE_ROOT/clients/$CLIENT/email/decay/$TODAY.md"
+mkdir -p "$(dirname "$OUT")"
+
+echo "=== email-engagement-decay-watcher: $CLIENT ===" >&2
+echo "  metrics-dir=$METRICS_DIR threshold=${THRESHOLD}% sequence=${SINGLE_SEQUENCE:-<all>}" >&2
+
+# Skill is substrate-light (no client layers required). Minimal preflight.
+skill_preflight "email-engagement-decay-watcher" "$CLIENT" || true
+
+# Run the decay analysis pass in Python.
+PYRESULT="$(python3 - "$METRICS_DIR" "$THRESHOLD" "$OUT" "$SINGLE_SEQUENCE" "$CLIENT" <<'PY'
+import csv
+import os
+import sys
+import re
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+metrics_dir, threshold_str, out_path, single_sequence, client = sys.argv[1:6]
+threshold_pct = float(threshold_str)
+
+REQUIRED_COLS = {"date", "sequence_id", "step", "sent", "delivered", "opened", "clicked", "unsubscribed", "complained", "bounced"}
+
+# Discover sequences from CSV filenames
+csv_files = []
+for fname in os.listdir(metrics_dir):
+    m = re.match(r"^(.+?)-(\d{4})-(\d{2})\.csv$", fname)
+    if m:
+        seq_id = m.group(1)
+        if single_sequence and seq_id != single_sequence:
+            continue
+        csv_files.append((seq_id, os.path.join(metrics_dir, fname)))
+
+if not csv_files:
+    print("REFUSED|missing-metrics|no CSV files matching <sequence-id>-<YYYY-MM>.csv pattern")
+    sys.exit(3)
+
+# Group by sequence
+by_sequence = defaultdict(list)
+for seq_id, path in csv_files:
+    by_sequence[seq_id].append(path)
+
+today = datetime.utcnow()
+window_days = 28  # 4 weeks
+prior_start = today - timedelta(days=window_days * 2)
+prior_end   = today - timedelta(days=window_days)
+current_start = prior_end
+current_end   = today
+
+reports = []  # one per sequence
+overall_summary = {"total": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "healthy": 0, "skipped": 0}
+
+def parse_date(s):
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+def aggregate(rows, start, end):
+    sent = delivered = opened = clicked = complained = bounced = 0
+    days = set()
+    for r in rows:
+        d = parse_date(r["date"])
+        if d is None:
+            continue
+        if d < start or d >= end:
+            continue
+        days.add(d.date())
+        sent       += int(r.get("sent", 0) or 0)
+        delivered  += int(r.get("delivered", 0) or 0)
+        opened     += int(r.get("opened", 0) or 0)
+        clicked    += int(r.get("clicked", 0) or 0)
+        complained += int(r.get("complained", 0) or 0)
+        bounced    += int(r.get("bounced", 0) or 0)
+    return {
+        "sent": sent, "delivered": delivered, "opened": opened, "clicked": clicked,
+        "complained": complained, "bounced": bounced, "days": len(days),
+    }
+
+def rate(num, den):
+    return (num / den) * 100.0 if den > 0 else 0.0
+
+def lift(prior, current):
+    if prior == 0:
+        return None
+    return ((current - prior) / prior) * 100.0
+
+def classify_shape(weekly_rates):
+    """
+    weekly_rates is a list of (week_start_date, open_rate) for the current 4-week window.
+    Returns one of: sudden-cliff | gradual-taper | step-down | none
+    """
+    if len(weekly_rates) < 4:
+        return "insufficient-data"
+    rates = [r for _, r in weekly_rates]
+    total_decline = rates[0] - rates[-1]
+    if total_decline <= 0:
+        return "none"
+
+    # Per-week deltas
+    deltas = [rates[i] - rates[i+1] for i in range(len(rates)-1)]
+    max_delta = max(deltas)
+    if total_decline > 0 and max_delta / total_decline > 0.7:
+        return "sudden-cliff"
+    # Monotonic decline?
+    if all(d >= 0 for d in deltas):
+        return "gradual-taper"
+    # Step-down: variance high but not monotonic
+    return "step-down"
+
+def hypothesis(shape, complaint_lift, bounce_lift):
+    """Map shape + complaint/bounce co-movement to first hypothesis + recommended next skill."""
+    if shape == "sudden-cliff":
+        if (complaint_lift is not None and complaint_lift > 25) or (bounce_lift is not None and bounce_lift > 25):
+            return ("deliverability event", "email-deliverability-audit")
+        return ("upstream blocking event (cohort gate change, ESP outage, trigger break)", "email-cohort-trigger")
+    if shape == "gradual-taper":
+        return ("relevance break / audience drift / subject fatigue", "email-cohort-trigger or email-sequence-design")
+    if shape == "step-down":
+        return ("discrete cohort change (ICP shift, major campaign exposure, definition change)", "email-cohort-trigger")
+    return ("no clear shape", "monitor")
+
+for seq_id in sorted(by_sequence.keys()):
+    overall_summary["total"] += 1
+    paths = by_sequence[seq_id]
+    rows = []
+    schema_ok = True
+    for p in paths:
+        with open(p, "r", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh)
+            if reader.fieldnames is None or not REQUIRED_COLS.issubset(set(reader.fieldnames)):
+                schema_ok = False
+                break
+            for r in reader:
+                rows.append(r)
+
+    if not schema_ok:
+        reports.append({
+            "sequence_id": seq_id,
+            "status": "skipped",
+            "reason": "schema-mismatch",
+        })
+        overall_summary["skipped"] += 1
+        continue
+
+    # Filter to last 8 weeks
+    eight_weeks_ago = today - timedelta(days=window_days * 2)
+    rows_in_window = [r for r in rows if (parse_date(r["date"]) or today) >= eight_weeks_ago]
+
+    # Need at least 8 weeks of data
+    distinct_days = set()
+    for r in rows_in_window:
+        d = parse_date(r["date"])
+        if d:
+            distinct_days.add(d.date())
+    if len(distinct_days) < 28:  # at least 28 distinct days = 4 prior + 4 current weeks
+        reports.append({
+            "sequence_id": seq_id,
+            "status": "skipped",
+            "reason": f"window-too-short ({len(distinct_days)} days; need ≥28)",
+        })
+        overall_summary["skipped"] += 1
+        continue
+
+    prior = aggregate(rows_in_window, prior_start, prior_end)
+    current = aggregate(rows_in_window, current_start, current_end)
+
+    open_prior = rate(prior["opened"], prior["delivered"])
+    open_current = rate(current["opened"], current["delivered"])
+    click_prior = rate(prior["clicked"], prior["delivered"])
+    click_current = rate(current["clicked"], current["delivered"])
+    complaint_prior = rate(prior["complained"], prior["delivered"])
+    complaint_current = rate(current["complained"], current["delivered"])
+    bounce_prior = rate(prior["bounced"], prior["sent"])
+    bounce_current = rate(current["bounced"], current["sent"])
+
+    open_lift = lift(open_prior, open_current)
+    click_lift = lift(click_prior, click_current)
+    complaint_lift = lift(complaint_prior, complaint_current)
+    bounce_lift = lift(bounce_prior, bounce_current)
+
+    # Pick the worse of open and click for severity classification
+    worst_lift = None
+    for L in (open_lift, click_lift):
+        if L is None:
+            continue
+        if worst_lift is None or L < worst_lift:
+            worst_lift = L
+
+    if worst_lift is None:
+        status = "healthy"
+    elif worst_lift > -10:
+        status = "healthy"
+    elif worst_lift > -threshold_pct:
+        status = "medium"
+    elif worst_lift > -50:
+        status = "high"
+    else:
+        status = "critical"
+
+    # Compute weekly open-rate series within current window for shape classification
+    week_buckets = defaultdict(lambda: {"opened": 0, "delivered": 0})
+    for r in rows_in_window:
+        d = parse_date(r["date"])
+        if d is None or d < current_start or d >= current_end:
+            continue
+        # Bucket: 4 weeks of size 7 days; week_idx = floor((d - current_start).days / 7)
+        wk_idx = (d - current_start).days // 7
+        if wk_idx < 0 or wk_idx > 3:
+            continue
+        week_buckets[wk_idx]["opened"]    += int(r.get("opened", 0) or 0)
+        week_buckets[wk_idx]["delivered"] += int(r.get("delivered", 0) or 0)
+    weekly_rates = []
+    for wk_idx in range(4):
+        b = week_buckets.get(wk_idx, {"opened": 0, "delivered": 0})
+        weekly_rates.append((wk_idx, rate(b["opened"], b["delivered"])))
+
+    shape = classify_shape(weekly_rates) if status != "healthy" else "none"
+    hyp, rec_skill = hypothesis(shape, complaint_lift, bounce_lift) if status != "healthy" else ("(healthy)", "monitor")
+
+    overall_summary[status] += 1
+
+    reports.append({
+        "sequence_id": seq_id,
+        "status": status,
+        "open_prior": open_prior, "open_current": open_current, "open_lift": open_lift,
+        "click_prior": click_prior, "click_current": click_current, "click_lift": click_lift,
+        "complaint_prior": complaint_prior, "complaint_current": complaint_current, "complaint_lift": complaint_lift,
+        "bounce_prior": bounce_prior, "bounce_current": bounce_current, "bounce_lift": bounce_lift,
+        "shape": shape,
+        "hypothesis": hyp,
+        "recommended_skill": rec_skill,
+        "weekly_open_rates": weekly_rates,
+        "input_paths": paths,
+    })
+
+# Build markdown
+def fmt_pct(v):
+    return f"{v:.1f}%" if v is not None else "n/a"
+
+def fmt_lift(v):
+    if v is None:
+        return "n/a"
+    sign = "+" if v >= 0 else ""
+    return f"{sign}{v:.1f}%"
+
+lines = []
+lines.append("---")
+lines.append(f"asset_type: decay alert digest")
+lines.append(f"watcher_run_date: {today.strftime('%Y-%m-%d')}")
+lines.append(f"client: {client}")
+lines.append(f"sequences_audited: {overall_summary['total']}")
+lines.append(f"decay_alerts: {overall_summary['critical'] + overall_summary['high'] + overall_summary['medium']}")
+lines.append(f"critical_alerts: {overall_summary['critical']}")
+lines.append(f"high_alerts: {overall_summary['high']}")
+lines.append(f"medium_alerts: {overall_summary['medium']}")
+lines.append(f"healthy_sequences: {overall_summary['healthy']}")
+lines.append(f"skipped_sequences: {overall_summary['skipped']}")
+lines.append(f"threshold_pct: {threshold_pct}")
+lines.append(f"watcher_skill: email-engagement-decay-watcher")
+lines.append(f"watcher_version: 0.1")
+lines.append("---")
+lines.append("")
+lines.append(f"# Email engagement decay digest, {today.strftime('%Y-%m-%d')}")
+lines.append("")
+lines.append(f"Sequences audited: {overall_summary['total']}. Critical: {overall_summary['critical']}, high: {overall_summary['high']}, medium: {overall_summary['medium']}, healthy: {overall_summary['healthy']}, skipped: {overall_summary['skipped']}.")
+lines.append("")
+lines.append("Per knowledge/patterns/engagement-decay-as-relevance-signal.md, the watcher's first hypothesis on a gradual taper is relevance, not deliverability. Sudden cliffs with complaint or bounce co-movement point at deliverability instead.")
+lines.append("")
+
+for r in reports:
+    lines.append(f"## {r['sequence_id']}")
+    lines.append("")
+    if r["status"] == "skipped":
+        lines.append(f"- Status: **skipped** — {r['reason']}")
+        lines.append("")
+        continue
+    if r["status"] == "healthy":
+        lines.append(f"- Status: **healthy**")
+        lines.append(f"- Open rate: prior 4w {fmt_pct(r['open_prior'])} → current 4w {fmt_pct(r['open_current'])} (lift {fmt_lift(r['open_lift'])})")
+        lines.append(f"- Click rate: prior 4w {fmt_pct(r['click_prior'])} → current 4w {fmt_pct(r['click_current'])} (lift {fmt_lift(r['click_lift'])})")
+        lines.append("")
+        continue
+    lines.append(f"- Status: **{r['status']}**")
+    lines.append(f"- Open rate: prior 4w {fmt_pct(r['open_prior'])} → current 4w {fmt_pct(r['open_current'])} (lift {fmt_lift(r['open_lift'])})")
+    lines.append(f"- Click rate: prior 4w {fmt_pct(r['click_prior'])} → current 4w {fmt_pct(r['click_current'])} (lift {fmt_lift(r['click_lift'])})")
+    lines.append(f"- Complaint rate: prior 4w {fmt_pct(r['complaint_prior'])} → current 4w {fmt_pct(r['complaint_current'])} (lift {fmt_lift(r['complaint_lift'])})")
+    lines.append(f"- Bounce rate: prior 4w {fmt_pct(r['bounce_prior'])} → current 4w {fmt_pct(r['bounce_current'])} (lift {fmt_lift(r['bounce_lift'])})")
+    lines.append(f"- Decay shape: **{r['shape']}**")
+    lines.append(f"- First hypothesis: {r['hypothesis']}")
+    lines.append(f"- Recommended next skill: `{r['recommended_skill']}`")
+    lines.append("")
+    lines.append("Weekly open-rate series (current 4-week window):")
+    lines.append("")
+    for wk_idx, rt in r["weekly_open_rates"]:
+        lines.append(f"  - week {wk_idx+1}: {fmt_pct(rt)}")
+    lines.append("")
+    lines.append("Input paths:")
+    for p in r["input_paths"]:
+        rel = os.path.relpath(p, start=os.environ.get("SUBSTRATE_ROOT", "/"))
+        lines.append(f"  - `{rel}`")
+    lines.append("")
+
+lines.append("## Patterns grounding this watcher")
+lines.append("")
+lines.append("- knowledge/patterns/engagement-decay-as-relevance-signal.md")
+lines.append("- knowledge/patterns/one-segment-one-trigger.md")
+lines.append("")
+lines.append("## Severity rubric")
+lines.append("")
+lines.append(f"- Critical: relative decline > 50%.")
+lines.append(f"- High: 25-50% relative decline.")
+lines.append(f"- Medium: 10-{int(threshold_pct)}% relative decline (advisory only by default; user-configurable threshold).")
+lines.append(f"- Healthy: under 10% relative decline.")
+lines.append("")
+lines.append("## See also")
+lines.append("")
+lines.append("- skills/email-cohort-trigger/SKILL.md")
+lines.append("- skills/email-sequence-design/SKILL.md")
+lines.append("- skills/email-deliverability-audit/SKILL.md")
+lines.append("- routines/email-decay-routine.md")
+
+with open(out_path, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+
+print(f"OK|{overall_summary['total']}|{overall_summary['critical']}|{overall_summary['high']}|{overall_summary['medium']}|{overall_summary['healthy']}|{overall_summary['skipped']}")
+PY
+)" || true
+
+case "$PYRESULT" in
+  REFUSED\|*)
+    err="${PYRESULT#REFUSED|}"
+    skill_refuse "$(echo "$err" | cut -d'|' -f1)" "$err"
+    ;;
+  OK\|*)
+    payload="${PYRESULT#OK|}"
+    TOT="$(echo "$payload" | awk -F'|' '{print $1}')"
+    CRIT="$(echo "$payload" | awk -F'|' '{print $2}')"
+    HIGH="$(echo "$payload" | awk -F'|' '{print $3}')"
+    MED="$(echo "$payload" | awk -F'|' '{print $4}')"
+    HEALTHY="$(echo "$payload" | awk -F'|' '{print $5}')"
+    SKIPPED="$(echo "$payload" | awk -F'|' '{print $6}')"
+    echo "  → wrote $OUT" >&2
+    echo "  $TOT sequences: $CRIT critical | $HIGH high | $MED medium | $HEALTHY healthy | $SKIPPED skipped" >&2
+    if [ "$CRIT" -gt 0 ]; then
+      echo "FAIL: $OUT ($CRIT critical decay alerts)"
+      exit 1
+    fi
+    echo "PASS: $OUT (no critical alerts)"
+    exit 0
+    ;;
+  *)
+    echo "REFUSED: unexpected watcher output: $PYRESULT" >&2
+    exit 1
+    ;;
+esac

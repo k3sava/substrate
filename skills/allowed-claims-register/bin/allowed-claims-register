@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""allowed-claims-register — compose the procurement-defensible claims register.
+
+Scans surfaces (URLs or local HTML/markdown) for numeric and superlative
+claims, dedupes across surfaces, and emits the canonical register file with
+operational-definition placeholders and a procurement-failure flag list.
+
+Usage:
+    allowed-claims-register --client <client>
+                            --surfaces <path-or-url> [--surfaces ... ...]
+                            [--output <path>]
+
+Exit codes:
+    0 — register composed
+    1 — preflight refused (substrate gap)
+    2 — input invalid (no claims found)
+    3 — verify failed
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+NUMERIC_CLAIM = re.compile(
+    r"(?P<claim>\b\w*\s*\d+[.,]?\d*\s*"
+    r"(?:%|x|X|hours?|hrs?|days?|weeks?|months?|years?|"
+    r"customers?|users?|clients?|companies?|deals?|leads?|signups?|hires?|"
+    r"seats?|seconds?|secs?|minutes?|mins?|tickets?|reps?|agents?|calls?|"
+    r"reviews?|stars?|nps|USD|EUR|INR|GBP|JPY|M\b|B\b|K\b)"
+    r"\s*\w*(?:\s+\w+){0,4})",
+    re.IGNORECASE,
+)
+
+DOLLAR_CLAIM = re.compile(
+    r"(?P<claim>(?:\$|€|£|₹|¥)\s*\d+[.,]?\d*\s*[KMB]?\+?\s*\w*(?:\s+\w+){0,4})",
+    re.IGNORECASE,
+)
+
+SUPERLATIVE_CLAIM = re.compile(
+    r"(?P<claim>\b(?:first|only|fastest|cheapest|biggest|largest|best|most|"
+    r"#1|number\s+one|leading|top|premier|sole)\b(?:\s+\w+){1,6})",
+    re.IGNORECASE,
+)
+
+UNIT_HINTS = {
+    "%": "rate or share",
+    "x": "multiplier",
+    "hours": "duration", "hrs": "duration", "days": "duration",
+    "weeks": "duration", "months": "duration", "years": "duration",
+    "customers": "count", "users": "count", "clients": "count",
+    "companies": "count", "deals": "count", "leads": "count",
+    "signups": "count", "tickets": "count", "calls": "count",
+    "nps": "Net Promoter Score",
+    "USD": "currency", "EUR": "currency", "INR": "currency",
+}
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.out: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "noscript"):
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript") and self._skip > 0:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if self._skip == 0:
+            s = data.strip()
+            if s:
+                self.out.append(s)
+
+
+def strip_html(text: str) -> str:
+    parser = _TextExtractor()
+    try:
+        parser.feed(text)
+    except Exception:
+        return text
+    return "\n".join(parser.out)
+
+
+def fetch_surface(s: str) -> tuple[str, str]:
+    """Return (label, text) for a surface input (URL or local path)."""
+    if s.startswith(("http://", "https://")):
+        try:
+            req = urllib.request.Request(s, headers={"User-Agent": "substrate/1.6"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            text = strip_html(raw) if "<" in raw and ">" in raw else raw
+            return s, text
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            print(f"  WARN: surface unreachable: {s} ({e})", file=sys.stderr)
+            return s, ""
+        except Exception as e:
+            print(f"  WARN: surface fetch error: {s} ({e})", file=sys.stderr)
+            return s, ""
+    # Local file
+    p = Path(s)
+    if not p.is_absolute():
+        p = (SUBSTRATE_ROOT / s).resolve()
+    if not p.is_file():
+        print(f"  WARN: surface file missing: {s}", file=sys.stderr)
+        return s, ""
+    try:
+        raw = p.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return s, ""
+    if p.suffix.lower() in {".html", ".htm"}:
+        return s, strip_html(raw)
+    return s, raw
+
+
+def normalize_claim(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip()).lower()
+
+
+def extract_claims(text: str) -> list[tuple[str, str]]:
+    """Return list of (claim_type, claim_text)."""
+    found: list[tuple[str, str]] = []
+    if not text.strip():
+        return found
+    for m in DOLLAR_CLAIM.finditer(text):
+        c = m.group("claim").strip()
+        if 3 < len(c) < 120:
+            found.append(("numeric", c))
+    for m in NUMERIC_CLAIM.finditer(text):
+        c = m.group("claim").strip()
+        if 3 < len(c) < 120:
+            # Skip obvious garbage like "2-3 weeks" with no leading anchor
+            if re.match(r"^\d+\s*[.,]?\s*\d*\s*$", c):
+                continue
+            found.append(("numeric", c))
+    for m in SUPERLATIVE_CLAIM.finditer(text):
+        c = m.group("claim").strip()
+        if 5 < len(c) < 100:
+            found.append(("superlative", c))
+    return found
+
+
+def guess_unit(claim_text: str) -> str:
+    low = claim_text.lower()
+    for token, hint in UNIT_HINTS.items():
+        if re.search(rf"\b{re.escape(token.lower())}\b", low):
+            return hint
+    if "$" in claim_text or "€" in claim_text or "£" in claim_text:
+        return "currency"
+    return "unit-unknown"
+
+
+def md_escape(s: str) -> str:
+    return s.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def compose_register(client: str, claims_index: dict, today: str, surface_warnings: list[str]) -> str:
+    lines = [
+        "---",
+        f"title: {client}'s allowed-claims register",
+        f"client: {client}",
+        f"last_compiled: {today}",
+        "review_cadence: monthly",
+        "produced_by: allowed-claims-register",
+        "asset_type: claims-register",
+        "contradiction_positions: [verified-vs-self-reported: position-A]",
+        "position_rationale: every claim defaults to self-reported until an "
+        "operational definition and source-of-truth pull raise it to verified.",
+        "---",
+        "",
+        f"# {client}'s allowed-claims register",
+        "",
+        f"Compiled {today}. Numeric and superlative claims extracted from the "
+        "named surfaces. Each row is the procurement-defensible shape: claim, "
+        "attribution, source-of-truth, operational definition, time period, "
+        "comparison anchor, audit trail, allowed surfaces, status.",
+        "",
+        "## Allowed claims",
+        "",
+        "| # | Claim | Type | Attribution | Source of truth | Operational definition | Time period | Comparison anchor | Audit trail | Allowed surfaces | Status |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
+
+    procurement_failures: list[tuple[int, str, str]] = []
+
+    sorted_keys = sorted(claims_index.keys(),
+                         key=lambda k: (-len(claims_index[k]["surfaces"]), k))
+
+    for i, key in enumerate(sorted_keys, 1):
+        entry = claims_index[key]
+        claim_text = entry["display"]
+        ctype = entry["type"]
+        surfaces = sorted(set(entry["surfaces"]))
+        attribution = "self-reported"
+        sot = "TBD"
+        op_def = f"TBD ({guess_unit(claim_text)})"
+        period = "TBD"
+        anchor = "TBD"
+        audit = "TBD"
+        status = "DRAFT"
+
+        # Procurement-failure heuristic: superlatives without explicit comparison
+        # anchor in the claim text, OR numeric claims with no measurable unit
+        if ctype == "superlative":
+            procurement_failures.append(
+                (i, claim_text,
+                 "superlative claim with no named comparison anchor; "
+                 "either supply the anchor or pull from external surfaces.")
+            )
+        if op_def.startswith("TBD") and ctype == "numeric" and "unit-unknown" in op_def:
+            procurement_failures.append(
+                (i, claim_text,
+                 "numeric claim with no measurable unit attached; restate the "
+                 "claim with a unit or pull from external surfaces.")
+            )
+
+        lines.append(
+            f"| {i} | {md_escape(claim_text)} | {ctype} | {attribution} | {sot} | "
+            f"{md_escape(op_def)} | {period} | {anchor} | {audit} | "
+            f"{', '.join(md_escape(s) for s in surfaces)} | {status} |"
+        )
+
+    lines += [
+        "",
+        "## Procurement-failure claims (DO NOT SHIP)",
+        "",
+        "Each row below fails the procurement gate as currently shaped. Either "
+        "fix the row with the named remediation or pull the claim from the "
+        "surface until it's fixable.",
+        "",
+    ]
+    if procurement_failures:
+        for idx, claim_text, reason in procurement_failures:
+            lines.append(f"- **Row {idx}**: \"{md_escape(claim_text)}\". {reason}")
+    else:
+        lines.append("_(no claim flagged at this pass; every row has a measurable "
+                     "unit and named comparison hint. Operational definitions still TBD.)_")
+    lines.append("")
+
+    # Surfaces register
+    lines += [
+        "## Surfaces register (which claims ship where)",
+        "",
+    ]
+    surface_to_claims: dict[str, list[int]] = defaultdict(list)
+    for i, key in enumerate(sorted_keys, 1):
+        for s in claims_index[key]["surfaces"]:
+            surface_to_claims[s].append(i)
+    for surface, idxs in sorted(surface_to_claims.items()):
+        idx_str = ", ".join(f"#{i}" for i in sorted(idxs))
+        lines.append(f"- `{surface}`: {idx_str}")
+    lines.append("")
+
+    if surface_warnings:
+        lines += [
+            "## Surface extraction warnings",
+            "",
+        ]
+        for w in surface_warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+
+    lines += [
+        "## Audit cadence",
+        "",
+        "- **Monthly**: re-verify each LIVE claim against its source-of-truth system.",
+        "- **Quarterly**: strike claims whose audit-trail URL has decayed or whose "
+        "source-of-truth system has changed schema.",
+        "- **On change**: when a source-of-truth system updates, this register "
+        "fires a re-verify run.",
+        "",
+        "## How downstream gates read this file",
+        "",
+        "- `claim-verify` reads the operational definition column and refuses any "
+        "draft that cites a claim whose row is still in DRAFT.",
+        "- `pre-publish-check` refuses any asset that cites a claim flagged in "
+        "the Procurement-failure section.",
+        "- `case-study-compose` reads the operational_definition column to fill "
+        "the case-study frontmatter without re-deriving the definition.",
+        "",
+        "## Patterns grounded",
+        "",
+        "- `knowledge/patterns/evidence-ladder.md`",
+        "- `knowledge/patterns/anti-fabrication.md`",
+        "- `knowledge/patterns/copywriting-craft-fundamentals.md`",
+    ]
+
+    return "\n".join(lines).replace("—", ", ") + "\n"
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--client", required=True)
+    p.add_argument("--surfaces", action="append", required=True)
+    p.add_argument("--output", default=None)
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        print(f"REFUSED: client root missing: {client_root}", file=sys.stderr)
+        return 1
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    claims_index: dict = {}
+    surface_warnings: list[str] = []
+    total_text_len = 0
+
+    for s in args.surfaces:
+        label, text = fetch_surface(s)
+        if not text:
+            surface_warnings.append(f"`{label}` returned no text at compile time.")
+            continue
+        if len(text) < 500:
+            surface_warnings.append(
+                f"`{label}` extracted only {len(text)} chars; surface may be JS-driven.")
+        total_text_len += len(text)
+        for ctype, claim_text in extract_claims(text):
+            key = normalize_claim(claim_text)
+            if key not in claims_index:
+                claims_index[key] = {"display": claim_text, "type": ctype, "surfaces": []}
+            claims_index[key]["surfaces"].append(label)
+
+    if not claims_index:
+        print("REFUSED: zero claims extracted across all surfaces. Either the "
+              "surfaces are empty or rendered behind JS. Expand inputs or feed "
+              "rendered text files.", file=sys.stderr)
+        return 2
+
+    doc = compose_register(args.client, claims_index, today, surface_warnings)
+
+    if args.output:
+        out_path = Path(args.output).resolve()
+    else:
+        out_path = client_root / "allowed-claims-register.md"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(doc, encoding="utf-8")
+
+    print(f"[allowed-claims-register] wrote {out_path}", file=sys.stderr)
+    print(f"  surfaces scanned: {len(args.surfaces)} | text chars: {total_text_len}",
+          file=sys.stderr)
+    print(f"  claims extracted: {len(claims_index)}", file=sys.stderr)
+    if surface_warnings:
+        print(f"  warnings: {len(surface_warnings)}", file=sys.stderr)
+    print(f"PASS: {out_path.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,653 @@
+#!/usr/bin/env bash
+# icp-cut — substrate skill runtime (v2.0)
+#
+# Reads closed-won deals CSV (and optional reviews + events), slices by
+# firmographic + behavioral dimensions, ranks segments by composite score,
+# emits md + json + rubric.csv outputs. Refuses with fewer than 30 deals.
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+CLOSED_WON=""
+REVIEWS=""
+EVENTS=""
+TOP_SEGMENTS=5
+MIN_DEALS=30
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)         CLIENT="$2"; shift 2 ;;
+    --closed-won)     CLOSED_WON="$2"; shift 2 ;;
+    --reviews)        REVIEWS="$2"; shift 2 ;;
+    --events)         EVENTS="$2"; shift 2 ;;
+    --top-segments)   TOP_SEGMENTS="$2"; shift 2 ;;
+    --min-deals)      MIN_DEALS="$2"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+icp-cut — slice the ICP from closed-won + optional reviews + events
+
+Usage:
+  icp-cut --client <client> --closed-won <path.csv>
+          [--reviews <path.csv>] [--events <path.csv>]
+          [--top-segments N] [--min-deals 30]
+
+Required CSV columns: deal_id, account_id, closed_date, industry,
+                       company_size_band, geo, arr_usd, signup_source.
+
+See skills/icp-cut/SKILL.md for full spec.
+EOF
+      exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+if [ -z "$CLIENT" ]; then
+  echo "ERR: --client required" >&2
+  exit 4
+fi
+if [ -z "$CLOSED_WON" ]; then
+  echo "ERR: --closed-won <path.csv> required" >&2
+  exit 4
+fi
+
+skill_preflight "icp-cut" "$CLIENT" || exit 3
+
+ICP_DIR="$SUBSTRATE_ROOT/clients/$CLIENT/icp"
+mkdir -p "$ICP_DIR"
+
+exec /usr/bin/env python3 - "$SUBSTRATE_ROOT" "$CLIENT" "$CLOSED_WON" "$REVIEWS" "$EVENTS" "$TOP_SEGMENTS" "$MIN_DEALS" <<'PYEOF'
+import csv
+import json
+import math
+import os
+import sys
+import statistics
+from collections import Counter, defaultdict
+from datetime import datetime, timezone, date
+from pathlib import Path
+
+(SR, CLIENT, CW_PATH, REV_PATH, EV_PATH, TOP_N_S, MIN_DEALS_S) = sys.argv[1:8]
+SUBSTRATE_ROOT = Path(SR)
+CLIENT_ROOT = SUBSTRATE_ROOT / "clients" / CLIENT
+ICP_DIR = CLIENT_ROOT / "icp"
+ICP_DIR.mkdir(parents=True, exist_ok=True)
+TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+TOP_N = int(TOP_N_S)
+MIN_DEALS = int(MIN_DEALS_S)
+
+REQUIRED_COLS = {
+    "deal_id", "account_id", "closed_date",
+    "industry", "company_size_band", "geo",
+    "arr_usd", "signup_source",
+}
+
+
+def refuse(reason, detail=""):
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    sys.exit(3)
+
+
+def load_closed_won(path):
+    p = Path(path)
+    if not p.is_file():
+        refuse("missing-closed-won", f"{path} not found")
+    rows = []
+    with p.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            refuse("missing-required-columns", f"{path} has no header")
+        missing = REQUIRED_COLS - set(reader.fieldnames)
+        if missing:
+            refuse(
+                "missing-required-columns",
+                f"{path} missing: {sorted(missing)}",
+            )
+        for raw in reader:
+            rows.append(dict(raw))
+    if len(rows) < MIN_DEALS:
+        refuse(
+            "too-few-deals",
+            f"have {len(rows)} closed-won rows; need >= {MIN_DEALS} for an honest ICP cut",
+        )
+    return rows
+
+
+def load_optional_csv(path):
+    if not path:
+        return []
+    p = Path(path)
+    if not p.is_file():
+        print(f"  warn: optional file not found: {path}", file=sys.stderr)
+        return []
+    with p.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def to_float(v, default=0.0):
+    try:
+        return float(v) if v not in (None, "") else default
+    except (ValueError, TypeError):
+        return default
+
+
+def to_int(v, default=None):
+    try:
+        return int(float(v)) if v not in (None, "") else default
+    except (ValueError, TypeError):
+        return default
+
+
+# Size band ordering for downstream rendering
+SIZE_BAND_ORDER = [
+    "1-10", "11-50", "51-200", "201-500", "501-1000", "1000+", "1001+", "5000+",
+]
+
+
+def normalize_size_band(s):
+    s = (s or "unknown").strip()
+    return s
+
+
+def normalize_industry(s):
+    return (s or "unknown").strip().lower()
+
+
+def normalize_geo(s):
+    return (s or "unknown").strip()
+
+
+def slice_by(rows, *keys):
+    """Group rows by a tuple of keys. Returns dict[tuple] -> list[row]."""
+    out = defaultdict(list)
+    for r in rows:
+        key = tuple(r.get(k, "unknown") or "unknown" for k in keys)
+        out[key].append(r)
+    return out
+
+
+def days_since(date_str):
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    return (datetime.now(timezone.utc) - d).days
+
+
+def build_event_signal_map(event_rows):
+    """Given an events CSV, build a per-account view of:
+        - retention_12mo: did the account have any event 360+ days after close?
+        - expansion: did arr_at_event_usd ever exceed initial?
+    """
+    by_account = defaultdict(list)
+    for ev in event_rows:
+        acct = ev.get("account_id", "")
+        if not acct:
+            continue
+        by_account[acct].append(ev)
+    out = {}
+    for acct, evs in by_account.items():
+        dates = []
+        max_arr = 0.0
+        first_arr = None
+        for ev in evs:
+            try:
+                d = datetime.strptime(ev.get("event_date", ""), "%Y-%m-%d")
+                dates.append(d)
+            except Exception:
+                pass
+            v = to_float(ev.get("arr_at_event_usd"))
+            if v > max_arr:
+                max_arr = v
+            if first_arr is None and v > 0:
+                first_arr = v
+        if not dates:
+            continue
+        out[acct] = {
+            "first_event": min(dates),
+            "last_event": max(dates),
+            "max_arr_usd": max_arr,
+            "first_arr_usd": first_arr or 0.0,
+            "expansion": (max_arr > (first_arr or 0.0) * 1.10),
+            "duration_days": (max(dates) - min(dates)).days,
+        }
+    return out
+
+
+def slice_score(slice_rows, all_n, event_signals=None):
+    """Compute per-slice metrics."""
+    n = len(slice_rows)
+    if n == 0:
+        return None
+    arrs = [to_float(r.get("arr_usd")) for r in slice_rows]
+    arrs = [a for a in arrs if a > 0]
+    cacs = [to_float(r.get("cac_usd")) for r in slice_rows]
+    cacs = [c for c in cacs if c > 0]
+    ttvs = [to_int(r.get("time_to_value_days")) for r in slice_rows]
+    ttvs = [t for t in ttvs if t is not None and t >= 0]
+    median_arr = statistics.median(arrs) if arrs else 0.0
+    mean_cac = statistics.mean(cacs) if cacs else 0.0
+    median_ttv = statistics.median(ttvs) if ttvs else None
+
+    retention_12mo = None
+    expansion_share = None
+    if event_signals is not None:
+        accounts = [r.get("account_id") for r in slice_rows]
+        evs = [event_signals.get(a) for a in accounts if a in event_signals]
+        evs = [e for e in evs if e]
+        if evs:
+            retain_count = 0
+            expand_count = 0
+            for r, ev in zip(slice_rows, evs):
+                close_str = r.get("closed_date", "")
+                try:
+                    close_d = datetime.strptime(close_str, "%Y-%m-%d")
+                except Exception:
+                    continue
+                age_days = (ev["last_event"] - close_d).days
+                if age_days >= 360:
+                    retain_count += 1
+                if ev["expansion"]:
+                    expand_count += 1
+            retention_12mo = retain_count / len(evs)
+            expansion_share = expand_count / len(evs)
+
+    # LTV proxy: 3-year ARR (median × 3) when retention not measured
+    ltv = (median_arr * 3) if retention_12mo is None else (median_arr * (1 + 2 * retention_12mo))
+    ltv_multiple = (ltv / mean_cac) if mean_cac > 0 else None
+
+    volume_share = n / all_n if all_n else 0.0
+
+    # Composite rank: log-volume × ARR band score × LTV multiple (where present) × retention proxy
+    arr_band_score = math.log10(median_arr + 100)
+    rank = (volume_share * 100) * arr_band_score
+    if ltv_multiple:
+        rank *= max(0.5, min(3.0, ltv_multiple / 3.0))
+    if retention_12mo is not None:
+        rank *= max(0.4, retention_12mo)
+
+    # Sample-size flag
+    sample_size_flag = "early-signal" if n < 5 else None
+
+    return {
+        "n": n,
+        "volume_share_pct": round(volume_share * 100, 2),
+        "median_arr_usd": round(median_arr, 2),
+        "mean_cac_usd": round(mean_cac, 2) if mean_cac else None,
+        "ltv_multiple": round(ltv_multiple, 2) if ltv_multiple else None,
+        "median_time_to_value_days": median_ttv,
+        "retention_12mo_pct": round(retention_12mo * 100, 1) if retention_12mo is not None else None,
+        "expansion_share_pct": round(expansion_share * 100, 1) if expansion_share is not None else None,
+        "rank_score": round(rank, 3),
+        "sample_size_flag": sample_size_flag,
+    }
+
+
+def conversion_by_source(rows, event_rows):
+    """Compute closed-won-rate per signup-source.
+
+    Requires events.csv with signup events. If unavailable, returns None.
+    """
+    if not event_rows:
+        return None
+    signups_by_source = Counter()
+    for ev in event_rows:
+        if (ev.get("event_name") or "").lower() == "signup":
+            src = ev.get("signup_source") or ev.get("source") or "unknown"
+            signups_by_source[src] += 1
+    if not signups_by_source:
+        return None
+    won_by_source = Counter(r.get("signup_source", "unknown") for r in rows)
+    out = {}
+    for src, signups in signups_by_source.most_common():
+        won = won_by_source.get(src, 0)
+        rate = won / signups if signups else 0.0
+        out[src] = {
+            "signups": signups,
+            "closed_won": won,
+            "conv_rate_pct": round(rate * 100, 2),
+        }
+    return out
+
+
+def compute_anti_icp(scored, all_rank):
+    """Anti-ICP = slices below median rank with >= 5 deals where mean_cac > median_arr × 0.4
+    (acquisition cost is consuming most of first-year ARR).
+    """
+    if not scored:
+        return []
+    ranks = [s["rank_score"] for _, s in scored]
+    if not ranks:
+        return []
+    median_rank = statistics.median(ranks)
+    out = []
+    for key, s in scored:
+        if s["sample_size_flag"]:
+            continue
+        if s["rank_score"] >= median_rank:
+            continue
+        cac = s["mean_cac_usd"] or 0.0
+        arr = s["median_arr_usd"] or 0.0
+        if cac and arr and cac > arr * 0.4:
+            out.append((key, s, "CAC consumes >40% of first-year ARR"))
+            continue
+        if s["ltv_multiple"] is not None and s["ltv_multiple"] < 1.5:
+            out.append((key, s, f"LTV multiple {s['ltv_multiple']} < 1.5"))
+    return out
+
+
+def fetch_voc_jtbd_overlay():
+    """If the client has a frontline-contact findings file, pull the top JTBD
+    hooks for the JTBD overlay. Returns a small dict or None.
+    """
+    findings_dir = CLIENT_ROOT / "voc" / "findings"
+    if not findings_dir.exists():
+        return None
+    candidates = sorted(findings_dir.glob("*.json"), reverse=True)
+    if not candidates:
+        return None
+    try:
+        payload = json.loads(candidates[0].read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    jtbd = payload.get("themes", {}).get("jtbd", {})
+    if not jtbd:
+        return None
+    ranked = sorted(jtbd.items(), key=lambda x: -x[1].get("count", 0))[:5]
+    return {
+        "source_findings": str(candidates[0].relative_to(SUBSTRATE_ROOT)),
+        "top_jtbd_hooks": [
+            {"hook": k, "count": v["count"], "files": len(v.get("source_files", []))}
+            for k, v in ranked
+        ],
+    }
+
+
+def render_md(rows, scored, top_segments, anti_icp, conv_by_src, jtbd_overlay):
+    parts = []
+    parts.append("---")
+    parts.append(f"title: ICP cut, {CLIENT}, {TODAY}")
+    parts.append("status: active")
+    parts.append(f"last_updated: {TODAY}")
+    parts.append("produced_by: icp-cut")
+    parts.append("patterns_grounded: [jtbd-as-buyer-mental-model, frontline-as-pmm-substrate, specificity-becomes-profitable, market-and-offer-beat-funnel-optimisation]")
+    parts.append(f"client: {CLIENT}")
+    parts.append(f"closed_won_n: {len(rows)}")
+    parts.append(f"closed_won_source: {CW_PATH}")
+    if REV_PATH:
+        parts.append(f"reviews_source: {REV_PATH}")
+    if EV_PATH:
+        parts.append(f"events_source: {EV_PATH}")
+    parts.append("---")
+    parts.append("")
+    parts.append(f"# ICP cut, {CLIENT}, {TODAY}")
+    parts.append("")
+    parts.append(
+        f"_Source corpus: {len(rows)} closed-won rows from `{CW_PATH}`. "
+        f"Optional inputs: reviews=`{REV_PATH or 'none'}`, events=`{EV_PATH or 'none'}`._"
+    )
+    parts.append("")
+
+    # Cohort summary
+    industries = Counter(normalize_industry(r["industry"]) for r in rows)
+    sizes = Counter(normalize_size_band(r["company_size_band"]) for r in rows)
+    geos = Counter(normalize_geo(r["geo"]) for r in rows)
+    sources = Counter((r.get("signup_source") or "unknown") for r in rows)
+    parts.append("## 1. Corpus distribution")
+    parts.append("")
+    parts.append("### Industry")
+    parts.append("")
+    parts.append("| Industry | n | % |")
+    parts.append("|---|---:|---:|")
+    for k, n in industries.most_common(10):
+        parts.append(f"| {k} | {n} | {round(n/len(rows)*100,1)}% |")
+    parts.append("")
+    parts.append("### Size band")
+    parts.append("")
+    parts.append("| Size | n | % |")
+    parts.append("|---|---:|---:|")
+    for k, n in sizes.most_common():
+        parts.append(f"| {k} | {n} | {round(n/len(rows)*100,1)}% |")
+    parts.append("")
+    parts.append("### Geo")
+    parts.append("")
+    parts.append("| Geo | n | % |")
+    parts.append("|---|---:|---:|")
+    for k, n in geos.most_common(10):
+        parts.append(f"| {k} | {n} | {round(n/len(rows)*100,1)}% |")
+    parts.append("")
+    parts.append("### Signup source")
+    parts.append("")
+    parts.append("| Source | n | % |")
+    parts.append("|---|---:|---:|")
+    for k, n in sources.most_common():
+        parts.append(f"| {k} | {n} | {round(n/len(rows)*100,1)}% |")
+    parts.append("")
+
+    # Top segments (industry × size)
+    parts.append("## 2. Ranked ICP segments (industry × size band)")
+    parts.append("")
+    parts.append(
+        "Composite rank: `volume_share × log10(median_arr+100) × ltv_multiple_factor × retention_factor`. "
+        "Slices with fewer than 5 deals are flagged `early-signal` and excluded from the rank."
+    )
+    parts.append("")
+    parts.append("| Rank | Industry | Size band | n | Vol% | Median ARR | Mean CAC | LTV× | TTV days | Retention% | Expansion% | Score |")
+    parts.append("|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for i, (key, s) in enumerate(top_segments, 1):
+        ind, size = key
+        ltv_s = f"{s['ltv_multiple']:.2f}" if s['ltv_multiple'] else "—"
+        cac_s = f"${s['mean_cac_usd']:,.0f}" if s['mean_cac_usd'] else "—"
+        ttv_s = str(s['median_time_to_value_days']) if s['median_time_to_value_days'] is not None else "—"
+        ret_s = f"{s['retention_12mo_pct']}%" if s['retention_12mo_pct'] is not None else "—"
+        exp_s = f"{s['expansion_share_pct']}%" if s['expansion_share_pct'] is not None else "—"
+        parts.append(
+            f"| {i} | {ind} | {size} | {s['n']} | {s['volume_share_pct']}% | "
+            f"${s['median_arr_usd']:,.0f} | {cac_s} | {ltv_s} | {ttv_s} | {ret_s} | {exp_s} | {s['rank_score']} |"
+        )
+    parts.append("")
+
+    # Anti-ICP
+    parts.append("## 3. Anti-ICP (do not target)")
+    parts.append("")
+    if anti_icp:
+        parts.append("Per the rule that skipping anti-ICP is positioning failure. These slices burn acquisition cost without recovery; the rank score is below median AND CAC consumes >40% of first-year ARR or LTV× < 1.5.")
+        parts.append("")
+        parts.append("| Industry | Size band | n | Median ARR | Mean CAC | LTV× | Reason |")
+        parts.append("|---|---|---:|---:|---:|---:|---|")
+        for key, s, reason in anti_icp:
+            ind, size = key
+            cac_s = f"${s['mean_cac_usd']:,.0f}" if s['mean_cac_usd'] else "—"
+            ltv_s = f"{s['ltv_multiple']:.2f}" if s['ltv_multiple'] else "—"
+            parts.append(
+                f"| {ind} | {size} | {s['n']} | ${s['median_arr_usd']:,.0f} | {cac_s} | {ltv_s} | {reason} |"
+            )
+    else:
+        parts.append("_No anti-ICP slices detected at current thresholds. Re-run with stricter thresholds if the segments still feel too broad._")
+    parts.append("")
+
+    # Conversion by source
+    parts.append("## 4. Conversion-rate per signup-source")
+    parts.append("")
+    if conv_by_src:
+        parts.append("Closed-won rate by source. High-volume sources with low conv-rate are channel-quality problems; low-volume sources with high conv-rate are scaling candidates.")
+        parts.append("")
+        parts.append("| Source | Signups | Closed-won | Conv rate |")
+        parts.append("|---|---:|---:|---:|")
+        for src, m in conv_by_src.items():
+            parts.append(f"| {src} | {m['signups']} | {m['closed_won']} | {m['conv_rate_pct']}% |")
+    else:
+        parts.append("_No events.csv with `signup` events provided; conversion-rate not computed._")
+    parts.append("")
+
+    # JTBD overlay
+    parts.append("## 5. JTBD overlay (from VoC findings)")
+    parts.append("")
+    if jtbd_overlay:
+        parts.append(f"_From `{jtbd_overlay['source_findings']}`._")
+        parts.append("")
+        parts.append("| Top JTBD hook | Mentions | Files |")
+        parts.append("|---|---:|---:|")
+        for h in jtbd_overlay["top_jtbd_hooks"]:
+            parts.append(f"| {h['hook']} | {h['count']} | {h['files']} |")
+        parts.append("")
+        parts.append("Pair the top segment with the top JTBD: this is the verbatim language the messaging-matrix should test first. Per `knowledge/patterns/jtbd-as-buyer-mental-model.md`.")
+    else:
+        parts.append("_No `voc/findings/*.json` available. Run `frontline-contact` first; the JTBD overlay sharpens the segment from a slice into a buyer mental model._")
+    parts.append("")
+
+    # ICP rubric (top 3 segments)
+    parts.append("## 6. ICP scoring rubric (auto-derived)")
+    parts.append("")
+    parts.append("Use this rubric in RevOps for account scoring. Each dimension is weighted by its contribution to the rank score across the top 3 segments.")
+    parts.append("")
+    parts.append("| Dimension | Top-3 winning value(s) | Weight | Threshold |")
+    parts.append("|---|---|---:|---|")
+    if top_segments:
+        top_inds = [k[0] for k, _ in top_segments[:3]]
+        top_sizes = [k[1] for k, _ in top_segments[:3]]
+        rubric = [
+            ("industry", ", ".join(sorted(set(top_inds))), 0.35, "exact match required"),
+            ("company_size_band", ", ".join(sorted(set(top_sizes))), 0.25, "exact match required"),
+            ("median_arr_band", f">= ${min((s['median_arr_usd'] for _, s in top_segments[:3])):,.0f}", 0.15, "first-year ARR floor"),
+            ("retention_12mo", "above corpus median when known", 0.10, "skip if unknown"),
+            ("signup_source", ", ".join([s for s, _ in sources.most_common(3)]), 0.10, "high-conv sources only"),
+            ("ttv_band", "<= corpus median (faster activation)", 0.05, "skip if unknown"),
+        ]
+        for dim, val, w, thresh in rubric:
+            parts.append(f"| {dim} | {val} | {w} | {thresh} |")
+    parts.append("")
+
+    # Substrate citations
+    parts.append("## 7. Substrate citations")
+    parts.append("")
+    parts.append(f"- Closed-won source: `{CW_PATH}` ({len(rows)} rows)")
+    if REV_PATH:
+        parts.append(f"- Reviews source: `{REV_PATH}`")
+    if EV_PATH:
+        parts.append(f"- Events source: `{EV_PATH}`")
+    parts.append(f"- Positioning: `clients/{CLIENT}/positioning/positioning-canonical-statement.md`")
+    parts.append("- Patterns:")
+    parts.append("  - `knowledge/patterns/jtbd-as-buyer-mental-model.md`")
+    parts.append("  - `knowledge/patterns/frontline-as-pmm-substrate.md`")
+    parts.append("  - `knowledge/patterns/specificity-becomes-profitable.md`")
+    parts.append("  - `knowledge/patterns/market-and-offer-beat-funnel-optimisation.md`")
+    parts.append("")
+    parts.append("## Next reads")
+    parts.append("")
+    parts.append(f"- `substrate positioning-forge --client {CLIENT} --diagnose` to refresh the canonical statement against the new ICP cut.")
+    parts.append(f"- `substrate messaging-matrix --client {CLIENT}` to compose persona × use-case grid for the top 3 segments.")
+    parts.append(f"- `substrate ad-spend-allocate --client {CLIENT}` to retarget paid budget against ranked segments.")
+
+    return "\n".join(parts)
+
+
+def write_rubric_csv(top_segments, sources, out_path):
+    if not top_segments:
+        return
+    top_inds = [k[0] for k, _ in top_segments[:3]]
+    top_sizes = [k[1] for k, _ in top_segments[:3]]
+    min_arr = min((s["median_arr_usd"] for _, s in top_segments[:3]))
+    rubric_rows = [
+        {"dimension": "industry", "winning_values": ", ".join(sorted(set(top_inds))), "weight": 0.35, "threshold": "exact match required"},
+        {"dimension": "company_size_band", "winning_values": ", ".join(sorted(set(top_sizes))), "weight": 0.25, "threshold": "exact match required"},
+        {"dimension": "median_arr_band", "winning_values": f">= {min_arr}", "weight": 0.15, "threshold": "first-year ARR floor"},
+        {"dimension": "retention_12mo", "winning_values": "above corpus median when known", "weight": 0.10, "threshold": "skip if unknown"},
+        {"dimension": "signup_source", "winning_values": ", ".join([s for s, _ in sources.most_common(3)]), "weight": 0.10, "threshold": "high-conv sources only"},
+        {"dimension": "ttv_band", "winning_values": "<= corpus median (faster activation)", "weight": 0.05, "threshold": "skip if unknown"},
+    ]
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["dimension", "winning_values", "weight", "threshold"])
+        writer.writeheader()
+        for r in rubric_rows:
+            writer.writerow(r)
+
+
+def main():
+    rows = load_closed_won(CW_PATH)
+    review_rows = load_optional_csv(REV_PATH)
+    event_rows = load_optional_csv(EV_PATH)
+    event_signals = build_event_signal_map(event_rows) if event_rows else None
+
+    # Slice by industry × size band
+    slices = slice_by(rows, "industry", "company_size_band")
+    scored = []
+    for key, slice_rows in slices.items():
+        s = slice_score(slice_rows, len(rows), event_signals=event_signals)
+        if s and not s["sample_size_flag"]:
+            scored.append((key, s))
+
+    scored.sort(key=lambda kv: -kv[1]["rank_score"])
+    top_segments = scored[:TOP_N]
+
+    # Anti-ICP overlap check: refuse if anti-ICP overlaps top-3 on >=2 dims
+    anti_icp = compute_anti_icp(scored, None)
+    overlap_dim = 0
+    if top_segments and anti_icp:
+        top_inds = {k[0] for k, _ in top_segments[:3]}
+        top_sizes = {k[1] for k, _ in top_segments[:3]}
+        for key, _, _ in anti_icp:
+            ind, size = key
+            d = 0
+            if ind in top_inds:
+                d += 1
+            if size in top_sizes:
+                d += 1
+            overlap_dim = max(overlap_dim, d)
+        if overlap_dim >= 2:
+            print(
+                f"  warn: anti-ICP overlaps top-3 on {overlap_dim} dimensions; cut harder.",
+                file=sys.stderr,
+            )
+
+    conv_by_src = conversion_by_source(rows, event_rows)
+    jtbd_overlay = fetch_voc_jtbd_overlay()
+    sources = Counter((r.get("signup_source") or "unknown") for r in rows)
+
+    md = render_md(rows, scored, top_segments, anti_icp, conv_by_src, jtbd_overlay)
+    md_path = ICP_DIR / f"icp-cut-{TODAY}.md"
+    md_path.write_text(md, encoding="utf-8")
+
+    json_payload = {
+        "client": CLIENT,
+        "generated_at": TODAY,
+        "closed_won_source": CW_PATH,
+        "closed_won_n": len(rows),
+        "ranked_segments": [
+            {"industry": k[0], "size_band": k[1], **s} for k, s in scored
+        ],
+        "top_segments": [
+            {"industry": k[0], "size_band": k[1], **s} for k, s in top_segments
+        ],
+        "anti_icp": [
+            {"industry": k[0], "size_band": k[1], "reason": reason, **s}
+            for k, s, reason in anti_icp
+        ],
+        "conversion_by_source": conv_by_src,
+        "jtbd_overlay": jtbd_overlay,
+        "sources_distribution": dict(sources),
+        "anti_icp_overlap_dim": overlap_dim,
+    }
+    json_path = ICP_DIR / f"icp-cut-{TODAY}.json"
+    json_path.write_text(json.dumps(json_payload, indent=2), encoding="utf-8")
+
+    csv_path = ICP_DIR / f"icp-rubric-{TODAY}.csv"
+    write_rubric_csv(top_segments, sources, csv_path)
+
+    print(f"[icp-cut] markdown: {md_path}")
+    print(f"[icp-cut] json:     {json_path}")
+    print(f"[icp-cut] rubric:   {csv_path}")
+
+    if overlap_dim >= 2:
+        print(f"[icp-cut] EXIT 1: anti-ICP overlap on {overlap_dim} dimensions; cut harder.", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+
+main()
+PYEOF

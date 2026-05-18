@@ -1,0 +1,152 @@
+# Example influencer roster for `influencer-fit-score`.
+#
+# Copy to clients/<client>/social/influencers.yaml and curate. The skill
+# scores each row against canonical positioning, ICP, brand voice, and
+# (optionally) a closed-won-contact CSV for audience-overlap signal.
+#
+# Per `pat_creator-not-corporate`, default the program toward personal
+# accounts; corporate-handle collaborations are rare and reserved for
+# co-branded announcements, not for growth.
+#
+# Per `pat_distribution-as-moat`, treat tier-1A partnerships as multi-quarter
+# relationship investments, not one-shot campaigns. Earned-channel
+# relationships outlast rented spend.
+#
+# Per `pat_native-format-beats-cross-post`, partnership content rewrites per
+# platform; do not cross-post wholesale.
+#
+# Schema: see knowledge/patterns/creator-not-corporate.md and the
+# influencer-fit-score SKILL.md for field definitions.
+
+influencers:
+  - handle: "@operator-justin"
+    name: "Justin Operator"
+    platform: linkedin
+    follower_count: 102000
+    audience_role: ["VP sales", "head of sales", "CRO"]
+    audience_industry: ["B2B SaaS", "vertical software"]
+    primary_topics: ["pipeline-coverage", "outbound-discipline", "rep-experience"]
+    voice_signals: ["plain-spoken", "data-cited", "founder-tone"]
+    prior_collabs: []
+    competitor_collabs: []
+    brand_safety_flags: []
+    sample_posts:
+      - "https://www.linkedin.com/posts/example-justin-1"
+      - "https://www.linkedin.com/posts/example-justin-2"
+    notes: "Has run his own newsletter for 4 years; consistently mines real-rep frictions."
+
+  - handle: "@growth-sahil"
+    name: "Sahil Growth"
+    platform: x
+    follower_count: 280000
+    audience_role: ["growth lead", "head of marketing", "startup founder"]
+    audience_industry: ["B2B SaaS", "consumer-tech"]
+    primary_topics: ["growth-loops", "creator-economics", "distribution"]
+    voice_signals: ["specific", "data-cited", "concrete"]
+    prior_collabs: ["acme-saas", "beta-tools"]
+    competitor_collabs: []
+    brand_safety_flags: []
+    sample_posts:
+      - "https://x.com/example/status/sahil-1"
+      - "https://x.com/example/status/sahil-2"
+    notes: "Mixed B2B/B2C audience; the B2B portion overlaps strongly with the head-of-growth ICP."
+
+  - handle: "@linkedin-coach-jasmin"
+    name: "Jasmin Coach"
+    platform: linkedin
+    follower_count: 64000
+    audience_role: ["content marketer", "marketing manager", "PMM"]
+    audience_industry: ["B2B SaaS", "B2B services"]
+    primary_topics: ["linkedin-format", "content-cadence", "writing-craft"]
+    voice_signals: ["plain-spoken", "operator", "specific"]
+    prior_collabs: ["copy-tool-startup"]
+    competitor_collabs: []
+    brand_safety_flags: []
+    sample_posts:
+      - "https://www.linkedin.com/posts/example-jasmin-1"
+    notes: "Format-discipline coaching; high engagement on craft posts but audience is more marketer than seller."
+
+  - handle: "@founder-rb2b"
+    name: "Adam B2B"
+    platform: linkedin
+    follower_count: 88000
+    audience_role: ["founder", "head of growth", "VP sales"]
+    audience_industry: ["B2B SaaS"]
+    primary_topics: ["warm-outbound", "founder-led-growth", "rb2b-product"]
+    voice_signals: ["founder-tone", "specific", "concrete"]
+    prior_collabs: ["rb2b"]
+    competitor_collabs: []
+    brand_safety_flags: []
+    sample_posts:
+      - "https://www.linkedin.com/posts/example-rb2b-1"
+    notes: "Strong founder-narrative voice; tends to anchor posts on his own product. Co-authoring works if framing avoids product overlap."
+
+  - handle: "@enterprise-cro-thought"
+    name: "Patricia Enterprise"
+    platform: linkedin
+    follower_count: 41000
+    audience_role: ["CRO", "VP sales", "head of sales operations"]
+    audience_industry: ["enterprise SaaS", "fintech"]
+    primary_topics: ["sales-leadership", "pipeline-economics", "rep-coaching"]
+    voice_signals: ["operator", "specific"]
+    prior_collabs: ["competitor-acme"]
+    competitor_collabs: ["acme-rev"]
+    brand_safety_flags: []
+    sample_posts:
+      - "https://www.linkedin.com/posts/example-patricia-1"
+    notes: "Strong audience overlap but currently runs a paid partnership with a named competitor; will be flagged."
+
+  - handle: "@viral-tiktok-creator"
+    name: "Riley Viral"
+    platform: tiktok
+    follower_count: 540000
+    audience_role: ["consumer", "lifestyle", "general-tech-adjacent"]
+    audience_industry: ["lifestyle", "consumer-tech"]
+    primary_topics: ["productivity-hacks", "office-life", "lifestyle"]
+    voice_signals: ["entertaining", "young-skewing"]
+    prior_collabs: []
+    competitor_collabs: []
+    brand_safety_flags: []
+    sample_posts:
+      - "https://www.tiktok.com/@example/video/riley-1"
+    notes: "Reach is large but audience is consumer; ICP fit is poor for B2B SaaS. Useful for awareness, not pipeline."
+
+  - handle: "@brand-controversy-creator"
+    name: "Off-Brand Op"
+    platform: x
+    follower_count: 120000
+    audience_role: ["mixed"]
+    audience_industry: ["mixed"]
+    primary_topics: ["edgy-takes", "current-events"]
+    voice_signals: ["combative", "polarizing"]
+    prior_collabs: []
+    competitor_collabs: []
+    brand_safety_flags: ["repeated-public-controversy", "non-brand-safe-positions"]
+    sample_posts:
+      - "https://x.com/example/status/controversy-1"
+    notes: "Brand-safety risk is real; will be hard-disqualified."
+
+  - handle: "@pmm-data-creator"
+    name: "Data PMM"
+    platform: linkedin
+    follower_count: 22000
+    audience_role: ["PMM", "head of marketing", "growth lead"]
+    audience_industry: ["B2B SaaS"]
+    primary_topics: ["pmm-craft", "narrative-strategy", "category-design"]
+    voice_signals: ["plain-spoken", "data-cited", "first-hand"]
+    prior_collabs: []
+    competitor_collabs: []
+    brand_safety_flags: []
+    sample_posts:
+      - "https://www.linkedin.com/posts/example-data-pmm-1"
+    notes: "Smaller audience but very high alignment; strong tier-1B candidate for an exploratory collab."
+
+# Ranking notes:
+# - Tier 1A is rare by design; the band is narrow and the hard rules at the
+#   top are stricter than at lower tiers.
+# - When the closed-won-contact CSV is supplied, the audience_overlap
+#   dimension contributes 0.25 of the composite; without it, the dimension
+#   scores 0 across the roster and rankings are depressed.
+# - Brand-safety flags are hard-disqualifications, not warnings.
+# - Active competitor collabs are hard-disqualifications when the competitive
+#   layer names the slug.

@@ -1,0 +1,13 @@
+{
+  "linkset": [
+    {
+      "anchor": "https://substrate.iamkesava.com/",
+      "links": [
+        { "rel": "service-doc", "href": "https://substrate.iamkesava.com/llms.txt" },
+        { "rel": "describedby", "href": "https://substrate.iamkesava.com/.well-known/agent-permissions.json" },
+        { "rel": "sitemap", "href": "https://substrate.iamkesava.com/sitemap.xml" },
+        { "rel": "service-desc", "href": "https://github.com/k3sava/substrate#substrate" }
+      ]
+    }
+  ]
+}

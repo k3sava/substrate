@@ -1,0 +1,773 @@
+#!/usr/bin/env python3
+"""influencer-fit-score — score and tier an influencer roster against canonical
+ICP, brand voice, and audience overlap.
+
+Reads clients/<client>/social/influencers.yaml. Produces a ranked markdown
+report with per-influencer composite scores, dimension breakdowns, hard-rule
+disqualifications, and tier-recommended pursuits. Refuses on substrate gaps.
+
+The fit model is read from canonical substrate, not invented per session. The
+ranking compounds across cycles because the same canonical position scores
+every roster the same way; differences come from candidate quality, not from
+drifting criteria.
+
+Usage:
+    influencer-fit-score --client <client> [--influencers <yaml>]
+                         [--platform <linkedin|x|tiktok|instagram|youtube>]
+                         [--top-n <int>] [--audience-overlap-csv <path>]
+                         [--out <path>]
+
+Exit codes:
+    0 — ranking written
+    3 — refused (substrate gap, missing positioning, missing roster)
+    4 — invalid args or schema-broken roster
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+
+
+# Scoring weights per SKILL.md
+WEIGHTS = {
+    "icp_fit": 0.30,
+    "audience_overlap": 0.25,
+    "voice_alignment": 0.20,
+    "topic_alignment": 0.15,
+    "prior_relationship": 0.10,
+}
+
+# Tier bands on the 0-100 normalized composite
+TIER_BANDS = [
+    ("1A", 75, 100),
+    ("1B", 55, 74),
+    ("2", 35, 54),
+    ("defer", 0, 34),
+]
+
+PURSUIT_MAP = {
+    "1A": "Primary partner; co-authored long-form + cross-promotion",
+    "1B": "Exploratory; one-off collab with a measurement contract",
+    "2": "Watch; track for 90 days, re-score",
+    "defer": "Do not pursue this cycle",
+    "dq": "Disqualified; see reasons",
+}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def read_file_or_none(path: Path) -> str | None:
+    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+
+# ---- Substrate readers ----
+
+def extract_canonical_statement(text: str) -> str:
+    in_block = False
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(canonical|the position|statement|positioning)\b",
+                    s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s:
+                out.append(s)
+    return "\n".join(out).strip() or text[:400].strip()
+
+
+def extract_anchors(positioning_text: str) -> list[str]:
+    """Pull load-bearing terms (5+ chars) from canonical statement."""
+    canonical = extract_canonical_statement(positioning_text)
+    candidates = re.findall(r"[a-z][a-z-]{4,}", canonical.lower())
+    seen: set[str] = set()
+    out: list[str] = []
+    stop = {"unlike", "which", "their", "every", "those", "where", "while",
+            "without", "across", "against", "around", "before", "after",
+            "still", "would", "should", "could", "about", "other"}
+    for w in candidates:
+        if w not in seen and w not in stop:
+            seen.add(w)
+            out.append(w)
+    return out[:25]
+
+
+def extract_icp_profile(icp_text: str | None) -> dict[str, list[str]]:
+    """Parse ICP layer for industries / roles / anti-industries."""
+    profile = {
+        "industries": [],
+        "roles": [],
+        "anti_industries": [],
+        "anti_roles": [],
+    }
+    if not icp_text:
+        return profile
+    for line in icp_text.splitlines():
+        l = line.strip().lower()
+        m = re.match(r"^industries?\s*:\s*(.+)$", l)
+        if m:
+            profile["industries"].extend(_split_list(m.group(1)))
+        m = re.match(r"^anti[_-]?industries?\s*:\s*(.+)$", l)
+        if m:
+            profile["anti_industries"].extend(_split_list(m.group(1)))
+        m = re.match(r"^roles?\s*:\s*(.+)$", l)
+        if m:
+            profile["roles"].extend(_split_list(m.group(1)))
+        m = re.match(r"^anti[_-]?roles?\s*:\s*(.+)$", l)
+        if m:
+            profile["anti_roles"].extend(_split_list(m.group(1)))
+        m = re.match(r"^(?:-\s*)?(?:role|industry|target[_-]?role|target[_-]?industry)\s*:\s*(.+)$", l)
+        if m:
+            value = m.group(1).strip()
+            if "industry" in l:
+                profile["industries"].append(value)
+            else:
+                profile["roles"].append(value)
+    for k in profile:
+        profile[k] = sorted({v.strip().lower() for v in profile[k] if v.strip()})
+    return profile
+
+
+def extract_kill_list(brand_voice_text: str | None) -> list[str]:
+    default = ["orchestration", "seamless", "strategic", "leverage", "transform",
+               "holistic", "synergy", "bespoke", "unlock", "robust", "sophisticated",
+               "comprehensive"]
+    if not brand_voice_text:
+        return default
+    out: list[str] = []
+    in_block = False
+    for line in brand_voice_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(kill[-\s]?list|words to avoid|banned|do not use)\b",
+                    s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s.startswith("-") or s.startswith("*"):
+                out.append(s.lstrip("-* ").strip().lower())
+    return out or default
+
+
+def extract_competitor_slugs(competitive_text: str | None) -> list[str]:
+    if not competitive_text:
+        return []
+    out: list[str] = []
+    for line in competitive_text.splitlines():
+        s = line.strip().lower()
+        m = re.match(r"^#+\s*(?:competitor|battle[-\s]?card)[\s:]+(.+)$", s)
+        if m:
+            slug = re.sub(r"[^a-z0-9-]+", "-", m.group(1).strip()).strip("-")
+            if slug:
+                out.append(slug)
+        m = re.match(r"^[-*]\s*competitor\s*:\s*(.+)$", s)
+        if m:
+            out.append(m.group(1).strip())
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for c in out:
+        c = c.lower().strip()
+        if c and c not in seen:
+            seen.add(c)
+            deduped.append(c)
+    return deduped
+
+
+def _split_list(s: str) -> list[str]:
+    s = s.strip()
+    s = s.strip("[]")
+    parts = re.split(r"[,;|]", s)
+    return [re.sub(r"^[\"'\s]+|[\"'\s]+$", "", p) for p in parts if p.strip()]
+
+
+# ---- Naive YAML loader (avoids PyYAML dep) ----
+
+def parse_influencers_yaml(path: Path) -> list[dict]:
+    """Read a YAML-shaped influencers roster.
+
+    The schema is documented in templates/social-influencers-example.yaml.
+    Top-level key `influencers:` is a list of mappings. Each mapping uses
+    scalar fields and a few list fields. The loader is intentionally naive:
+    it handles the documented shape and refuses anything that deviates.
+    """
+    text = path.read_text(encoding="utf-8")
+    influencers: list[dict] = []
+    cur: dict | None = None
+    cur_list_key: str | None = None
+    in_root = False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        s = line.lstrip()
+        if not s or s.startswith("#"):
+            continue
+        if not in_root:
+            if re.match(r"^influencers\s*:\s*$", line.strip()):
+                in_root = True
+            continue
+        # Detect top-level new-influencer marker: "  - handle: ..."
+        m = re.match(r"^\s*-\s*([a-z_]+)\s*:\s*(.*)$", line)
+        if m:
+            if cur is not None:
+                influencers.append(cur)
+            cur = {}
+            cur_list_key = None
+            key, value = m.group(1).strip(), m.group(2).strip()
+            cur[key] = _coerce_yaml_scalar(value)
+            continue
+        # Continuation list item under a list-typed field
+        m = re.match(r"^\s+-\s+(.+)$", line)
+        if m and cur is not None and cur_list_key:
+            v = _coerce_yaml_scalar(m.group(1).strip())
+            cur.setdefault(cur_list_key, []).append(v)
+            continue
+        # Field within current influencer
+        m = re.match(r"^\s+([a-z_]+)\s*:\s*(.*)$", line)
+        if m and cur is not None:
+            key, value = m.group(1).strip(), m.group(2).strip()
+            if value == "" or value == "[]":
+                cur_list_key = key if value == "" else None
+                cur[key] = []
+                continue
+            if value.startswith("[") and value.endswith("]"):
+                cur[key] = [_coerce_yaml_scalar(p)
+                            for p in _split_list(value)]
+                cur_list_key = None
+                continue
+            cur[key] = _coerce_yaml_scalar(value)
+            cur_list_key = None
+            continue
+    if cur is not None:
+        influencers.append(cur)
+    return influencers
+
+
+def _coerce_yaml_scalar(value: str):
+    v = value.strip()
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    if v.startswith("'") and v.endswith("'"):
+        return v[1:-1]
+    if v.lower() in ("true", "yes"):
+        return True
+    if v.lower() in ("false", "no"):
+        return False
+    if re.match(r"^-?\d+$", v):
+        return int(v)
+    if re.match(r"^-?\d+\.\d+$", v):
+        return float(v)
+    return v
+
+
+# ---- Audience overlap CSV ----
+
+def load_overlap_handles(path: Path) -> set[str]:
+    """Load a closed-won contacts CSV. Looks for handle / linkedin / twitter
+    columns and returns a normalized set of handles."""
+    handles: set[str] = set()
+    with path.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            return handles
+        cols = [c.lower() for c in reader.fieldnames]
+        handle_cols = [c for c in cols if any(
+            kw in c for kw in ("handle", "linkedin", "twitter", "url", "profile"))]
+        for row in reader:
+            row_l = {k.lower(): (v or "").strip() for k, v in row.items()}
+            for c in handle_cols:
+                v = row_l.get(c, "")
+                if not v:
+                    continue
+                norm = v.lower().strip().rstrip("/")
+                norm = norm.split("/")[-1] if "/" in norm else norm
+                norm = norm.lstrip("@")
+                if norm:
+                    handles.add(norm)
+    return handles
+
+
+# ---- Per-dimension scorers ----
+
+def score_icp_fit(inf: dict, icp: dict) -> tuple[float, str]:
+    aud_role = [r.lower() for r in (inf.get("audience_role") or [])]
+    aud_ind = [i.lower() for i in (inf.get("audience_industry") or [])]
+
+    if any(i in icp["anti_industries"] for i in aud_ind):
+        return 0.0, "anti-ICP industry in audience (hard-disqualify)"
+
+    if any(r in icp["anti_roles"] for r in aud_role):
+        return 0.0, "anti-ICP role in audience (hard-disqualify)"
+
+    score = 0.0
+    parts = []
+
+    # Role match: 0.5 of dimension
+    if not icp["roles"]:
+        score += 0.5 * 0.5
+        parts.append("roles: ICP-not-pinned")
+    elif aud_role and any(_loose_match(r, ir)
+                          for r in aud_role for ir in icp["roles"]):
+        score += 0.5
+        matched = [r for r in aud_role if any(_loose_match(r, ir)
+                                              for ir in icp["roles"])]
+        parts.append(f"role-match: {', '.join(matched[:2])}")
+    else:
+        parts.append(f"role-miss: {', '.join(aud_role[:2]) or 'unknown'}")
+
+    # Industry match: 0.5 of dimension
+    if not icp["industries"]:
+        score += 0.5 * 0.5
+        parts.append("industries: ICP-not-pinned")
+    elif aud_ind and any(_loose_match(i, ii)
+                         for i in aud_ind for ii in icp["industries"]):
+        score += 0.5
+        matched = [i for i in aud_ind if any(_loose_match(i, ii)
+                                             for ii in icp["industries"])]
+        parts.append(f"industry-match: {', '.join(matched[:2])}")
+    else:
+        parts.append(f"industry-miss: {', '.join(aud_ind[:2]) or 'unknown'}")
+
+    return min(score, 1.0), "; ".join(parts)
+
+
+def score_audience_overlap(inf: dict,
+                           overlap_handles: set[str] | None) -> tuple[float, str]:
+    if overlap_handles is None:
+        return 0.0, "no overlap-CSV supplied; dimension uncomputable"
+    handle = (inf.get("handle") or "").lstrip("@").lower().strip()
+    follower_count = int(inf.get("follower_count") or 0) or 1
+    sample_posts = inf.get("sample_posts") or []
+    intersect = 0
+    seen_handles = {handle} | {
+        re.sub(r".*linkedin\.com/in/", "", p.lower()).strip("/")
+        for p in sample_posts
+    }
+    seen_handles = {h.lstrip("@") for h in seen_handles if h}
+    for h in seen_handles:
+        if h in overlap_handles:
+            intersect += 1
+    fraction = intersect / max(len(seen_handles) or 1, 1)
+    if intersect == 0:
+        return 0.1, "no closed-won overlap on supplied handles"
+    if fraction >= 0.3:
+        return 0.95, f"strong-overlap: {intersect}/{len(seen_handles)} handles in closed-won"
+    if fraction >= 0.1:
+        return 0.6, f"moderate-overlap: {intersect}/{len(seen_handles)}"
+    return 0.3, f"weak-overlap: {intersect}/{len(seen_handles)}"
+
+
+def score_voice_alignment(inf: dict, kill_list: list[str]) -> tuple[float, str]:
+    voice = " ".join(inf.get("voice_signals") or []).lower()
+    notes = (inf.get("notes") or "").lower()
+    sample = (inf.get("sample_text") or "").lower()  # if operator pasted a transcript
+    full = f"{voice} {notes} {sample}"
+    hits = [w for w in kill_list if re.search(rf"\b{re.escape(w)}\b", full)]
+    if len(hits) >= 2:
+        return 0.0, f"kill-list overlap: {', '.join(hits[:3])} (hard-disqualify)"
+    if len(hits) == 1:
+        return 0.4, f"single kill-list hit: {hits[0]}"
+
+    # Positive signals: plain-spoken, founder-tone, data-cited get +
+    positives = ["plain-spoken", "data-cited", "founder-tone", "specific",
+                 "operator", "concrete", "first-hand"]
+    pos_hits = [p for p in positives if p.replace("-", " ") in voice
+                or p in voice]
+    if pos_hits:
+        score = min(0.6 + 0.1 * len(pos_hits), 1.0)
+        return score, f"voice-aligned: {', '.join(pos_hits[:3])}"
+    return 0.5, "neutral voice (no kill-list, no positive signals)"
+
+
+def score_topic_alignment(inf: dict, anchors: list[str]) -> tuple[float, str]:
+    topics = " ".join(inf.get("primary_topics") or []).lower()
+    if not topics:
+        return 0.0, "no topics declared"
+    if not anchors:
+        return 0.5, "no anchors in positioning to compare"
+    hits = [a for a in anchors if a in topics]
+    if not hits:
+        return 0.2, f"no anchor overlap (topics: {topics[:80]})"
+    if len(hits) >= 3:
+        return 0.95, f"strong-anchor-overlap: {', '.join(hits[:5])}"
+    return 0.6, f"partial-anchor-overlap: {', '.join(hits[:3])}"
+
+
+def score_prior_relationship(inf: dict,
+                             competitor_slugs: list[str]) -> tuple[float, str]:
+    competitor_collabs = [c.lower() for c in (inf.get("competitor_collabs") or [])]
+    prior = [p.lower() for p in (inf.get("prior_collabs") or [])]
+    if competitor_slugs:
+        active_competitor = [c for c in competitor_collabs
+                             if any(slug in c or c in slug
+                                    for slug in competitor_slugs)]
+        if active_competitor:
+            return 0.0, f"active competitor collab: {', '.join(active_competitor[:2])} (hard-disqualify)"
+    if prior:
+        return 0.85, f"prior collabs: {', '.join(prior[:2])}"
+    return 0.4, "no prior collab history"
+
+
+def _loose_match(a: str, b: str) -> bool:
+    a, b = a.strip().lower(), b.strip().lower()
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    a_tokens = set(re.split(r"[\s\-_/]+", a))
+    b_tokens = set(re.split(r"[\s\-_/]+", b))
+    return bool(a_tokens & b_tokens)
+
+
+# ---- Composite + tier ----
+
+def composite_score(features: dict[str, float]) -> float:
+    return round(sum(features[k] * WEIGHTS[k] for k in WEIGHTS) * 100, 1)
+
+
+def assign_tier(score: float, disqualified: bool) -> str:
+    if disqualified:
+        return "dq"
+    for tier, lo, hi in TIER_BANDS:
+        if lo <= score <= hi:
+            return tier
+    return "defer"
+
+
+# ---- Reporting ----
+
+def render_report(*, client: str, today: str, scored: list[dict],
+                  disqualified: list[dict], roster_size: int,
+                  overlap_supplied: bool) -> str:
+    tier_counts = {t: 0 for t, _, _ in TIER_BANDS}
+    tier_counts["dq"] = len(disqualified)
+    for s in scored:
+        tier_counts[s["tier"]] = tier_counts.get(s["tier"], 0) + 1
+
+    lines = []
+    lines.append("---")
+    lines.append(f"ranking_id: {client}-influencer-rank-{today}")
+    lines.append(f"client: {client}")
+    lines.append("asset_type: internal-spec influencer ranking audit")
+    lines.append(f"roster_size: {roster_size}")
+    lines.append(f"scored_size: {len(scored)}")
+    lines.append(f"disqualified_size: {len(disqualified)}")
+    lines.append("substrate_layers_read: [positioning, icp, brand-voice, competitive]")
+    lines.append("patterns_applied: [creator-not-corporate, social-as-distribution-not-conversion, "
+                 "native-format-beats-cross-post, distribution-as-moat, copywriting-craft-fundamentals]")
+    lines.append("contradictions_resolved: []")
+    lines.append("produced_by: influencer-fit-score")
+    lines.append(f"authored_date: {today}")
+    lines.append("voice_check: pending")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Influencer ranking — {client} — {today}")
+    lines.append("")
+    lines.append(f"Roster: {roster_size}. Scored: {len(scored)}. Disqualified: {len(disqualified)}.")
+    lines.append("")
+    lines.append("## Tier distribution")
+    lines.append("")
+    lines.append("| Tier | Count | Pursuit |")
+    lines.append("|---|---|---|")
+    for t in ("1A", "1B", "2", "defer", "dq"):
+        c = tier_counts.get(t, 0)
+        lines.append(f"| {t} | {c} | {PURSUIT_MAP[t]} |")
+    lines.append("")
+
+    for tier in ("1A", "1B", "2", "defer"):
+        in_tier = [s for s in scored if s["tier"] == tier]
+        if not in_tier:
+            continue
+        title_map = {
+            "1A": "Tier 1A primary partners",
+            "1B": "Tier 1B exploratory",
+            "2": "Tier 2 watch",
+            "defer": "Tier defer",
+        }
+        lines.append(f"## {title_map[tier]}")
+        lines.append("")
+        for s in in_tier:
+            inf = s["influencer"]
+            lines.append(f"### {inf.get('handle', '?')} — {inf.get('name', '')}".rstrip(" —"))
+            lines.append("")
+            lines.append(f"- platform: `{inf.get('platform', '?')}`  "
+                         f"followers: {inf.get('follower_count', '?')}  "
+                         f"composite: **{s['composite']}**")
+            lines.append("- dimension breakdown:")
+            for k in WEIGHTS:
+                lines.append(f"  - `{k}` ({WEIGHTS[k]:.2f}): "
+                             f"{round(s['features'][k] * 100, 1)} — {s['rationales'][k]}")
+            if tier == "1A":
+                lines.append("- recommended next step: open a co-authored long-form brief; "
+                             "use `social-content-design --author personal` to draft the cross-promotion shape "
+                             "(per `pat_creator-not-corporate`, personal-account collaboration compounds).")
+            elif tier == "1B":
+                lines.append("- recommended next step: one-off collaboration with a measurement contract; "
+                             "use `social-amplification-test --test-type hook` against an internal control "
+                             "to size the lift.")
+            else:
+                lines.append("- recommended next step: track for 90 days; re-score on the next cycle.")
+            lines.append("")
+
+    if disqualified:
+        lines.append("## Disqualified")
+        lines.append("")
+        lines.append("| Handle | Name | Reason |")
+        lines.append("|---|---|---|")
+        for d in disqualified:
+            inf = d["influencer"]
+            lines.append(f"| {inf.get('handle', '?')} | {inf.get('name', '')} | {d['reason']} |")
+        lines.append("")
+
+    lines.append("## Audience-overlap notes")
+    lines.append("")
+    if overlap_supplied:
+        lines.append("Overlap CSV was supplied; per-influencer overlap scores reflect intersection "
+                     "with closed-won-contact handles. Per `pat_social-as-distribution-not-conversion`, "
+                     "this is a cohort-level metric, not a last-click attribution signal. The right "
+                     "downstream metric is branded-search lift in the 30-90 days after collaboration "
+                     "ships, plus newsletter or trial signups attributed via UTM.")
+    else:
+        lines.append("No overlap CSV supplied. The `audience_overlap` dimension scored 0 across the "
+                     "roster; the composite is depressed accordingly. Supply a closed-won-contact "
+                     "CSV via `--audience-overlap-csv` for sharper ranking. Per "
+                     "`pat_social-as-distribution-not-conversion`, social drives top-of-funnel awareness; "
+                     "last-click attribution underweights its real role, so the audience-overlap "
+                     "signal is the cohort-level proxy that compounds. Without it, the model cannot "
+                     "rank fit at the precision that distinguishes tier-1A from tier-1B.")
+    lines.append("")
+
+    lines.append("## Distribution note")
+    lines.append("")
+    lines.append("Influencer collaborations compound on personal accounts (per `pat_creator-not-corporate`); "
+                 "the corporate-handle path runs at structurally lower reach and should be reserved for "
+                 "announcement copy, not for collaboration-led distribution. Per `pat_distribution-as-moat`, "
+                 "earned-channel relationships outlast rented-channel spend; treat each tier-1A partnership "
+                 "as a multi-quarter relationship investment, not a one-shot campaign. Distribution is a "
+                 "moat exactly because the earned channel compounds across years; rented spend evaporates "
+                 "the day the budget stops. Per `pat_native-format-beats-cross-post`, partnership content "
+                 "rewrites per platform, not wholesale cross-post; each platform has native rhythms and "
+                 "cross-posted content underperforms native authoring on every measured surface.")
+    lines.append("")
+    lines.append("Per `pat_copywriting-craft-fundamentals`, the influencer's voice has to read as specific "
+                 "over abstract: a tier-1A partner's body of work cuts unearned words, kills the darling, "
+                 "and earns its place line by line. Voice signals like 'plain-spoken', 'data-cited', "
+                 "'specific', and 'concrete' are the surface markers; the underlying discipline is "
+                 "specific-over-abstract craft.")
+    lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- positioning: `clients/{client}/01-position.md`")
+    lines.append(f"- ICP: `clients/{client}/02-icp.md`")
+    lines.append(f"- brand voice: `clients/{client}/07-brand-voice.md`")
+    lines.append(f"- competitive: `clients/{client}/04-competitive.md`")
+    lines.append(f"- influencer roster: `clients/{client}/social/influencers.yaml`")
+    lines.append("")
+
+    lines.append("## Patterns grounded")
+    lines.append("")
+    lines.append("- `knowledge/patterns/creator-not-corporate.md`")
+    lines.append("- `knowledge/patterns/social-as-distribution-not-conversion.md`")
+    lines.append("- `knowledge/patterns/native-format-beats-cross-post.md`")
+    lines.append("- `knowledge/patterns/distribution-as-moat.md`")
+    lines.append("- `knowledge/patterns/copywriting-craft-fundamentals.md`")
+    lines.append("")
+
+    lines.append("## Hand-off")
+    lines.append("")
+    lines.append("Top tier-1A partners: open a brief via `social-content-design` with `--purpose customer-spotlight` "
+                 "or `--purpose thought-leadership` for the partner's voice. Open a measurement contract via "
+                 "`open-goal` with the predicted branded-search lift and a 60-day window.")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="influencer-fit-score")
+    p.add_argument("--client", required=True)
+    p.add_argument("--influencers", default=None,
+                   help="path to influencers.yaml (default: clients/<client>/social/influencers.yaml)")
+    p.add_argument("--platform", default=None,
+                   choices=["linkedin", "x", "tiktok", "instagram", "youtube"])
+    p.add_argument("--top-n", type=int, default=25)
+    p.add_argument("--audience-overlap-csv", default=None)
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        return refuse("client-root-missing",
+                      f"clients/{args.client}/ not found.")
+
+    pos_path = client_root / "01-position.md"
+    pos = read_file_or_none(pos_path)
+    if pos is None:
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/01-position.md not found. "
+                      f"Run positioning-forge first; the fit model has no anchor.")
+
+    bv_path = client_root / "07-brand-voice.md"
+    bv = read_file_or_none(bv_path)
+    if bv is None:
+        return refuse("missing-brand-voice",
+                      f"clients/{args.client}/07-brand-voice.md not found. "
+                      f"The voice-alignment dimension cannot run without a kill-list source.")
+
+    icp_path = client_root / "02-icp.md"
+    icp_text = read_file_or_none(icp_path)
+    comp_path = client_root / "04-competitive.md"
+    comp_text = read_file_or_none(comp_path)
+
+    influencers_path = (Path(args.influencers).resolve()
+                        if args.influencers
+                        else client_root / "social" / "influencers.yaml")
+    if not influencers_path.is_file():
+        return refuse("missing-influencers",
+                      f"influencer roster not found at {influencers_path}. "
+                      f"Copy templates/social-influencers-example.yaml and curate.")
+
+    roster = parse_influencers_yaml(influencers_path)
+    if not roster:
+        return refuse("empty-roster",
+                      f"{influencers_path} parsed to zero rows. "
+                      f"Check the schema in templates/social-influencers-example.yaml.")
+
+    if args.platform:
+        roster = [r for r in roster if (r.get("platform") or "").lower() == args.platform]
+        if not roster:
+            sys.stderr.write(f"  warn: no influencers for platform={args.platform}; "
+                             "ranking will be empty.\n")
+
+    overlap_handles: set[str] | None = None
+    if args.audience_overlap_csv:
+        ov_path = Path(args.audience_overlap_csv).resolve()
+        if not ov_path.is_file():
+            return refuse("missing-overlap-csv",
+                          f"audience overlap CSV not found at {ov_path}.")
+        overlap_handles = load_overlap_handles(ov_path)
+        sys.stderr.write(f"  loaded {len(overlap_handles)} closed-won handles "
+                         f"from {ov_path}\n")
+
+    icp = extract_icp_profile(icp_text)
+    anchors = extract_anchors(pos)
+    kill_list = extract_kill_list(bv)
+    competitor_slugs = extract_competitor_slugs(comp_text)
+
+    sys.stderr.write(f"[influencer-fit-score] client={args.client}\n")
+    sys.stderr.write(f"  ICP: {len(icp['industries'])} industries, "
+                     f"{len(icp['roles'])} roles, "
+                     f"{len(icp['anti_industries'])} anti-industries\n")
+    sys.stderr.write(f"  anchors={len(anchors)}  kill-list={len(kill_list)}  "
+                     f"competitors={len(competitor_slugs)}\n")
+    sys.stderr.write(f"  roster: {len(roster)} influencers\n")
+
+    scored: list[dict] = []
+    disqualified: list[dict] = []
+    for inf in roster:
+        if not inf.get("handle"):
+            sys.stderr.write(f"  ✗ row without handle skipped: {inf}\n")
+            continue
+        # Hard rule: brand_safety_flags non-empty disqualifies before scoring
+        bs_flags = inf.get("brand_safety_flags") or []
+        if bs_flags:
+            disqualified.append({
+                "influencer": inf,
+                "reason": f"brand-safety flag: {', '.join(bs_flags[:3])}",
+            })
+            continue
+
+        features = {}
+        rationales = {}
+        features["icp_fit"], rationales["icp_fit"] = score_icp_fit(inf, icp)
+        features["audience_overlap"], rationales["audience_overlap"] = \
+            score_audience_overlap(inf, overlap_handles)
+        features["voice_alignment"], rationales["voice_alignment"] = \
+            score_voice_alignment(inf, kill_list)
+        features["topic_alignment"], rationales["topic_alignment"] = \
+            score_topic_alignment(inf, anchors)
+        features["prior_relationship"], rationales["prior_relationship"] = \
+            score_prior_relationship(inf, competitor_slugs)
+
+        # Hard-disqualify rules: any dimension that returned 0.0 with a
+        # "(hard-disqualify)" rationale moves the row to disqualified.
+        hard_dq = [k for k, v in rationales.items()
+                   if "(hard-disqualify)" in v]
+        if hard_dq:
+            disqualified.append({
+                "influencer": inf,
+                "reason": f"{hard_dq[0]}: {rationales[hard_dq[0]]}",
+            })
+            continue
+
+        composite = composite_score(features)
+        tier = assign_tier(composite, disqualified=False)
+        scored.append({
+            "influencer": inf,
+            "features": features,
+            "rationales": rationales,
+            "composite": composite,
+            "tier": tier,
+        })
+
+    scored.sort(key=lambda x: -x["composite"])
+    if args.top_n and len(scored) > args.top_n:
+        scored = scored[:args.top_n]
+
+    out_path = (Path(args.out).resolve() if args.out
+                else client_root / "social" / "influencer-rankings"
+                     / f"{today}.md")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    md = render_report(
+        client=args.client,
+        today=today,
+        scored=scored,
+        disqualified=disqualified,
+        roster_size=len(roster),
+        overlap_supplied=overlap_handles is not None,
+    )
+    out_path.write_text(md, encoding="utf-8")
+
+    sys.stderr.write(f"\n[influencer-fit-score] wrote {out_path}\n")
+    sys.stderr.write(f"  scored={len(scored)}  disqualified={len(disqualified)}  "
+                     f"roster={len(roster)}\n")
+    print(str(out_path))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

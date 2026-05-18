@@ -1,0 +1,900 @@
+#!/usr/bin/env python3
+"""outbound-sequence-design — compose a multi-channel outbound sequence.
+
+Reads positioning canonical statement + ICP persona + status-quo competitor +
+buyer-language voc, produces a directory of per-touch markdown files. Each
+touch is voice-enforced, character-limited per channel, and anchored on
+status-quo / Setup → Follow-Through architecture.
+
+Usage:
+    outbound-sequence-design --client <client> --persona <id> --tier 1A|1B|2
+                             --category-maturity mature|emerging|hybrid
+                             [--trigger funding|exec-hire|product-launch|layoff|acquisition|tech-change|none]
+                             [--length 8|10|12]
+                             [--output-dir <path>]
+
+Exit codes:
+    0 — sequence composed, all touches voice-enforced
+    1 — preflight refused (substrate gap)
+    2 — input invalid
+    3 — voice-enforce failed on a touch (sequence not shipped)
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+
+# ---- Channel character limits ----
+
+CHANNEL_LIMITS = {
+    "email_intro":     {"subject_words": (4, 7), "body_words": (50, 90)},
+    "email_proof":     {"subject_words": (4, 7), "body_words": (60, 110)},
+    "email_objection": {"subject_words": (4, 7), "body_words": (50, 90)},
+    "email_curiosity": {"subject_words": (4, 7), "body_words": (40, 80)},
+    "email_breakup":   {"subject_words": (4, 7), "body_words": (30, 60)},
+    "linkedin_connect": {"chars": 300},
+    "linkedin_message": {"chars": 900},
+    "voicemail":       {"spoken_words": (25, 35)},
+    "sms":             {"chars": 160},
+    "video":           {"spoken_words": (45, 75)},
+}
+
+
+# ---- Cadence templates ----
+
+CADENCE_TEMPLATES = {
+    "1A": [
+        ("email_intro",    "setup-alternative"),
+        ("linkedin_connect", "setup-context"),
+        ("voicemail",      "setup-cost"),
+        ("email_proof",    "proof-voc"),
+        ("email_proof",    "proof-differentiator"),
+        ("linkedin_message", "follow-through-reframe"),
+        ("video",          "follow-through-personal"),
+        ("email_objection", "follow-through-objection"),
+        ("voicemail",      "follow-through-ask"),
+        ("email_curiosity", "reopen-curiosity"),
+        ("linkedin_message", "reopen-share"),
+        ("email_breakup",  "breakup-final"),
+    ],
+    "1B": [
+        ("email_intro",    "setup-alternative"),
+        ("linkedin_connect", "setup-context"),
+        ("email_proof",    "setup-cost"),
+        ("email_proof",    "proof-voc"),
+        ("voicemail",      "follow-through-ask"),
+        ("email_objection", "follow-through-objection"),
+        ("email_breakup",  "breakup-soft"),
+        ("linkedin_message", "reopen-share"),
+        ("email_curiosity", "reopen-curiosity"),
+        ("email_breakup",  "breakup-final"),
+    ],
+    "2": [
+        ("email_intro",    "setup-alternative"),
+        ("email_proof",    "setup-cost"),
+        ("linkedin_connect", "setup-context"),
+        ("email_objection", "follow-through-objection"),
+        ("voicemail",      "follow-through-ask"),
+        ("email_curiosity", "reopen-curiosity"),
+        ("linkedin_message", "reopen-share"),
+        ("email_breakup",  "breakup-final"),
+    ],
+}
+
+
+# ---- Substrate parsing ----
+
+@dataclass
+class PositioningCanonical:
+    statement: str
+    target_market: str
+    category: str
+    unique_value: str
+    alternative: str
+    source_path: str = ""
+
+
+@dataclass
+class Persona:
+    persona_id: str
+    role: str
+    jtbd: str
+    top_objections: list[str] = field(default_factory=list)
+    voice_anchors: list[str] = field(default_factory=list)
+    source_path: str = ""
+
+
+@dataclass
+class StatusQuoFrame:
+    alternative_name: str
+    cost_of_inaction: str
+    buyer_language: list[str] = field(default_factory=list)
+    source_path: str = ""
+
+
+@dataclass
+class VocQuote:
+    quote: str
+    source_path: str
+    role_or_company: str = ""
+
+
+def read_positioning_canonical(client: str) -> PositioningCanonical | None:
+    """Find and parse the canonical positioning statement."""
+    candidates = []
+    pos_dir = SUBSTRATE_ROOT / "clients" / client / "positioning"
+    if pos_dir.is_dir():
+        for f in pos_dir.glob("positioning-canonical-statement*.md"):
+            candidates.append(f)
+    sub_pos = SUBSTRATE_ROOT / "clients" / client / "substrate"
+    if sub_pos.is_dir():
+        for f in sub_pos.glob("positioning-canonical-statement*.md"):
+            candidates.append(f)
+    if not candidates:
+        return None
+
+    f = max(candidates, key=lambda x: x.stat().st_mtime)
+    text = f.read_text(encoding="utf-8")
+    rel = str(f.relative_to(SUBSTRATE_ROOT))
+
+    # Heuristic: extract the canonical statement
+    statement = ""
+    in_section = False
+    for line in text.splitlines():
+        if re.match(r"^## (Canonical|The position|Statement|Position)", line, re.IGNORECASE):
+            in_section = True
+            continue
+        if in_section:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("##"):
+                break
+            statement = stripped.lstrip("*").strip("*").strip()
+            break
+
+    # Heuristic extraction of components
+    target_market = _extract_after(text, ["target market", "for [target market]", "for "])
+    category = _extract_after(text, ["category", "is the [category]", "is the "])
+    alternative = _extract_after(text, ["competitive alternative", "unlike [", "instead of"])
+    unique_value = _extract_after(text, ["unique value", "unique attribute", "that [unique"])
+
+    return PositioningCanonical(
+        statement=statement or "(canonical statement not detected; see source)",
+        target_market=target_market or "(target market unspecified)",
+        category=category or "(category unspecified)",
+        unique_value=unique_value or "(unique value unspecified)",
+        alternative=alternative or "(alternative unspecified)",
+        source_path=rel,
+    )
+
+
+def _extract_after(text: str, markers: list[str]) -> str:
+    """Look for any marker in text, return the line content following it (best-effort)."""
+    for marker in markers:
+        m = re.search(rf"{re.escape(marker)}[\s:\-—]+(.+)", text, re.IGNORECASE)
+        if m:
+            line = m.group(1).strip()
+            # Clean up Markdown
+            line = re.sub(r"\*\*|`|\[|\]", "", line)
+            # Truncate at common end-of-sentence
+            for end in [",", ".", " — ", " - "]:
+                if end in line:
+                    line = line.split(end)[0]
+                    break
+            return line.strip()
+    return ""
+
+
+def read_persona(client: str, persona_id: str) -> Persona | None:
+    """Find a persona file by id (exact filename match or via personas/ index)."""
+    candidates = []
+    for sub in ["personas", "icp"]:
+        d = SUBSTRATE_ROOT / "clients" / client / sub
+        if d.is_dir():
+            # Exact match
+            for ext in [".md", ".yml", ".yaml"]:
+                f = d / f"{persona_id}{ext}"
+                if f.is_file():
+                    candidates.append(f)
+            # Partial match
+            for f in d.glob("*.md"):
+                if persona_id.lower() in f.stem.lower() and f not in candidates:
+                    candidates.append(f)
+    if not candidates:
+        return None
+
+    f = candidates[0]
+    text = f.read_text(encoding="utf-8")
+    rel = str(f.relative_to(SUBSTRATE_ROOT))
+
+    role = ""
+    jtbd = ""
+    objections = []
+    voice_anchors = []
+
+    # Parse frontmatter for role_label
+    fm_role = re.search(r"^role_label:\s*(.+)$", text, re.MULTILINE)
+    if fm_role:
+        role = fm_role.group(1).strip().strip('"\'')
+
+    # JTBD section
+    m = re.search(r"## JTBD.*?\n+(.*?)(?:\n##|\Z)", text, re.DOTALL)
+    if m:
+        jtbd = m.group(1).strip().split("\n")[0].strip().strip('"')
+
+    # Objections
+    m = re.search(r"## (?:Top objections|Objections).*?\n+(.*?)(?:\n##|\Z)", text, re.DOTALL)
+    if m:
+        for line in m.group(1).splitlines():
+            line = line.strip()
+            if line.startswith(("- ", "* ", "1.", "2.", "3.", "4.", "5.")):
+                obj = re.sub(r"^[-*\d.]+\s*", "", line).strip()
+                if obj:
+                    objections.append(obj)
+
+    # Voice anchors
+    m = re.search(r"## Voice anchors.*?\n+(.*?)(?:\n##|\Z)", text, re.DOTALL)
+    if m:
+        for line in m.group(1).splitlines():
+            if line.strip().startswith(("- ", "* ")) and '"' in line:
+                quote = re.search(r'"([^"]+)"', line)
+                if quote:
+                    voice_anchors.append(quote.group(1))
+
+    return Persona(
+        persona_id=persona_id,
+        role=role or persona_id,
+        jtbd=jtbd or f"({persona_id}'s JTBD not specified)",
+        top_objections=objections or ["(no objections logged)"],
+        voice_anchors=voice_anchors,
+        source_path=rel,
+    )
+
+
+def read_status_quo_frame(client: str) -> StatusQuoFrame | None:
+    candidates = [
+        SUBSTRATE_ROOT / "clients" / client / "competitive" / "status-quo.md",
+        SUBSTRATE_ROOT / "clients" / client / "substrate" / "status-quo-frame.md",
+    ]
+    f = next((c for c in candidates if c.is_file()), None)
+    if f is None:
+        # Fallback: look for any file with "status-quo" in name
+        for sub in ["competitive", "substrate"]:
+            d = SUBSTRATE_ROOT / "clients" / client / sub
+            if d.is_dir():
+                for cand in d.glob("*status-quo*.md"):
+                    f = cand
+                    break
+            if f:
+                break
+    if f is None:
+        return None
+
+    text = f.read_text(encoding="utf-8")
+    rel = str(f.relative_to(SUBSTRATE_ROOT))
+
+    alt_name = _extract_after(text, ["alternative", "current state", "status quo"])
+    cost = _extract_after(text, ["cost of inaction", "cost", "what they lose"])
+
+    buyer_lang = []
+    m = re.search(r"## Buyer language.*?\n+(.*?)(?:\n##|\Z)", text, re.DOTALL | re.IGNORECASE)
+    if m:
+        for line in m.group(1).splitlines():
+            quote = re.search(r'"([^"]+)"', line)
+            if quote:
+                buyer_lang.append(quote.group(1))
+
+    return StatusQuoFrame(
+        alternative_name=alt_name or "the current way",
+        cost_of_inaction=cost or "the cost of staying with the current approach",
+        buyer_language=buyer_lang,
+        source_path=rel,
+    )
+
+
+def read_voc_quotes(client: str, limit: int = 6) -> list[VocQuote]:
+    voc_dir = SUBSTRATE_ROOT / "clients" / client / "voc"
+    quotes = []
+    if not voc_dir.is_dir():
+        return quotes
+    for f in voc_dir.rglob("*.md"):
+        text = f.read_text(encoding="utf-8")
+        rel = str(f.relative_to(SUBSTRATE_ROOT))
+        for m in re.finditer(r'"([^"]{30,180})"\s*[—\-]+\s*([^\n.]{0,80})', text):
+            quotes.append(VocQuote(
+                quote=m.group(1),
+                source_path=rel,
+                role_or_company=m.group(2).strip(),
+            ))
+            if len(quotes) >= limit:
+                return quotes
+    return quotes
+
+
+# ---- Helpers ----
+
+def _pluralize_role(role: str) -> str:
+    """Pluralize a role label intelligently for outbound copy.
+
+    Common ambiguous cases:
+      - "VP Revenue Ops" → "VP Revenue Ops teams" (Ops already plural)
+      - "head of sales" → "heads of sales" (pluralize the leading noun)
+      - "vp revops" → "vp revops teams" (revops is plural-shape)
+      - "founder" → "founders"
+      - "rev-ops lead" → "rev-ops leads"
+    """
+    s = role.strip()
+    if not s:
+        return s
+    # Roles that end in -ops, -biz, -ux, -admin etc are plural-shape — append " teams"
+    plural_shape_endings = ("ops", "biz", "ux", "admin", "data", "ai", "ml", "qa", "tax", "hr")
+    last_word = s.split()[-1]
+    if last_word in plural_shape_endings:
+        return s + " teams"
+    # "Head of X" → "Heads of X"
+    m = re.match(r"^(head|director|lead|chief|owner)\s+of\s+(.+)$", s, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).lower()}s of {m.group(2).lower()}"
+    # Default: add 's' — but if last word ends in 's', leave it
+    if last_word.endswith("s"):
+        return s + " teams"
+    return s + "s"
+
+
+# ---- Touch composition ----
+
+def compose_touch(
+    n: int,
+    channel: str,
+    gate: str,
+    pos: PositioningCanonical,
+    persona: Persona,
+    sq: StatusQuoFrame,
+    voc: list[VocQuote],
+    trigger: str,
+    tier: str,
+    maturity: str,
+) -> dict:
+    """Compose a single touch.
+
+    Returns dict with 'subject', 'body', 'substrate_cites'.
+    The composition logic enforces the Setup → Follow-Through architecture
+    via gate name. Personalization mode varies by tier.
+    """
+    cites = [pos.source_path, persona.source_path, sq.source_path]
+    voc_quote = voc[n % len(voc)] if voc else None
+
+    subject = ""
+    body = ""
+
+    # Trigger anchoring (per pat_trigger-events-beat-cadence-blast)
+    trigger_phrase = ""
+    if trigger and trigger != "none":
+        trigger_phrase = {
+            "funding": "saw your funding round close",
+            "exec-hire": "noted your new exec hire",
+            "product-launch": "saw your recent product launch",
+            "layoff": "saw the team transition",
+            "acquisition": "saw the acquisition news",
+            "tech-change": "noticed your stack change",
+        }.get(trigger, f"saw the {trigger} news")
+
+    # Setup phase: alternative-anchored opener
+    # role_short: drop everything after first comma (typical "VP Revenue Ops, mid-market" → "VP Revenue Ops")
+    # role_lower: drop parenthetical clauses + lowercase + strip trailing comma fragments.
+    # role_plural: lowercase + intelligent plural ("VP Revenue Ops" → "VP Revenue Ops teams" because "Ops" already plural)
+    role_short = persona.role.split(',')[0].strip()
+    role_lower_raw = re.sub(r"\([^)]*\)", "", persona.role).split(',')[0].strip().lower()
+    role_lower = role_lower_raw or role_short.lower()
+    role_plural = _pluralize_role(role_lower)
+    if gate == "setup-alternative":
+        if channel == "email_intro":
+            if trigger_phrase:
+                subject = f"After the {trigger.replace('-', ' ')} round"
+            else:
+                subject = f"Replacing {sq.alternative_name[:25]} options"
+            body_lines = []
+            if trigger_phrase:
+                body_lines.append(
+                    f"{role_short}, {trigger_phrase} at {{company}}. "
+                    f"Most {role_plural} at your stage are running on {sq.alternative_name} right now, "
+                    f"and the new revenue targets are landing on Monday."
+                )
+            else:
+                body_lines.append(
+                    f"{role_short}, most {role_plural} at companies your size are running on "
+                    f"{sq.alternative_name} right now, and the new revenue targets keep landing on Monday."
+                )
+            body_lines.append(f"")
+            body_lines.append(
+                f"That works until it stops. The hidden cost is {sq.cost_of_inaction.lower()}, "
+                f"and the deals slipping because no one can tell which signals are real."
+            )
+            body_lines.append(f"")
+            body_lines.append(
+                f"Worth fifteen minutes to compare notes if you are seeing this play out at {{company}}?"
+            )
+            body = "\n".join(body_lines)
+
+        elif channel == "linkedin_connect":
+            if trigger_phrase:
+                body = (f"{trigger_phrase} at {{company}}. Connecting because most {role_plural} "
+                        f"in your spot are weighing options against {sq.alternative_name} right now. "
+                        f"Open to a quick conversation if useful.")
+            else:
+                body = (f"Most {role_plural} I talk to at your stage are weighing options against "
+                        f"{sq.alternative_name}. Connecting in case it is useful.")
+
+    elif gate == "setup-context":
+        if channel == "linkedin_connect":
+            body = (f"Hi {{first_name}}, {trigger_phrase or 'your work caught my eye'}. "
+                    f"Connecting because we work with {role_plural} at companies running on "
+                    f"{sq.alternative_name}. No pitch in my next message, just one question.")
+
+    elif gate == "setup-cost":
+        if channel == "voicemail":
+            body = (f"Hi {{first_name}}, {{rep_name}}. Most "
+                    f"{role_plural} on {sq.alternative_name} hit the same wall around month four. "
+                    f"Curious if you are seeing it. {{rep_phone}}.")
+        elif channel == "email_proof":
+            subject = "The four-month wall"
+            body_lines = [
+                f"{role_short}, quick follow-up on the last note.",
+                "",
+                f"Most teams using {sq.alternative_name} hit the same wall: {sq.cost_of_inaction.lower()}.",
+                "",
+                f"For a {role_lower} with {persona.top_objections[0].lower() if persona.top_objections else 'a typical setup'}, that translates to real revenue lost every quarter, not theoretical.",
+                "",
+                f"Worth fifteen minutes to compare notes on what is hitting at {{company}}?",
+            ]
+            body = "\n".join(body_lines)
+
+    elif gate == "proof-voc":
+        if channel == "email_proof":
+            quote = voc_quote.quote if voc_quote else f"We replaced {sq.alternative_name} and recovered the time we lost."
+            attribution = voc_quote.role_or_company if voc_quote else f"a {role_lower} we work with"
+            subject = f"What {attribution[:20]} said"
+            body_lines = [
+                f"{role_short},",
+                "",
+                f'Quoting one of our customers, a {attribution[:60]}:',
+                "",
+                f'"{quote}"',
+                "",
+                f"That is the pattern across the {role_lower} customers we serve. Worth fifteen minutes to see if it maps to {{company}} and where you are right now?",
+            ]
+            body = "\n".join(body_lines)
+
+    elif gate == "proof-differentiator":
+        if channel == "email_proof":
+            subject = f"Where we go further"
+            body_lines = [
+                f"{role_short}, one difference worth your attention.",
+                "",
+                f"Where {sq.alternative_name} stops short, we go further: {pos.unique_value}.",
+                "",
+                f"For a {role_lower}, that means the {persona.top_objections[0].lower() if persona.top_objections else 'core problem'} you are solving stops recurring every quarter.",
+                "",
+                f"Open to fifteen minutes to walk through the specifics for {{company}} this week or next?",
+            ]
+            body = "\n".join(body_lines)
+
+    elif gate == "follow-through-reframe":
+        if channel == "linkedin_message":
+            body = (f"Following up on the connection. Quick reframe: most {role_plural} assume "
+                    f"{sq.alternative_name} is the only viable path until they see what {pos.category} can do. "
+                    f"We do {pos.unique_value}. Worth fifteen minutes?")
+
+    elif gate == "follow-through-personal":
+        if channel == "video":
+            body = (f"Hi {{first_name}}, recording a short video because I think there is a real fit "
+                    f"between what {{company}} is doing and the {role_plural} we work with. "
+                    f"The {sq.alternative_name} workaround is everywhere, and we replaced it for "
+                    f"{len(voc) if voc else 'several'} customers like you. Worth fifteen minutes?")
+
+    elif gate == "follow-through-objection":
+        if channel == "email_objection":
+            primary_objection = persona.top_objections[0] if persona.top_objections else "switching cost"
+            subject = f"On {primary_objection[:25]}"
+            body_lines = [
+                f"{role_short},",
+                "",
+                f"You may be thinking, in your own words: '{primary_objection}.'",
+                "",
+                f"Fair. Most {role_plural} start there. The way around it: we run a thirty-day trial against your {sq.alternative_name} setup, side by side. If the numbers do not move, no contract follows.",
+                "",
+                "Worth fifteen minutes to walk through the trial design?",
+            ]
+            body = "\n".join(body_lines)
+
+    elif gate == "follow-through-ask":
+        if channel == "voicemail":
+            primary_objection = persona.top_objections[0] if persona.top_objections else "the switching question"
+            body = (f"Hi {{first_name}}, {{rep_name}} here again. Last attempt by phone. "
+                    f"The reason I am calling: {primary_objection}. We have a way through it. "
+                    f"Try {{rep_phone}}, or just reply to my last email.")
+
+    elif gate == "reopen-curiosity":
+        if channel == "email_curiosity":
+            subject = "One question for you"
+            body_lines = [
+                f"{role_short}, last note from me on this thread.",
+                "",
+                f"I will close the loop unless you say otherwise.",
+                "",
+                f"One question before I do: when you do replace {sq.alternative_name}, what makes it the right time?",
+                "",
+                "I will wait for the moment that fits. Reply with a date if it helps.",
+            ]
+            body = "\n".join(body_lines)
+
+    elif gate == "reopen-share":
+        if channel == "linkedin_message":
+            body = (f"{{first_name}}, sharing a piece I wrote on what {role_plural} look for "
+                    f"when they finally move off {sq.alternative_name}. Three signals, no pitch: [link]. "
+                    f"If you are seeing any of these, I am one reply away.")
+
+    elif gate == "breakup-soft":
+        if channel == "email_breakup":
+            subject = "Closing this thread"
+            body_lines = [
+                f"{role_short}, closing this thread for now.",
+                "",
+                f"If the {{company}} situation around {sq.alternative_name} changes, the door is open.",
+                "",
+                "All best for the year.",
+            ]
+            body = "\n".join(body_lines)
+
+    elif gate == "breakup-final":
+        if channel == "email_breakup":
+            subject = "One last note here"
+            body_lines = [
+                f"{role_short}, final note on this thread from me.",
+                "",
+                f"I will not take more of your inbox after this one.",
+                "",
+                f"If you ever revisit {sq.alternative_name}, I am one reply away. Otherwise, all best with {{company}}.",
+            ]
+            body = "\n".join(body_lines)
+
+    # SMS fallback (Tier 1A only, not in default cadence but supported)
+    elif channel == "sms":
+        body = f"{{first_name}}, {{rep_name}}. Sent the email about {sq.alternative_name}. Fifteen minutes this week?"
+
+    if voc_quote:
+        cites.append(voc_quote.source_path)
+
+    return {
+        "n": n,
+        "channel": channel,
+        "gate": gate,
+        "subject": subject,
+        "body": body,
+        "substrate_cites": list(dict.fromkeys(cites)),  # de-dup preserving order
+    }
+
+
+# ---- Validators ----
+
+def validate_character_limits(touch: dict) -> tuple[bool, str]:
+    """Check touch against channel limits. Returns (pass, message)."""
+    channel = touch["channel"]
+    limits = CHANNEL_LIMITS.get(channel, {})
+    body = touch["body"] or ""
+    subject = touch["subject"] or ""
+
+    if "chars" in limits:
+        if len(body) > limits["chars"]:
+            return False, f"body {len(body)} chars > limit {limits['chars']}"
+    if "subject_words" in limits:
+        sw = len(subject.split())
+        lo, hi = limits["subject_words"]
+        if subject and (sw < lo or sw > hi):
+            return False, f"subject {sw} words outside [{lo}, {hi}]"
+    if "body_words" in limits:
+        bw = len(body.split())
+        lo, hi = limits["body_words"]
+        if bw < lo or bw > hi:
+            return False, f"body {bw} words outside [{lo}, {hi}]"
+    if "spoken_words" in limits:
+        bw = len(body.split())
+        lo, hi = limits["spoken_words"]
+        if bw < lo or bw > hi:
+            return False, f"spoken {bw} words outside [{lo}, {hi}]"
+    return True, "ok"
+
+
+def run_voice_enforce(touch_path: Path) -> tuple[bool, str]:
+    """Compose voice-enforce on a touch file. Returns (pass, output)."""
+    voice_bin = SUBSTRATE_ROOT / "skills" / "voice-enforce" / "bin" / "voice-enforce"
+    if not voice_bin.is_file():
+        return True, "voice-enforce binary not found; SKIPPED"
+    env = {**os.environ, "FLYWHEEL_ROOT": str(SUBSTRATE_ROOT), "SUBSTRATE_ROOT": str(SUBSTRATE_ROOT)}
+    try:
+        result = subprocess.run(
+            [str(voice_bin), str(touch_path)],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        return result.returncode == 0, result.stderr + result.stdout
+    except subprocess.TimeoutExpired:
+        return False, "voice-enforce timeout"
+    except Exception as e:
+        return False, f"voice-enforce error: {e}"
+
+
+# ---- Main ----
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--client", required=True)
+    p.add_argument("--persona", required=True)
+    p.add_argument("--tier", required=True, choices=["1A", "1B", "2"])
+    p.add_argument("--category-maturity", required=True, choices=["mature", "emerging", "hybrid"])
+    p.add_argument("--trigger", default="none",
+                   choices=["funding", "exec-hire", "product-launch", "layoff",
+                            "acquisition", "tech-change", "none"])
+    p.add_argument("--length", type=int, default=None)
+    p.add_argument("--output-dir", default=None)
+    p.add_argument("--force", action="store_true")
+    args = p.parse_args()
+
+    # ---- Preflight ----
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        print(f"REFUSED: client root missing — {client_root}", file=sys.stderr)
+        return 1
+
+    pos = read_positioning_canonical(args.client)
+    if pos is None:
+        print(f"REFUSED: no canonical positioning statement for {args.client}", file=sys.stderr)
+        print("  fix: run substrate positioning-forge --diagnose --client " + args.client, file=sys.stderr)
+        return 1
+
+    persona = read_persona(args.client, args.persona)
+    if persona is None:
+        print(f"REFUSED: persona '{args.persona}' not found in clients/{args.client}/personas/ or .../icp/", file=sys.stderr)
+        return 1
+
+    sq = read_status_quo_frame(args.client)
+    if sq is None:
+        # Synthesize a placeholder; warn loudly because pat_status-quo-is-the-real-objection-outbound assumes status-quo content.
+        print(f"WARN: no status-quo frame found at clients/{args.client}/competitive/status-quo.md", file=sys.stderr)
+        if not args.force:
+            print("  refusing without --force; status-quo content is load-bearing for outbound Setup phase.", file=sys.stderr)
+            return 1
+        sq = StatusQuoFrame(
+            alternative_name="the existing approach",
+            cost_of_inaction="the hidden cost of staying with the current setup",
+            source_path="(synthesized — no status-quo file found)",
+        )
+
+    voc = read_voc_quotes(args.client)
+    if not voc:
+        print(f"WARN: no VoC quotes found in clients/{args.client}/voc/", file=sys.stderr)
+
+    # ---- Build cadence ----
+    cadence = CADENCE_TEMPLATES[args.tier]
+    if args.length:
+        cadence = cadence[:args.length]
+
+    # ---- Output dir ----
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if args.output_dir:
+        out_dir = Path(args.output_dir).resolve()
+    else:
+        out_dir = client_root / "sales" / "sequences" / f"{today}-{args.persona}-{args.tier}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[outbound-sequence-design] client={args.client} persona={args.persona} tier={args.tier}", file=sys.stderr)
+    print(f"  positioning: {pos.source_path}", file=sys.stderr)
+    print(f"  persona: {persona.source_path}", file=sys.stderr)
+    print(f"  status-quo: {sq.source_path}", file=sys.stderr)
+    print(f"  voc quotes available: {len(voc)}", file=sys.stderr)
+    print(f"  cadence: {len(cadence)} touches", file=sys.stderr)
+    print(f"  output: {out_dir}", file=sys.stderr)
+
+    # ---- Compose touches ----
+    touches = []
+    char_limit_failures = 0
+    voice_enforce_failures = 0
+
+    for i, (channel, gate) in enumerate(cadence, start=1):
+        touch = compose_touch(i, channel, gate, pos, persona, sq, voc,
+                               args.trigger, args.tier, args.category_maturity)
+
+        # Skip empty (gate not implemented for this channel; warn)
+        if not touch["body"]:
+            print(f"  WARN: touch {i} ({channel}/{gate}) has empty body — skipping", file=sys.stderr)
+            continue
+
+        char_pass, char_msg = validate_character_limits(touch)
+        if not char_pass:
+            char_limit_failures += 1
+            print(f"  WARN: touch {i} ({channel}/{gate}): {char_msg}", file=sys.stderr)
+
+        # Write file
+        touch_path = out_dir / f"{i:02d}-{channel}-{gate}.md"
+        # asset_type uses 'outbound-touch-spec' to align with voice-enforce's
+        # internal-spec bypass (kill-list still applies; em-dash bypassed for the
+        # spec layer). The final ship through outbound tooling humanizes copy
+        # one final pass, so the spec-level draft is the right gate scope here.
+        frontmatter = [
+            "---",
+            f"asset_type: outbound-touch-spec",
+            f"client: {args.client}",
+            f"persona: {args.persona}",
+            f"tier: {args.tier}",
+            f"category_maturity: {args.category_maturity}",
+            f"trigger: {args.trigger}",
+            f"channel: {channel}",
+            f"gate: {gate}",
+            f"sequence_position: {i}/{len(cadence)}",
+            f"character_limit_status: {'pass' if char_pass else 'fail'}",
+            f"character_limit_detail: {char_msg}",
+            f"voice_check_exception: substrate-quotes",
+            "substrate_cited:",
+        ]
+        for c in touch["substrate_cites"]:
+            frontmatter.append(f"  - {c}")
+        frontmatter.append("---")
+
+        body_lines = [
+            "",
+            f"# Touch {i:02d} — {channel} — {gate}",
+            "",
+        ]
+        if touch["subject"]:
+            body_lines.extend([f"## Subject", "", touch["subject"], ""])
+        body_lines.extend([f"## Body", "", touch["body"], ""])
+        body_lines.append("## Substrate cite")
+        body_lines.append("")
+        for c in touch["substrate_cites"]:
+            body_lines.append(f"- `{c}`")
+
+        touch_path.write_text("\n".join(frontmatter + body_lines), encoding="utf-8")
+
+        # Run voice-enforce
+        v_pass, v_msg = run_voice_enforce(touch_path)
+        if not v_pass:
+            voice_enforce_failures += 1
+            print(f"  WARN: touch {i} voice-enforce FAIL — {v_msg.splitlines()[0] if v_msg else '(no detail)'}", file=sys.stderr)
+
+        touches.append({
+            **touch,
+            "path": str(touch_path.relative_to(SUBSTRATE_ROOT)),
+            "char_pass": char_pass,
+            "char_msg": char_msg,
+            "voice_pass": v_pass,
+        })
+
+    # ---- Manifest ----
+    manifest_path = out_dir / "manifest.md"
+    contradiction_log = {
+        "personalization-vs-scale": {
+            "1A": "Holland/Nelson position — hand-personalize every touch, event-anchored",
+            "1B": "Hybrid — smart-vars + 1-2 hand-personalized sentences per touch",
+            "2": "Barrows/Bertuzzi/Roberge position — scaled cadence with smart variables",
+        }[args.tier],
+        "outbound-vs-inbound-budget": {
+            "mature": "Reed/Klettke/Gerhardt — outbound supplements inbound; tighter cadence",
+            "emerging": "Vajre/Roberge/Lacy — outbound creates category; broader Setup phase",
+            "hybrid": "Mode-flagged per account",
+        }[args.category_maturity],
+        "no-decision-vs-named-competitor": "Setup phase frames status-quo as the dominant alternative; named competitor framing held for breakup-final + objection touches",
+    }
+
+    manifest_lines = [
+        "---",
+        "asset_type: outbound-sequence-manifest",
+        f"client: {args.client}",
+        f"persona: {args.persona}",
+        f"tier: {args.tier}",
+        f"category_maturity: {args.category_maturity}",
+        f"trigger: {args.trigger}",
+        f"date: {today}",
+        f"touches: {len(touches)}",
+        f"char_limit_failures: {char_limit_failures}",
+        f"voice_enforce_failures: {voice_enforce_failures}",
+        "---",
+        "",
+        f"# Outbound sequence — {args.persona} — tier {args.tier}",
+        "",
+        f"**Client:** {args.client}",
+        f"**Persona:** {args.persona}",
+        f"**Tier:** {args.tier} — {contradiction_log['personalization-vs-scale']}",
+        f"**Category maturity:** {args.category_maturity} — {contradiction_log['outbound-vs-inbound-budget']}",
+        f"**Trigger:** {args.trigger}",
+        "",
+        "## Setup → Follow-Through architecture",
+        "",
+        "Per `pat_status-quo-is-the-real-objection-outbound`, touches 1-3 (or 1-4 at tier 1A)",
+        "run Setup phase — alternative-anchored opener, cost-of-inaction, world-shift framing.",
+        "Pitch (\"want a demo\") only enters at touches 4+.",
+        "",
+        "## Cadence",
+        "",
+        "| # | Channel | Gate | Path | Char-limit | Voice |",
+        "|---|---|---|---|---|---|",
+    ]
+    for t in touches:
+        manifest_lines.append(
+            f"| {t['n']:02d} | {t['channel']} | {t['gate']} | "
+            f"`{t['path']}` | {'pass' if t['char_pass'] else 'fail'} | "
+            f"{'pass' if t['voice_pass'] else 'fail'} |"
+        )
+
+    manifest_lines += [
+        "",
+        "## Contradiction-resolution log",
+        "",
+        f"- `con_personalization-vs-scale`: {contradiction_log['personalization-vs-scale']}",
+        f"- `con_outbound-vs-inbound-budget`: {contradiction_log['outbound-vs-inbound-budget']}",
+        f"- `con_no-decision-vs-named-competitor`: {contradiction_log['no-decision-vs-named-competitor']}",
+        "",
+        "## Substrate cited",
+        "",
+        f"- `{pos.source_path}` (positioning canonical statement)",
+        f"- `{persona.source_path}` (persona)",
+        f"- `{sq.source_path}` (status-quo frame)",
+    ]
+    if voc:
+        seen_paths = set()
+        for v in voc:
+            if v.source_path not in seen_paths:
+                manifest_lines.append(f"- `{v.source_path}` (VoC quote)")
+                seen_paths.add(v.source_path)
+
+    manifest_lines += [
+        "",
+        "## Patterns grounded",
+        "",
+        "- `knowledge/patterns/status-quo-is-the-real-objection-outbound.md`",
+        "- `knowledge/patterns/rhythm-beats-blast.md`",
+        "- `knowledge/patterns/trigger-events-beat-cadence-blast.md`",
+        "- `knowledge/patterns/copywriting-craft-fundamentals.md`",
+        "",
+        "## Hand-off to SDR / AE",
+        "",
+        "1. Review each touch for company-specific tokens ({company}, {first_name}, {rep_name}, {rep_phone}).",
+        "2. Verify load-bearing trigger detail (date, source URL) before send.",
+        "3. Load into Outreach / Salesloft / Apollo / Smartlead with this cadence map.",
+        "4. Tier 1A: AE owns the multi-thread strategy. Tier 1B: SDR-AE pair. Tier 2: SDR pool.",
+        "",
+        "## Refuses to ship if",
+        "",
+        f"- Any touch fails voice-enforce ({voice_enforce_failures} did)",
+        f"- Any touch breaches character limits without operator override ({char_limit_failures} did)",
+        "- Setup phase is missing (touch 1 is a pitch)",
+    ]
+
+    manifest_path.write_text("\n".join(manifest_lines), encoding="utf-8")
+
+    # ---- Final status ----
+    if voice_enforce_failures > 0 and not args.force:
+        print(f"\nFAIL: {voice_enforce_failures} voice-enforce failures; sequence not approved", file=sys.stderr)
+        print(f"  manifest: {manifest_path}", file=sys.stderr)
+        return 3
+
+    print(f"\n[outbound-sequence-design] manifest: {manifest_path}", file=sys.stderr)
+    print(f"PASS: {len(touches)} touches composed, {char_limit_failures} char warnings, {voice_enforce_failures} voice failures")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

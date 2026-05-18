@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""ad-attribution-honest — defensive gate that refuses claims of channel
+performance without naming the attribution model + window + known
+blind-spots.
+
+For every "channel X drove Y" pattern in the asset, requires:
+  1. An attribution model name in the same paragraph (last-touch, first-touch,
+     linear, time-decay, data-driven, multi-touch, MMM, incrementality,
+     geo-holdout, ghost-ads).
+  2. A window declaration (specific dates, or a relative window).
+  3. An asset-level blind-spot disclosure (footnote or aside that names the
+     known biases of the model used). In --strict mode, every claim needs
+     its own blind-spot footnote.
+
+Composes with claim-verify and voice-enforce in pre-publish-check.
+
+Usage:
+    ad-attribution-honest <asset> [--strict] [--threshold N] [--json]
+
+Exit:
+    0 — all claims grounded (or no claims found)
+    1 — bare claims above threshold
+    2 — file not found
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+# Channel synonyms — the union of platform names that count as a paid channel.
+CHANNEL_SYNONYMS = {
+    "meta": ["meta", "facebook ads", "facebook", "fb ads", "ig ads", "instagram ads", "instagram"],
+    "google-search": ["google search", "google ads", "adwords", "search ads", "paid search"],
+    "google-pmax": ["pmax", "performance max"],
+    "google-display": ["google display", "gdn", "display network"],
+    "linkedin": ["linkedin ads", "linkedin sponsored", "linkedin"],
+    "tiktok": ["tiktok ads", "tiktok"],
+    "x": ["x ads", "twitter ads", "x platform"],
+    "reddit": ["reddit ads", "reddit"],
+    "youtube": ["youtube ads", "youtube"],
+    "paid-social": ["paid social"],
+    "paid-search": ["paid search"],
+    "display": ["display", "programmatic display"],
+    "ctv": ["connected tv", "ctv", "ott ads"],
+}
+# Flatten to a regex alternation, longest first
+_CHANNEL_TERMS = sorted(
+    {term for terms in CHANNEL_SYNONYMS.values() for term in terms},
+    key=lambda x: -len(x),
+)
+CHANNEL_RE = re.compile(r"\b(" + "|".join(re.escape(t) for t in _CHANNEL_TERMS) + r")\b", re.IGNORECASE)
+
+# Performance verbs that turn a channel mention into a performance claim.
+PERFORMANCE_VERBS = [
+    "drove", "drives", "driven", "delivered", "delivers", "produced", "produces",
+    "generated", "generates", "contributed", "contributes", "accounts for",
+    "responsible for", "attributable to", "attributed to", "attribute to",
+    "credited with", "produced", "yielded", "yields", "yielding",
+    "resulted in", "led to", "leads to",
+]
+PERFORMANCE_VERB_RE = re.compile(r"\b(" + "|".join(re.escape(v) for v in PERFORMANCE_VERBS) + r")\b", re.IGNORECASE)
+
+# Numeric / claim shape: %, $, "X conversions", "Y MQLs"
+PERFORMANCE_VALUE_RE = re.compile(
+    r"(\$[\d,]+(?:\.\d+)?(?:K|M|B)?|\b\d+(?:\.\d+)?%|\b\d+\s*(?:conversions?|leads?|MQLs?|SQLs?|deals?|trials?|signups?|sign[-\s]?ups?|customers?|opportunities|opps|pipeline|revenue|ARR|MRR))",
+    re.IGNORECASE,
+)
+
+# Format: "X% from <channel>" / "<channel> X%" / "X from <channel>"
+INVERTED_CLAIM_RE = re.compile(
+    r"((?:\$[\d,]+(?:K|M|B)?|\b\d+(?:\.\d+)?%|\b\d+\s*(?:conversions?|leads?|MQLs?|SQLs?|deals?|trials?|signups?|customers?|pipeline|revenue|ARR|MRR)))\s+(?:from|via|on|through)\s+(?:" + "|".join(re.escape(t) for t in _CHANNEL_TERMS) + r")",
+    re.IGNORECASE,
+)
+
+# Attribution model names
+ATTRIBUTION_MODEL_TERMS = [
+    "last-touch", "last touch", "last-click", "last click",
+    "first-touch", "first touch", "first-click", "first click",
+    "linear", "linear attribution", "even-distribution",
+    "time-decay", "time decay",
+    "position-based", "u-shaped", "w-shaped",
+    "data-driven", "data driven", "google data-driven attribution",
+    "multi-touch", "multitouch", "mta",
+    "marketing mix model", "mmm", "media mix model",
+    "incrementality", "incremental", "geo holdout", "geo-holdout",
+    "ghost ads", "ghost-ads",
+    "lift study", "lift studies", "conversion lift",
+    "psa control", "public service announcement control",
+    "self-reported attribution", "self-reported",
+    "platform-reported", "platform reported", "platform attribution",
+    "in-platform", "in platform",
+]
+ATTRIBUTION_MODEL_RE = re.compile(r"\b(" + "|".join(re.escape(t) for t in sorted(ATTRIBUTION_MODEL_TERMS, key=lambda x: -len(x))) + r")\b", re.IGNORECASE)
+
+# Window declarations
+WINDOW_RE = re.compile(
+    r"(?:"
+    r"\b\d{4}-\d{2}-\d{2}\b"
+    r"|\b(?:Q[1-4])\s*\d{4}\b"
+    r"|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b"
+    r"|\b(?:last|past|prior|previous|trailing|next)\s+\d+\s+(?:days?|weeks?|months?|quarters?|years?)\b"
+    r"|\bH[1-2]\s*\d{4}\b"
+    r"|\b\d+[-\s]?day\s+window\b"
+    r"|\b\d+[-\s]?day\s+attribution\b"
+    r"|\bytd\b"
+    r"|\b(?:trailing|t)?12[-\s]?months?\b"
+    r"|\b(?:30|60|90|180|365)[-\s]?days?\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# Blind-spot disclosure — the words that show the writer named a known limitation.
+BLINDSPOT_TERMS = [
+    "blind spot", "blind-spot", "blindspot",
+    "known bias", "known biases", "biased toward",
+    "overcounts", "overcounting", "undercounts", "undercounting",
+    "self-reported", "platform self-attributes",
+    "incrementality not measured", "incrementality is not measured",
+    "no holdout", "no geo holdout", "no incrementality test",
+    "model assumption", "attribution caveat", "attribution limitation",
+    "not incremental", "not adjusted for incrementality",
+    "may be over-attributed", "may be under-attributed",
+    "view-through", "click-through only",
+]
+BLINDSPOT_RE = re.compile(r"\b(" + "|".join(re.escape(t) for t in sorted(BLINDSPOT_TERMS, key=lambda x: -len(x))) + r")\b", re.IGNORECASE)
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}, text
+    fm_text = text[3:end]
+    body = text[end + 4:]
+    fm: dict = {}
+    for line in fm_text.splitlines():
+        m = re.match(r"^([a-z_-]+)\s*:\s*(.+)$", line)
+        if m:
+            fm[m.group(1)] = m.group(2).strip()
+    return fm, body
+
+
+def find_claims(body: str) -> list[dict]:
+    """Find channel-performance claims in the body.
+    Returns list of dicts: line_no, claim_text, channel, claim_kind.
+    """
+    claims = []
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        # Skip code fences
+        if line.strip().startswith("```"):
+            continue
+        # Skip pure heading lines
+        if re.match(r"^#+\s", line):
+            continue
+        # Pattern A: <channel> ... <verb> ... <value>
+        for cm in CHANNEL_RE.finditer(line):
+            # In a window of ~80 chars after the channel mention, look for verb + value
+            window_after = line[cm.end():cm.end() + 200]
+            verb_match = PERFORMANCE_VERB_RE.search(window_after)
+            if not verb_match:
+                continue
+            value_match = PERFORMANCE_VALUE_RE.search(window_after)
+            if not value_match:
+                continue
+            # Check the value is after the verb
+            if value_match.start() < verb_match.start():
+                continue
+            # Capture the claim chunk
+            claim_chunk = line[cm.start():cm.end() + value_match.end() + 1].strip()
+            claims.append({
+                "line": i + 1,
+                "claim": claim_chunk[:140],
+                "channel": cm.group(0),
+                "kind": "channel-verb-value",
+            })
+        # Pattern B: <value> from/via/on/through <channel>
+        for im in INVERTED_CLAIM_RE.finditer(line):
+            claims.append({
+                "line": i + 1,
+                "claim": im.group(0)[:140],
+                "channel": im.group(0),
+                "kind": "value-from-channel",
+            })
+    # Dedupe by line+channel signature
+    seen: set[tuple[int, str]] = set()
+    dedup: list[dict] = []
+    for c in claims:
+        key = (c["line"], c["claim"][:40])
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(c)
+    return dedup
+
+
+def claim_proximity_check(line_no: int, body_lines: list[str], proximity: int = 5) -> dict:
+    """Check whether attribution-model and window are within `proximity` lines of `line_no`."""
+    start = max(0, line_no - 1 - proximity)
+    end = min(len(body_lines), line_no + proximity)
+    nearby = "\n".join(body_lines[start:end])
+    return {
+        "has_model": bool(ATTRIBUTION_MODEL_RE.search(nearby)),
+        "has_window": bool(WINDOW_RE.search(nearby)),
+        "has_blindspot_local": bool(BLINDSPOT_RE.search(nearby)),
+    }
+
+
+def asset_has_blindspot(body: str) -> bool:
+    return bool(BLINDSPOT_RE.search(body))
+
+
+def is_skill_output(fm: dict) -> bool:
+    """Skip assets emitted by ad-spend-allocate or ad-diagnose; their frontmatter
+    declares the model + window."""
+    if "patterns_applied" in fm and "incrementality-not-attribution" in str(fm.get("patterns_applied", "")):
+        return True
+    if "diagnostic_id" in fm or "allocation_id" in fm:
+        return True
+    return False
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("asset")
+    p.add_argument("--strict", action="store_true")
+    p.add_argument("--threshold", type=int, default=0)
+    p.add_argument("--json", action="store_true", dest="json_out")
+    args = p.parse_args()
+
+    asset_path = Path(args.asset).resolve()
+    if not asset_path.is_file():
+        print(f"asset not found: {args.asset}", file=sys.stderr)
+        return 2
+
+    text = asset_path.read_text(encoding="utf-8")
+    fm, body = parse_frontmatter(text)
+
+    if is_skill_output(fm):
+        if args.json_out:
+            print(json.dumps({
+                "asset": str(asset_path),
+                "claims_total": 0,
+                "claims_grounded": 0,
+                "bare_claims": [],
+                "skipped_reason": "skill-output (declares model + window in frontmatter)",
+            }, indent=2))
+        else:
+            print(f"PASS: {args.asset} (ad-attribution-honest BYPASSED — skill-output)")
+        return 0
+
+    body_lines = body.split("\n")
+    claims = find_claims(body)
+    asset_blindspot = asset_has_blindspot(body)
+
+    bare: list[dict] = []
+    grounded: int = 0
+
+    for c in claims:
+        prox = claim_proximity_check(c["line"], body_lines)
+        missing: list[str] = []
+        if not prox["has_model"]:
+            missing.append("attribution-model")
+        if not prox["has_window"]:
+            missing.append("window")
+        if args.strict and not prox["has_blindspot_local"]:
+            missing.append("blindspot-local")
+        if not asset_blindspot and not args.strict:
+            missing.append("blindspot-asset-level")
+
+        if missing:
+            bare.append({
+                "line": c["line"],
+                "claim": c["claim"],
+                "channel": c["channel"],
+                "kind": c["kind"],
+                "missing": missing,
+            })
+        else:
+            grounded += 1
+
+    if args.json_out:
+        print(json.dumps({
+            "asset": str(asset_path),
+            "claims_total": len(claims),
+            "claims_grounded": grounded,
+            "bare_claims": bare,
+            "asset_blindspot_disclosure": asset_blindspot,
+            "strict": args.strict,
+        }, indent=2))
+        return 0 if len(bare) <= args.threshold else 1
+
+    print(f"=== ad-attribution-honest: {args.asset} ===", file=sys.stderr)
+    print(f"  claims found: {len(claims)}  grounded: {grounded}  "
+          f"bare: {len(bare)}  asset-blindspot: {asset_blindspot}", file=sys.stderr)
+    print(f"  pattern grounding: knowledge/patterns/incrementality-not-attribution.md", file=sys.stderr)
+
+    if bare:
+        print("", file=sys.stderr)
+        print("  BARE CLAIMS (channel performance asserted without attribution model + window + blind-spot):", file=sys.stderr)
+        for b in bare[:12]:
+            print(f"    L{b['line']:>4d}  '{b['claim']}'", file=sys.stderr)
+            print(f"           missing: {', '.join(b['missing'])}", file=sys.stderr)
+        if len(bare) > 12:
+            print(f"    ... +{len(bare) - 12} more", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  How to fix:", file=sys.stderr)
+        print("    1. Name the attribution model within 5 lines of the claim:", file=sys.stderr)
+        print("       'Meta drove 40% of new revenue (last-touch, 30-day window).'", file=sys.stderr)
+        print("    2. Or downgrade the claim to a correlation:", file=sys.stderr)
+        print("       'Meta correlates with 40% of new revenue in our last-touch dashboard.'", file=sys.stderr)
+        print("    3. Add an asset-level blind-spot footnote naming the model's bias:", file=sys.stderr)
+        print("       'Note: last-touch overcounts paid social by 2-5x typical of CTC's measurements; ", file=sys.stderr)
+        print("        a quarterly geo holdout corrects.'", file=sys.stderr)
+
+    if len(bare) > args.threshold:
+        print(f"\nFAIL: {args.asset} ({len(bare)} bare claims; threshold {args.threshold})")
+        return 1
+    print(f"\nPASS: {args.asset} ({len(bare)} bare claims; threshold {args.threshold})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

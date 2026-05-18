@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# email-list-hygiene — classify a subscriber list CSV; emit prune / suppression / re-engagement / segment artifacts.
+#
+# Usage:
+#   email-list-hygiene --client <c> --list <subscribers.csv> \
+#     [--out <dir>] [--inactive-days <n>] [--bounce-threshold <n>] [--gmail-share-warn <pct>]
+#
+# Real CSV parsing (Python in-line). Real role-address regex. Real disposable-domain list.
+#
+# Exit codes:
+#   0 — hygiene run complete
+#   1 — list-too-small warning (still 0-status semantically; nonzero only on hard fail)
+#   2 — list file not found
+#   3 — substrate-gap or refusal
+#   4 — invalid args
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+export FLYWHEEL_ROOT="$SUBSTRATE_ROOT"
+
+# shellcheck disable=SC1091
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+LIST=""
+OUT_DIR=""
+INACTIVE_DAYS=540
+BOUNCE_THRESHOLD=1
+GMAIL_WARN=70
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)            CLIENT="$2"; shift 2 ;;
+    --list)              LIST="$2"; shift 2 ;;
+    --out)               OUT_DIR="$2"; shift 2 ;;
+    --inactive-days)     INACTIVE_DAYS="$2"; shift 2 ;;
+    --bounce-threshold)  BOUNCE_THRESHOLD="$2"; shift 2 ;;
+    --gmail-share-warn)  GMAIL_WARN="$2"; shift 2 ;;
+    --help|-h)           sed -n '2,15p' "$0" | sed 's/^# //'; exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 4 ;;
+  esac
+done
+
+[ -n "$CLIENT" ] || { echo "REFUSED: --client required" >&2; exit 4; }
+[ -n "$LIST" ]   || { echo "REFUSED: --list required" >&2; exit 4; }
+[ -f "$LIST" ]   || { echo "REFUSED: list file not found: $LIST" >&2; exit 2; }
+
+TODAY="$(date -u +%Y-%m-%d)"
+[ -n "$OUT_DIR" ] || OUT_DIR="$SUBSTRATE_ROOT/clients/$CLIENT/email/hygiene/$TODAY"
+mkdir -p "$OUT_DIR"
+
+echo "=== email-list-hygiene: $LIST ===" >&2
+echo "  client=$CLIENT inactive-days=$INACTIVE_DAYS bounce-threshold=$BOUNCE_THRESHOLD gmail-warn=$GMAIL_WARN%" >&2
+
+skill_preflight "email-list-hygiene" "$CLIENT"
+preflight_rc=$?
+if [ "$preflight_rc" -ne 0 ]; then
+  exit "$preflight_rc"
+fi
+
+# Verify python3 is available (CSV parsing in awk gets brittle on quoted fields).
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "REFUSED: python3 required for safe CSV parsing" >&2
+  exit 5
+fi
+
+# Run the classification pass in Python. Output four CSVs + a summary stub.
+PYOUT="$(python3 - "$LIST" "$OUT_DIR" "$INACTIVE_DAYS" "$BOUNCE_THRESHOLD" "$GMAIL_WARN" <<'PY'
+import csv
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+from collections import Counter, defaultdict
+
+list_path, out_dir, inactive_days, bounce_threshold, gmail_warn = sys.argv[1:6]
+inactive_days = int(inactive_days)
+bounce_threshold = int(bounce_threshold)
+gmail_warn = float(gmail_warn)
+
+REQUIRED_COLS = {"email", "signup_date", "last_open", "last_click", "bounce_count", "bounce_type", "status"}
+
+# Curated disposable-mail domains (subset; not exhaustive — operators extend).
+DISPOSABLE_DOMAINS = {
+    "mailinator.com", "guerrillamail.com", "10minutemail.com", "tempmail.com",
+    "throwaway.email", "yopmail.com", "trashmail.com", "fakeinbox.com",
+    "maildrop.cc", "sharklasers.com", "getnada.com", "mohmal.com",
+    "tempr.email", "temp-mail.org", "dispostable.com", "spambox.us",
+    "mailcatch.com", "spamgourmet.com", "anonbox.net", "emailondeck.com",
+    "throwawaymail.com", "boximail.com", "burnermail.io",
+}
+
+# Role-based local-parts (RFC 2142 + practical extensions).
+ROLE_LOCALPARTS = {
+    "info", "admin", "support", "sales", "noreply", "no-reply",
+    "webmaster", "postmaster", "abuse", "hostmaster", "root", "contact",
+    "hello", "team", "hr", "jobs", "press", "marketing", "billing",
+    "legal", "privacy", "security", "service", "accounts", "office",
+    "help", "feedback", "donotreply", "do-not-reply",
+}
+
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+def parse_date(s):
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+with open(list_path, "r", encoding="utf-8", newline="") as fh:
+    reader = csv.DictReader(fh)
+    if reader.fieldnames is None:
+        print(f"REFUSED|csv-malformed|no header row in {list_path}", file=sys.stderr)
+        sys.exit(3)
+    cols = set(reader.fieldnames)
+    missing = REQUIRED_COLS - cols
+    if missing:
+        print(f"REFUSED|csv-malformed|missing required columns: {sorted(missing)}", file=sys.stderr)
+        sys.exit(3)
+
+    rows = list(reader)
+
+n = len(rows)
+if n == 0:
+    print(f"REFUSED|csv-malformed|zero data rows in {list_path}", file=sys.stderr)
+    sys.exit(3)
+
+cutoff_inactive = datetime.utcnow() - timedelta(days=inactive_days)
+cutoff_signup_old = datetime.utcnow() - timedelta(days=730)  # 24 months
+
+prune_rows = []
+suppression_rows = []
+re_engagement_rows = []
+active_rows = []
+
+# Reasons audit log
+reason_counts = Counter()
+tld_counter = Counter()
+domain_counter = Counter()
+
+for idx, row in enumerate(rows):
+    email = (row.get("email") or "").strip().lower()
+    if not email or not EMAIL_RE.match(email):
+        prune_rows.append({**row, "_hygiene_reason": "invalid-email-format"})
+        reason_counts["invalid-email-format"] += 1
+        continue
+
+    local, _, domain = email.partition("@")
+    domain_counter[domain] += 1
+    tld = domain.rsplit(".", 1)[-1] if "." in domain else domain
+    tld_counter[tld] += 1
+
+    bounce_count = 0
+    try:
+        bounce_count = int(row.get("bounce_count") or 0)
+    except ValueError:
+        bounce_count = 0
+    bounce_type = (row.get("bounce_type") or "").strip().lower()
+    status = (row.get("status") or "").strip().lower()
+
+    last_open = parse_date(row.get("last_open"))
+    last_click = parse_date(row.get("last_click"))
+    signup_date = parse_date(row.get("signup_date"))
+
+    most_recent_engagement = None
+    for d in (last_open, last_click):
+        if d is None:
+            continue
+        if most_recent_engagement is None or d > most_recent_engagement:
+            most_recent_engagement = d
+
+    # Hard bounce → prune
+    if bounce_type == "hard" and bounce_count >= bounce_threshold:
+        prune_rows.append({**row, "_hygiene_reason": f"hard-bounce-count-{bounce_count}"})
+        reason_counts["hard-bounce"] += 1
+        continue
+
+    # Disposable domain → prune
+    if domain in DISPOSABLE_DOMAINS:
+        prune_rows.append({**row, "_hygiene_reason": "disposable-domain"})
+        reason_counts["disposable-domain"] += 1
+        continue
+
+    # Already unsubscribed → prune (already removed but keep audit trail)
+    if status in ("unsubscribed", "complained", "spam"):
+        prune_rows.append({**row, "_hygiene_reason": f"status-{status}"})
+        reason_counts[f"status-{status}"] += 1
+        continue
+
+    # Suspected spam-trap: signup older than 24 months AND no opens AND no clicks ever
+    if (signup_date is not None and signup_date < cutoff_signup_old
+            and last_open is None and last_click is None):
+        suppression_rows.append({**row, "_hygiene_reason": "suspected-spam-trap"})
+        reason_counts["suspected-spam-trap"] += 1
+        continue
+
+    # Role-based local-part → suppression
+    if local in ROLE_LOCALPARTS:
+        suppression_rows.append({**row, "_hygiene_reason": "role-based-address"})
+        reason_counts["role-based-address"] += 1
+        continue
+
+    # Never-engaged within window → re-engagement
+    if most_recent_engagement is None or most_recent_engagement < cutoff_inactive:
+        re_engagement_rows.append({**row, "_hygiene_reason": f"inactive-{inactive_days}d"})
+        reason_counts["never-engaged"] += 1
+        continue
+
+    # Active
+    active_rows.append(row)
+    reason_counts["active"] += 1
+
+# TLD distribution
+gmail_share = 0.0
+gmail_count = sum(c for d, c in domain_counter.items() if d in ("gmail.com", "googlemail.com"))
+total = sum(domain_counter.values())
+if total:
+    gmail_share = (gmail_count / total) * 100.0
+
+# Top 10 domains for the report
+top_domains = domain_counter.most_common(10)
+
+# Write CSVs
+def write_csv(path, rows, extra_col=None):
+    if not rows:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("# no rows in this category\n")
+        return
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+write_csv(os.path.join(out_dir, "prune-candidates.csv"), prune_rows)
+write_csv(os.path.join(out_dir, "suppression-candidates.csv"), suppression_rows)
+write_csv(os.path.join(out_dir, "re-engagement-candidates.csv"), re_engagement_rows)
+write_csv(os.path.join(out_dir, "active-subscribers.csv"), active_rows)
+
+# Surface counts to the parent shell
+print(f"TOTAL={n}")
+print(f"PRUNE={len(prune_rows)}")
+print(f"SUPPRESSION={len(suppression_rows)}")
+print(f"REENGAGE={len(re_engagement_rows)}")
+print(f"ACTIVE={len(active_rows)}")
+print(f"GMAIL_SHARE={gmail_share:.1f}")
+print(f"SINGLE_PROVIDER_RISK={'yes' if gmail_share > gmail_warn else 'no'}")
+print(f"REASONS={'|'.join(f'{k}:{v}' for k, v in reason_counts.most_common())}")
+print(f"TOP_DOMAINS={'|'.join(f'{d}:{c}' for d, c in top_domains)}")
+
+PY
+)"
+
+# Capture python's stdout key=value pairs
+TOTAL=0 PRUNE=0 SUPPRESSION=0 REENGAGE=0 ACTIVE=0 GMAIL_SHARE=0 SINGLE_PROVIDER_RISK=no REASONS="" TOP_DOMAINS=""
+while IFS='=' read -r k v; do
+  case "$k" in
+    TOTAL) TOTAL="$v" ;;
+    PRUNE) PRUNE="$v" ;;
+    SUPPRESSION) SUPPRESSION="$v" ;;
+    REENGAGE) REENGAGE="$v" ;;
+    ACTIVE) ACTIVE="$v" ;;
+    GMAIL_SHARE) GMAIL_SHARE="$v" ;;
+    SINGLE_PROVIDER_RISK) SINGLE_PROVIDER_RISK="$v" ;;
+    REASONS) REASONS="$v" ;;
+    TOP_DOMAINS) TOP_DOMAINS="$v" ;;
+  esac
+done <<< "$PYOUT"
+
+echo "  total=$TOTAL prune=$PRUNE suppression=$SUPPRESSION re-engagement=$REENGAGE active=$ACTIVE" >&2
+echo "  gmail-share=$GMAIL_SHARE% single-provider-risk=$SINGLE_PROVIDER_RISK" >&2
+
+# List-too-small warning (informational; still returns 0)
+LIST_TOO_SMALL="no"
+if [ "$TOTAL" -lt 100 ]; then
+  LIST_TOO_SMALL="yes"
+  echo "  ! list under 100 rows; statistical signal is weak" >&2
+fi
+
+# --- segment recommendations grounded in ICP cells ---
+
+ICP_FILE="$SUBSTRATE_ROOT/clients/$CLIENT/02-icp.md"
+SEGMENT_REC_PATH="$OUT_DIR/segment-recommendations.md"
+{
+  echo "---"
+  echo "asset_type: hygiene segment recommendations"
+  echo "client: $CLIENT"
+  echo "hygiene_run_date: $TODAY"
+  echo "active_subscribers: $ACTIVE"
+  echo "---"
+  echo ""
+  echo "# Segment recommendations for active subscribers"
+  echo ""
+  echo "Source: \`active-subscribers.csv\` ($ACTIVE rows)"
+  echo "ICP reference: \`clients/$CLIENT/02-icp.md\`"
+  echo ""
+  echo "Per knowledge/patterns/one-segment-one-trigger.md, the smallest viable lifecycle unit is one cohort × one trigger. The recommendations below split the active subscriber base by recency of engagement; map each segment to an ICP cell from the ICP doc."
+  echo ""
+  echo "## Recency cohorts (mechanical split)"
+  echo ""
+  echo "1. **Recent engagers (engagement within 30 days)** — candidates for paid product moments and high-intent triggers."
+  echo "2. **Mid engagers (engagement 30–180 days)** — candidates for nurture and education sequences."
+  echo "3. **Cool engagers (engagement 180 days to inactive cutoff)** — candidates for re-engagement before falling into the prune queue."
+  echo ""
+  echo "## ICP cell map (operator action required)"
+  echo ""
+  if [ -f "$ICP_FILE" ]; then
+    echo "Pull cell IDs from \`02-icp.md\`. The hygiene run cannot map subscribers to cells without a cohort field on each row; the next step is to enrich the active list with ICP-cell tags from the CRM (HubSpot/Salesforce) and re-run hygiene against the enriched list."
+    echo ""
+    echo "ICP file present: \`$ICP_FILE\`. Open it and copy the cell IDs from the header table into the cohort definitions."
+  else
+    echo "ICP file missing: \`02-icp.md\`. The skill recorded recency cohorts only; cell mapping requires the ICP layer."
+  fi
+} > "$SEGMENT_REC_PATH"
+
+# --- summary ---
+
+SUMMARY_PATH="$OUT_DIR/summary.md"
+{
+  cat <<EOF
+---
+asset_type: hygiene summary
+hygiene_run_date: $TODAY
+list_path: $LIST
+total_rows: $TOTAL
+prune_candidates: $PRUNE
+suppression_candidates: $SUPPRESSION
+re_engagement_candidates: $REENGAGE
+active_subscribers: $ACTIVE
+gmail_share_pct: $GMAIL_SHARE
+single_provider_risk: $SINGLE_PROVIDER_RISK
+list_too_small: $LIST_TOO_SMALL
+auditor_skill: email-list-hygiene
+auditor_version: 0.1
+---
+
+# Email list hygiene summary, $TODAY
+
+Source: \`$LIST\` ($TOTAL rows).
+
+## Counts by class
+
+| Class | Count | Share |
+|---|---|---|
+EOF
+  printf "| prune candidates | %d | %.1f%% |\n" "$PRUNE" "$(awk -v p="$PRUNE" -v t="$TOTAL" 'BEGIN{ if (t>0) printf "%.1f", (p/t)*100; else print "0" }')"
+  printf "| suppression candidates | %d | %.1f%% |\n" "$SUPPRESSION" "$(awk -v s="$SUPPRESSION" -v t="$TOTAL" 'BEGIN{ if (t>0) printf "%.1f", (s/t)*100; else print "0" }')"
+  printf "| re-engagement candidates | %d | %.1f%% |\n" "$REENGAGE" "$(awk -v r="$REENGAGE" -v t="$TOTAL" 'BEGIN{ if (t>0) printf "%.1f", (r/t)*100; else print "0" }')"
+  printf "| active subscribers | %d | %.1f%% |\n" "$ACTIVE" "$(awk -v a="$ACTIVE" -v t="$TOTAL" 'BEGIN{ if (t>0) printf "%.1f", (a/t)*100; else print "0" }')"
+
+  cat <<EOF
+
+## Reason breakdown
+
+EOF
+  IFS='|' read -r -a reason_arr <<< "$REASONS"
+  for r in "${reason_arr[@]}"; do
+    [ -n "$r" ] || continue
+    rk="$(echo "$r" | cut -d':' -f1)"
+    rv="$(echo "$r" | cut -d':' -f2)"
+    echo "- \`$rk\`: $rv"
+  done
+
+  cat <<EOF
+
+## TLD / provider distribution
+
+Single-provider risk threshold: $GMAIL_WARN%. Current Gmail share: ${GMAIL_SHARE}% — risk: $SINGLE_PROVIDER_RISK.
+
+Top sending-recipient domains:
+
+EOF
+  IFS='|' read -r -a top_arr <<< "$TOP_DOMAINS"
+  for r in "${top_arr[@]}"; do
+    [ -n "$r" ] || continue
+    rk="$(echo "$r" | cut -d':' -f1)"
+    rv="$(echo "$r" | cut -d':' -f2)"
+    echo "- \`$rk\`: $rv"
+  done
+
+  cat <<EOF
+
+## Files
+
+- [\`prune-candidates.csv\`](prune-candidates.csv) — $PRUNE rows.
+- [\`suppression-candidates.csv\`](suppression-candidates.csv) — $SUPPRESSION rows.
+- [\`re-engagement-candidates.csv\`](re-engagement-candidates.csv) — $REENGAGE rows.
+- [\`active-subscribers.csv\`](active-subscribers.csv) — $ACTIVE rows.
+- [\`segment-recommendations.md\`](segment-recommendations.md) — ICP-grounded segment hints.
+
+## Patterns grounding this run
+
+- knowledge/patterns/sender-reputation-is-a-domain-asset.md
+- knowledge/patterns/one-segment-one-trigger.md
+
+## Next actions
+
+1. Apply \`prune-candidates.csv\` as a hard suppression in the ESP (no future sends).
+2. Apply \`suppression-candidates.csv\` as a soft suppression with one re-permission attempt scheduled.
+3. Run \`email-sequence-design\` on \`re-engagement-candidates.csv\` cohort with \`--purpose re-engagement\`.
+4. Wire \`active-subscribers.csv\` into the segment recommendations from the section above.
+EOF
+
+  if [ "$LIST_TOO_SMALL" = "yes" ]; then
+    cat <<EOF
+
+## Note
+
+This list has fewer than 100 rows. The recency cohort split is recorded but the statistical signal at this size is too weak to base a campaign on. Re-run after collecting more subscribers OR treat this as a one-off cleanup task rather than a segmentation exercise.
+EOF
+  fi
+} > "$SUMMARY_PATH"
+
+echo "  → wrote $OUT_DIR" >&2
+echo "PASS: $OUT_DIR ($TOTAL rows; $PRUNE prune, $SUPPRESSION suppression, $REENGAGE re-engage, $ACTIVE active)"
+exit 0

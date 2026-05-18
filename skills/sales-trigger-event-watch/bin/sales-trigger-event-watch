@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""sales-trigger-event-watch — detect trigger events on a target account list.
+
+Watches RSS / news feeds / direct company-page changes for funding rounds,
+exec hires, product launches, layoffs, acquisitions, and tech-stack shifts.
+Writes a daily triggers file consumed by abm-account-prioritize and
+outbound-sequence-design.
+
+Usage:
+    sales-trigger-event-watch --client <client> [--accounts <csv>] [--feeds <yaml>]
+                              [--lookback-days 30] [--mode rss|news|all]
+                              [--dry-run] [--output <path>]
+
+Exit codes:
+    0 — triggers file written (or dry-run completed)
+    1 — preflight refused
+    2 — input invalid
+    3 — feed errors prevented detection
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import sys
+import urllib.request
+import urllib.parse
+import urllib.error
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+
+# ---- Trigger taxonomy ----
+
+TRIGGER_KEYWORDS = {
+    "funding": [
+        r"raises?\s+\$\d+",
+        r"funding\s+round",
+        r"series\s+[a-d]",
+        r"seed\s+round",
+        r"led\s+by\s+[A-Z]",
+        r"valuation",
+        r"closes?\s+\$\d+",
+    ],
+    "exec-hire": [
+        r"hires?\s+(?:chief|vp|vice president|head of|director|svp|cmo|cro|cfo|coo|ceo|cto)",
+        r"appoints?\s+(?:chief|vp|new|former)",
+        r"names?\s+(?:chief|vp|new)",
+        r"joins?\s+as\s+(?:chief|vp|head|director)",
+        r"promot(?:ed|ion)\s+to\s+(?:chief|vp|head|director)",
+    ],
+    "product-launch": [
+        r"launches?\s+",
+        r"introduces?\s+",
+        r"unveils?\s+",
+        r"announces?\s+(?:new|the launch|the release)",
+        r"releases?\s+(?:new|version|v\d)",
+        r"general(?:ly)?\s+available",
+        r"\bGA\b",
+    ],
+    "layoff": [
+        r"lay(?:s)?\s*off",
+        r"layoff",
+        r"workforce\s+reduction",
+        r"job\s+cuts",
+        r"restructur",
+        r"reduction\s+in\s+force",
+        r"\bRIF\b",
+    ],
+    "acquisition": [
+        r"acquires?\s+",
+        r"acquired?\s+by",
+        r"acquisition\s+of",
+        r"buys?\s+",
+        r"merger\s+with",
+        r"buyout",
+    ],
+    "tech-change": [
+        r"migrates?\s+to",
+        r"replaces?\s+",
+        r"adopts?\s+",
+        r"switches?\s+(?:from|to)",
+        r"selects?\s+",
+        r"deploys?\s+",
+        r"rolls?\s+out",
+    ],
+}
+
+# Window in days per trigger type (per pat_trigger-events-beat-cadence-blast)
+TRIGGER_WINDOWS = {
+    "funding": 60,
+    "exec-hire": 90,
+    "product-launch": 30,
+    "layoff": 60,
+    "acquisition": 120,
+    "tech-change": 60,
+}
+
+RECOMMENDED_ACTIONS = {
+    "funding":        "Multithread CFO + COO + relevant exec; budget reallocation window is 60-90d",
+    "exec-hire":      "Reach the new exec in week 2-4; new execs are buying behavior change",
+    "product-launch": "Reach with a stack-fit angle; the launch implies new infrastructure spend",
+    "layoff":         "Reach lightly; sensitivity required; the team may be consolidating tools",
+    "acquisition":    "Reach about consolidation / integration; M&A often forces stack rationalization",
+    "tech-change":    "Reach on stack rationalization; competitive displacement opportunity",
+}
+
+
+# ---- Feed handling ----
+
+def fetch_url(url: str, timeout: int = 15) -> str | None:
+    """Fetch URL contents with a sensible UA."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "substrate-sales-trigger-watch/0.1 (+https://substrate.iamkesava.com)",
+                "Accept": "application/rss+xml, application/atom+xml, text/xml, application/json, text/html;q=0.9",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return data.decode(charset, errors="replace")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, Exception) as e:
+        print(f"  [warn] fetch failed: {url[:80]} — {e}", file=sys.stderr)
+        return None
+
+
+def parse_rss(text: str) -> list[dict]:
+    """Parse RSS / Atom feed into [{title, link, pubdate, summary}, ...]."""
+    out = []
+    if not text:
+        return out
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return out
+
+    # RSS 2.0
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pubdate = (item.findtext("pubDate") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        out.append({"title": title, "link": link, "pubdate": pubdate, "summary": desc})
+    if out:
+        return out
+
+    # Atom
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    for entry in root.iter("{http://www.w3.org/2005/Atom}entry"):
+        title = (entry.findtext("atom:title", "", ns) or "").strip()
+        link_el = entry.find("atom:link", ns)
+        link = link_el.get("href") if link_el is not None else ""
+        pubdate = (entry.findtext("atom:updated", "", ns) or
+                   entry.findtext("atom:published", "", ns) or "").strip()
+        summary = (entry.findtext("atom:summary", "", ns) or
+                   entry.findtext("atom:content", "", ns) or "").strip()
+        out.append({"title": title, "link": link, "pubdate": pubdate, "summary": summary})
+
+    return out
+
+
+def parse_pubdate(s: str) -> datetime | None:
+    if not s:
+        return None
+    formats = [
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(s.strip(), fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    # Also try ISO format direct
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+# ---- Trigger classification ----
+
+def classify_trigger(text: str) -> tuple[str, str] | None:
+    """Return (trigger_type, matched_phrase) or None."""
+    if not text:
+        return None
+    lower = text.lower()
+    for ttype, patterns in TRIGGER_KEYWORDS.items():
+        for pat in patterns:
+            m = re.search(pat, lower)
+            if m:
+                return ttype, m.group(0)
+    return None
+
+
+def text_mentions_account(text: str, company: str, domain: str = "") -> bool:
+    """Heuristic: does the text mention this account (case-insensitive substring +
+    optional domain check)."""
+    if not text:
+        return False
+    lower = text.lower()
+    company_l = company.lower()
+    if not company_l:
+        return False
+    # Whole-word match for company; allows quoted brand names
+    pattern = r"\b" + re.escape(company_l) + r"\b"
+    if re.search(pattern, lower):
+        return True
+    if domain:
+        # Strip protocol and trailing slash
+        d = domain.lower().replace("https://", "").replace("http://", "").rstrip("/")
+        if d in lower:
+            return True
+    return False
+
+
+def significance_score(trigger: dict, sources_seen: dict[str, int]) -> str:
+    """high | medium | low based on source quality and corroboration."""
+    src = trigger.get("source_kind", "secondary")
+    confirms = sources_seen.get(trigger.get("dedup_key", ""), 1)
+    age_days = trigger.get("age_days", 999)
+
+    if age_days > 90:
+        return "low"  # stale per spec
+    if src == "primary" or confirms >= 2:
+        return "high"
+    if confirms == 1 and src == "secondary":
+        return "medium"
+    return "low"
+
+
+# ---- Feed config ----
+
+DEFAULT_FEEDS = [
+    # Public funding/news feeds (illustrative; operator can extend in feeds.yaml)
+    {"name": "Google News (per account)", "kind": "google-news-per-account",
+     "template": "https://news.google.com/rss/search?q=%22{company}%22&hl=en"},
+    {"name": "TechCrunch", "kind": "rss",
+     "url": "https://techcrunch.com/feed/", "source_kind": "secondary"},
+    {"name": "VentureBeat", "kind": "rss",
+     "url": "https://venturebeat.com/feed/", "source_kind": "secondary"},
+]
+
+
+def load_feeds(feeds_path: Path) -> list[dict]:
+    """Parse a feeds.yaml-ish file; falls back to defaults.
+
+    File format (minimal):
+
+        feeds:
+          - name: TechCrunch
+            kind: rss
+            url: https://techcrunch.com/feed/
+            source_kind: secondary
+          - name: Crunchbase News
+            kind: rss
+            url: https://news.crunchbase.com/feed/
+            source_kind: secondary
+    """
+    if not feeds_path.is_file():
+        return list(DEFAULT_FEEDS)
+
+    text = feeds_path.read_text(encoding="utf-8")
+    feeds = []
+    current: dict | None = None
+    for line in text.splitlines():
+        stripped = line.rstrip()
+        if not stripped or stripped.lstrip().startswith("#"):
+            continue
+        if re.match(r"^\s*-\s+(name|url):", stripped) or stripped.lstrip().startswith("- "):
+            if current and (current.get("url") or current.get("template")):
+                feeds.append(current)
+            current = {}
+            # Same-line entry
+            m = re.match(r"^\s*-\s+(\w+):\s*(.+)$", stripped)
+            if m:
+                current[m.group(1).strip()] = m.group(2).strip().strip('"\'')
+            continue
+        m = re.match(r"^\s+(\w+):\s*(.+)$", stripped)
+        if m and current is not None:
+            current[m.group(1).strip()] = m.group(2).strip().strip('"\'')
+    if current and (current.get("url") or current.get("template")):
+        feeds.append(current)
+    return feeds or list(DEFAULT_FEEDS)
+
+
+# ---- Account loading ----
+
+def load_accounts(accounts_path: Path) -> list[dict]:
+    accounts = []
+    with accounts_path.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            row = {k.lower(): v for k, v in row.items()}
+            if row.get("company"):
+                accounts.append(row)
+    return accounts
+
+
+# ---- Main detection loop ----
+
+def watch(client: str, accounts: list[dict], feeds: list[dict],
+          lookback_days: int, mode: str, dry_run: bool) -> list[dict]:
+    """Iterate feeds, match against accounts, return list of trigger dicts."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    triggers: list[dict] = []
+    sources_seen: dict[str, int] = {}
+
+    # Build lookup of company → account record
+    by_company = {a["company"].lower(): a for a in accounts if a.get("company")}
+
+    print(f"  scanning {len(feeds)} feed(s) against {len(accounts)} account(s) "
+          f"(lookback {lookback_days}d, mode={mode})", file=sys.stderr)
+
+    for feed in feeds:
+        kind = feed.get("kind", "rss")
+
+        if kind == "google-news-per-account":
+            if mode not in ("all", "news"):
+                continue
+            template = feed.get("template", "")
+            if not template:
+                continue
+            for acc in accounts:
+                company = acc["company"]
+                domain = acc.get("domain", "")
+                url = template.replace("{company}", urllib.parse.quote_plus(company))
+                text = fetch_url(url)
+                items = parse_rss(text or "")
+                _process_items(items, by_company, [acc], cutoff, triggers,
+                                sources_seen, source_label=f"google-news/{company}",
+                                source_kind="secondary")
+            continue
+
+        if kind == "rss":
+            if mode not in ("all", "rss"):
+                continue
+            url = feed.get("url", "")
+            if not url:
+                continue
+            text = fetch_url(url)
+            items = parse_rss(text or "")
+            _process_items(items, by_company, accounts, cutoff, triggers,
+                            sources_seen, source_label=feed.get("name", url),
+                            source_kind=feed.get("source_kind", "secondary"))
+
+        # Direct company-page check (lightweight; checks for changelog/blog feed at /feed)
+        if kind == "company-page" and mode in ("all", "company-pages"):
+            for acc in accounts:
+                domain = acc.get("domain", "")
+                if not domain:
+                    continue
+                url = domain.rstrip("/") + "/feed"
+                if not url.startswith("http"):
+                    url = "https://" + url.lstrip("/")
+                text = fetch_url(url)
+                items = parse_rss(text or "")
+                _process_items(items, by_company, [acc], cutoff, triggers,
+                                sources_seen, source_label=f"{domain}/feed",
+                                source_kind="primary")
+
+    # Re-score significance with full corroboration count
+    for t in triggers:
+        t["significance"] = significance_score(t, sources_seen)
+    return triggers
+
+
+def _process_items(items: list[dict], by_company: dict[str, dict],
+                   account_subset: list[dict], cutoff: datetime,
+                   triggers: list, sources_seen: dict,
+                   source_label: str, source_kind: str):
+    """Process feed items and append matching triggers."""
+    now = datetime.now(timezone.utc)
+    for item in items:
+        text_blob = f"{item.get('title', '')} {item.get('summary', '')}"
+        pubdate = parse_pubdate(item.get("pubdate", ""))
+        if pubdate and pubdate < cutoff:
+            continue
+        # Match against any account in subset
+        matched_acc = None
+        for acc in account_subset:
+            if text_mentions_account(text_blob, acc["company"], acc.get("domain", "")):
+                matched_acc = acc
+                break
+        if not matched_acc:
+            continue
+        # Classify
+        cls = classify_trigger(text_blob)
+        if not cls:
+            continue
+        ttype, phrase = cls
+        # Window check
+        window = TRIGGER_WINDOWS.get(ttype, 60)
+        age_days = (now - pubdate).days if pubdate else 999
+        if age_days > window:
+            continue
+        # Build trigger
+        link = item.get("link", "")
+        title = item.get("title", "")[:200]
+        dedup_key = f"{matched_acc['company'].lower()}|{ttype}|{title[:50]}"
+        sources_seen[dedup_key] = sources_seen.get(dedup_key, 0) + 1
+        # Skip if we've already added this trigger (one entry per dedup-key)
+        already = any(t.get("dedup_key") == dedup_key for t in triggers)
+        if already:
+            continue
+
+        triggers.append({
+            "account": matched_acc["company"],
+            "domain": matched_acc.get("domain", ""),
+            "event": ttype,
+            "date": pubdate.strftime("%Y-%m-%d") if pubdate else "",
+            "title": title,
+            "summary": _shorten(item.get("summary", "") or title, 200),
+            "source_url": link,
+            "source_label": source_label,
+            "source_kind": source_kind,
+            "matched_phrase": phrase,
+            "age_days": age_days,
+            "dedup_key": dedup_key,
+        })
+
+
+def _shorten(text: str, n: int) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+    text = re.sub(r"<[^>]+>", "", text)  # strip basic HTML
+    if len(text) > n:
+        text = text[: n - 1].rsplit(" ", 1)[0] + "..."
+    return text
+
+
+# ---- Output ----
+
+def write_triggers_file(client: str, triggers: list[dict],
+                         lookback_days: int, output_path: Path) -> None:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    sig_counts = {"high": 0, "medium": 0, "low": 0}
+    by_account: dict[str, list] = {}
+    for t in triggers:
+        sig_counts[t["significance"]] = sig_counts.get(t["significance"], 0) + 1
+        by_account.setdefault(t["account"], []).append(t)
+
+    top_accounts = sorted(by_account.items(),
+                          key=lambda kv: -sum(1 if x["significance"] == "high" else 0 for x in kv[1]))[:10]
+
+    fm = [
+        "---",
+        "asset_type: trigger-events-feed",
+        f"client: {client}",
+        f"date: {today}",
+        f"lookback_days: {lookback_days}",
+        f"total_triggers: {len(triggers)}",
+        f"high_significance: {sig_counts.get('high', 0)}",
+        f"medium_significance: {sig_counts.get('medium', 0)}",
+        f"low_significance: {sig_counts.get('low', 0)}",
+        "---",
+    ]
+    body = [
+        "",
+        f"# Trigger events — {today}",
+        "",
+        "## Summary",
+        "",
+        f"{sig_counts.get('high', 0)} high, {sig_counts.get('medium', 0)} medium, "
+        f"{sig_counts.get('low', 0)} low. Lookback {lookback_days}d. "
+        f"{len(by_account)} accounts had ≥1 trigger.",
+        "",
+    ]
+    if top_accounts:
+        body.append("Top accounts in window:")
+        body.append("")
+        for acc, ts in top_accounts:
+            high = sum(1 for x in ts if x["significance"] == "high")
+            body.append(f"- **{acc}**: {len(ts)} triggers ({high} high)")
+        body.append("")
+
+    body.append("## Triggers")
+    body.append("")
+    if not triggers:
+        body.append("_(no triggers in window)_")
+    else:
+        # Ordered by significance, then date desc
+        sig_order = {"high": 0, "medium": 1, "low": 2}
+        triggers_sorted = sorted(triggers,
+                                 key=lambda x: (sig_order.get(x["significance"], 3),
+                                                -_date_to_int(x["date"])))
+        for t in triggers_sorted:
+            line = (f"- account: {t['account']} | event: {t['event']} | date: {t['date']} | "
+                    f"source: {t['source_url']} | significance: {t['significance']} | "
+                    f"summary: {t['title']} | action: {RECOMMENDED_ACTIONS.get(t['event'], 'review')}")
+            body.append(line)
+    body.append("")
+
+    body.append("## Per-account breakdown")
+    body.append("")
+    for acc, ts in sorted(by_account.items()):
+        body.append(f"### {acc}")
+        body.append("")
+        for t in sorted(ts, key=lambda x: -_date_to_int(x["date"])):
+            body.append(f"- **{t['date']}** — {t['event']} ({t['significance']}) — {t['title']}")
+            body.append(f"  - source: [{t['source_label']}]({t['source_url']})")
+            body.append(f"  - matched phrase: \"{t['matched_phrase']}\"")
+            body.append(f"  - recommended action: {RECOMMENDED_ACTIONS.get(t['event'], 'review')}")
+        body.append("")
+
+    body.append("## Substrate cited")
+    body.append("")
+    body.append(f"- `clients/{client}/sales/target-accounts.csv`")
+    body.append("")
+    body.append("## Patterns grounded")
+    body.append("")
+    body.append("- `knowledge/patterns/trigger-events-beat-cadence-blast.md`")
+    body.append("- `knowledge/patterns/account-not-lead-as-unit.md`")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(fm + body), encoding="utf-8")
+
+
+def _date_to_int(s: str) -> int:
+    try:
+        return int(s.replace("-", ""))
+    except ValueError:
+        return 0
+
+
+def update_index(client: str, today_path: Path) -> None:
+    """Append today's file to the rolling index."""
+    index = SUBSTRATE_ROOT / "clients" / client / "sales" / "triggers" / "INDEX.md"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    line = f"- [{today}](./{today_path.name})"
+    if index.is_file():
+        existing = index.read_text(encoding="utf-8")
+        if line in existing:
+            return
+        new_text = existing.rstrip() + "\n" + line + "\n"
+    else:
+        new_text = (
+            f"# Trigger events index — {client}\n\n"
+            "Daily trigger files (newest first):\n\n"
+            f"{line}\n"
+        )
+    index.write_text(new_text, encoding="utf-8")
+
+
+# ---- Main ----
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--client", required=True)
+    p.add_argument("--accounts", default=None)
+    p.add_argument("--feeds", default=None)
+    p.add_argument("--mode", default="all", choices=["rss", "news", "company-pages", "all"])
+    p.add_argument("--lookback-days", type=int, default=30)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--output", default=None)
+    p.add_argument("--force", action="store_true")
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        print(f"REFUSED: client root missing — {client_root}", file=sys.stderr)
+        return 1
+
+    accounts_path = Path(args.accounts) if args.accounts else \
+        (client_root / "sales" / "target-accounts.csv")
+    if not accounts_path.is_file():
+        print(f"REFUSED: target accounts CSV missing — {accounts_path}", file=sys.stderr)
+        print(f"  fix: create the watchlist at clients/{args.client}/sales/target-accounts.csv", file=sys.stderr)
+        return 1
+
+    accounts = load_accounts(accounts_path)
+    if not accounts:
+        print(f"REFUSED: target accounts CSV has no rows", file=sys.stderr)
+        return 2
+    if len(accounts) > 5000 and not args.force:
+        print(f"REFUSED: account list >5000 ({len(accounts)}); ABM watch is for tiered lists.", file=sys.stderr)
+        print("  use --force to override or filter the list first.", file=sys.stderr)
+        return 2
+
+    feeds_path = Path(args.feeds) if args.feeds else (client_root / "sales" / "feeds.yaml")
+    feeds = load_feeds(feeds_path)
+    print(f"[sales-trigger-event-watch] client={args.client}, accounts={len(accounts)}, feeds={len(feeds)}", file=sys.stderr)
+
+    triggers = watch(args.client, accounts, feeds, args.lookback_days, args.mode, args.dry_run)
+
+    print(f"  detected {len(triggers)} triggers", file=sys.stderr)
+
+    if args.dry_run:
+        for t in triggers[:25]:
+            print(f"  [dry] {t['date']} | {t['account']} | {t['event']} | "
+                   f"{t['significance']} | {t['title'][:60]}", file=sys.stderr)
+        print(f"\nDRY-RUN: {len(triggers)} triggers detected; no file written")
+        return 0
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if args.output:
+        out_path = Path(args.output).resolve()
+    else:
+        out_path = client_root / "sales" / "triggers" / f"{today}.md"
+
+    write_triggers_file(args.client, triggers, args.lookback_days, out_path)
+    update_index(args.client, out_path)
+
+    print(f"[sales-trigger-event-watch] wrote {out_path}", file=sys.stderr)
+    print(f"PASS: {len(triggers)} triggers → {out_path.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

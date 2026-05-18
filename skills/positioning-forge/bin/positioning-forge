@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# positioning-forge — Dunford 5-step diagnostic + canonical statement check.
+#
+# Two modes:
+#   --check <asset>   — verify asset's positioning aligns with canonical statement
+#   --diagnose        — read substrate; produce/refresh canonical statement
+#
+# Canonical statement file:
+#   clients/<client>/substrate/positioning-canonical-statement-<date>.md
+#
+# Dunford 5 steps (Obviously Awesome):
+#   1. Competitive alternatives (what would buyer use if not us)
+#   2. Unique attributes we have they don't
+#   3. Value themes those attributes enable
+#   4. Target market characteristics that care most
+#   5. Market category we frame inside
+#
+# Output:
+#   stdout — canonical 1-line statement (or check pass/fail)
+#   stderr — diagnostic + 12-second-test result
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+CLIENT="${SUBSTRATE_CLIENT:-${CLIENT:-sample-client}}"
+
+MODE="diagnose"
+ASSET=""
+
+while [ "${1:-}" != "" ]; do
+  case "$1" in
+    --check)     MODE="check"; ASSET="$2"; shift 2 ;;
+    --diagnose)  MODE="diagnose"; shift ;;
+    --client)    CLIENT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+CANONICAL_FILE=$(ls "$SUBSTRATE_ROOT/clients/$CLIENT/substrate/positioning-canonical-statement-"*.md 2>/dev/null | head -1)
+
+if [ "$MODE" = "check" ]; then
+  [ -f "$ASSET" ] || { echo "asset not found: $ASSET" >&2; exit 2; }
+
+  if [ -z "$CANONICAL_FILE" ] || [ ! -f "$CANONICAL_FILE" ]; then
+    echo "FAIL: no canonical positioning statement at clients/$CLIENT/substrate/positioning-canonical-statement-*.md" >&2
+    echo "Run: substrate positioning-forge --diagnose" >&2
+    exit 1
+  fi
+
+  # Extract canonical line — first non-empty bold/text after H1 "Canonical statement" or "## Canonical"
+  canonical=$(awk '
+    /^# Canonical/ { in_block=1; next }
+    /^## (Canonical|The position|Statement)/ { in_block=1; next }
+    in_block && /^\*\*/ { gsub(/\*\*/, ""); print; exit }
+    in_block && /^[A-Za-z]/ { print; exit }
+  ' "$CANONICAL_FILE")
+
+  echo "=== positioning-forge --check: $ASSET ===" >&2
+  echo "  canonical: $canonical" >&2
+
+  # Heuristic: does the asset's H1 + first paragraph contain at least 2 of the 3
+  # canonical-statement load-bearing terms? (category noun, audience, differentiator)
+  asset_head=$(head -100 "$ASSET" | tr '[:upper:]' '[:lower:]')
+  canonical_lower=$(echo "$canonical" | tr '[:upper:]' '[:lower:]')
+
+  # Extract category noun, audience, differentiator from canonical
+  # (Heuristic: split canonical statement on common connectors and look for nouns)
+  hits=0
+  # Look for major content words from canonical that appear in asset_head
+  while read word; do
+    w_lower=$(echo "$word" | tr '[:upper:]' '[:lower:]')
+    if [ ${#w_lower} -ge 5 ] && echo "$asset_head" | grep -q -F -i "$w_lower"; then
+      hits=$((hits+1))
+    fi
+  done < <(echo "$canonical" | tr ' ' '\n' | grep -E '^[A-Za-z]{5,}$' | sort -u | head -10)
+
+  if [ "$hits" -ge 3 ]; then
+    echo "  asset reflects ≥3 canonical terms: PASS" >&2
+    echo "PASS: $ASSET (positioning-aligned)"
+    exit 0
+  fi
+
+  echo "  asset reflects only $hits canonical terms (need ≥3)" >&2
+  echo "FAIL: $ASSET (positioning-drift; canonical: '$canonical')"
+  exit 1
+fi
+
+# Diagnose mode — surface what canonical statement should be
+echo "=== positioning-forge --diagnose ($CLIENT) ===" >&2
+echo "" >&2
+echo "Dunford 5-step diagnostic. Substrate references:" >&2
+for layer in positioning icp voc-corpus-index competitor-landscape product-knowledge market-context; do
+  matches=$(ls "$SUBSTRATE_ROOT/clients/$CLIENT/substrate/${layer}"*.md 2>/dev/null | head -1)
+  if [ -n "$matches" ]; then
+    echo "  ✓ $layer: $matches" >&2
+  else
+    echo "  ✗ $layer: MISSING — substrate-gap; refusing to forge" >&2
+  fi
+done
+echo "" >&2
+
+if [ -n "$CANONICAL_FILE" ]; then
+  echo "Existing canonical statement: $CANONICAL_FILE" >&2
+  echo "" >&2
+
+  # Substrate-cite refusal: every Dunford-5 row must point to a substrate file that exists.
+  # The author CANNOT ship a canonical-statement file without per-row substrate-cite.
+  # This closes the "author-from-memory" exemption that produced the 2026-05-01 errors.
+  echo "Verifying per-row substrate-cite (refuses if any row lacks a real path)..." >&2
+
+  missing=0
+  # Scan for "Source path:" / "Source:" / "source:" / file-path lines under each Dunford-5 step.
+  # Heuristic: every row in a markdown table or bullet under §1-5 should reference at least
+  # one path that ends with .md / .yml / .yaml / .json and resolves under the substrate root.
+
+  python3 - "$CANONICAL_FILE" "$SUBSTRATE_ROOT" <<'PY' 2>&1
+import re, sys
+from pathlib import Path
+
+canonical_path = sys.argv[1]
+substrate_root = sys.argv[2]
+text = Path(canonical_path).read_text()
+
+# Find the Dunford-5 working section
+sections = re.split(r"^### \d\.\s", text, flags=re.MULTILINE)
+if len(sections) < 6:
+    print("  ✗ no five Dunford-5 sections detected (expected '### 1. ' through '### 5. ')")
+    sys.exit(1)
+
+step_labels = ["1 Competitive alternatives", "2 Unique attributes", "3 Value themes", "4 Target market", "5 Market category"]
+verified = 0
+issues = []
+
+# Walk a path-finding regex across each step
+path_re = re.compile(r'`?([\w./_-]+\.(?:md|yml|yaml|json|jsonl))`?')
+
+# Build a basename → full-path index of substrate files (one-time).
+# Indexed roots are every top-level substrate tree that holds canonical material.
+basename_idx = {}
+for root_dir in ["clients", "knowledge", "shared", "raw", "personas", "templates",
+                 "goals", "metrics", "routines"]:
+    base = Path(substrate_root) / root_dir
+    if base.exists():
+        for f in base.rglob("*.md"):
+            basename_idx.setdefault(f.name, str(f.relative_to(Path(substrate_root))))
+        for f in base.rglob("*.yml"):
+            basename_idx.setdefault(f.name, str(f.relative_to(Path(substrate_root))))
+        for f in base.rglob("*.yaml"):
+            basename_idx.setdefault(f.name, str(f.relative_to(Path(substrate_root))))
+
+for i, label in enumerate(step_labels, start=1):
+    if i >= len(sections):
+        issues.append(f"step {label}: missing")
+        continue
+    block = sections[i]
+    paths = path_re.findall(block)
+    real_paths = []
+    for p in paths:
+        # Try absolute-ish path first
+        full = Path(substrate_root) / p
+        if full.exists():
+            real_paths.append(p)
+            continue
+        # Then basename match against substrate index
+        bn = p.split("/")[-1]
+        if bn in basename_idx:
+            real_paths.append(p + " (resolved via basename to " + basename_idx[bn] + ")")
+    if real_paths:
+        verified += 1
+        print(f"  ✓ Dunford-{i}: {len(real_paths)} substrate path(s) cited (e.g., {real_paths[0]})")
+    else:
+        issues.append(f"Dunford-{i} ({label}): NO substrate path cited or paths do not resolve")
+        print(f"  ✗ Dunford-{i}: no resolvable substrate path in {len(paths)} candidates")
+
+print(f"\n  {verified}/5 Dunford steps cite resolvable substrate paths.")
+if verified < 5:
+    print("\n  REFUSED: positioning-forge --diagnose cannot accept a canonical statement")
+    print("  without per-row substrate-cite. Each Dunford-5 step (### 1. through ### 5.)")
+    print("  must reference at least one substrate file path that resolves under the")
+    print("  substrate root. This closes the author-from-memory failure mode: per-claim")
+    print("  cites force the operator to ground the diagnosis in real artifacts.")
+    print("\n  Failing steps:")
+    for s in issues:
+        print(f"    - {s}")
+    sys.exit(1)
+print("\n  PASS: every Dunford-5 step is grounded in a real substrate path.")
+PY
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    exit 1
+  fi
+
+  echo "" >&2
+  echo "Run with --check <asset> to verify an asset aligns with the canonical statement." >&2
+  exit 0
+fi
+
+echo "No canonical statement file yet at clients/$CLIENT/substrate/positioning-canonical-statement-*.md" >&2
+echo "" >&2
+echo "Forge by: reading substrate above; producing 1-line answer to:" >&2
+echo "  'For [target market], [product] is the [category] that [unique value],'" >&2
+echo "  'unlike [competitive alternative].'" >&2
+echo "" >&2
+echo "Then: write to clients/$CLIENT/substrate/positioning-canonical-statement-$(date +%Y-%m-%d).md" >&2
+echo "  with sections: ## Canonical statement / ## Dunford-5 / ## How to apply" >&2
+exit 1

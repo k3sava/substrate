@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+"""aeo-relevance — score AEO relevance for an asset.
+
+Real logic: extracts claims from the asset, parses passage structure (TL;DR, H3
+density, bulleted answers, schema.org markup), simulates AI assistant queries
+against the canonical prompt set, and scores citation likelihood per claim using
+the passage-as-citation-unit rubric (Pierri / Crestodina / King / Solis).
+
+Modes:
+  score          per-asset relevance scorecard with passage breakdown
+  gap-analysis   prompt × asset matrix; surface unmet prompts
+  content-brief  for an unmet prompt, propose the passage shape that would win citation
+
+Refuses without:
+  - clients/<client>/aeo/target-prompts.md (prompt set required)
+  - --asset (the asset to score)
+  - asset that has zero H2/H3 structure (not passage-extractable)
+
+Patterns applied:
+  - aeo-triangle (presence + relevance + manual-action propagation)
+  - passage-as-citation-unit (the unit of optimisation is the passage, not the page)
+  - agents-as-product-users
+  - distribution-as-moat (off-domain mirror discipline)
+
+Exit codes:
+  0  scorecard / gap analysis / brief written
+  1  written with warnings (low score, [VERIFY] flags)
+  2  asset not found
+  3  refused (missing target-prompts.md, missing asset, asset not passage-extractable)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+os.environ["SUBSTRATE_ROOT"] = str(SUBSTRATE_ROOT)
+os.environ.setdefault("FLYWHEEL_ROOT", str(SUBSTRATE_ROOT))
+
+
+# ---------- voice / kill-list checks ----------
+
+KILL_LIST = {
+    "orchestration", "seamless", "strategic", "leverage", "transform",
+    "holistic", "synergy", "bespoke", "unlock", "robust", "harness",
+    "elevate", "empower", "supercharge", "revolutionize", "streamline",
+    "cutting-edge", "best-in-class", "world-class", "next-generation",
+}
+
+THROAT_CLEAR_OPENERS = {
+    "in today's world", "in this day and age", "in the world of",
+    "as we all know", "it is important to note", "needless to say",
+    "at the end of the day", "in conclusion", "in summary",
+}
+
+# ---------- markdown / HTML parser ----------
+
+def strip_frontmatter(text: str) -> tuple[dict, str]:
+    """Extract YAML frontmatter; return (frontmatter_dict, body)."""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}, text
+    fm_text = text[3:end]
+    body = text[end + 4:].lstrip()
+    fm: dict[str, str] = {}
+    for line in fm_text.splitlines():
+        if ":" in line and not line.startswith(" "):
+            k, _, v = line.partition(":")
+            fm[k.strip()] = v.strip().strip("'\"")
+    return fm, body
+
+
+def split_passages(body: str) -> list[dict]:
+    """Split a markdown asset into passages by H2/H3 boundaries.
+
+    A passage is the text under one H2 or H3 (whichever is the deepest applicable).
+    Returns list of dicts with: heading, level, body, word_count, has_bullets,
+    has_question, references_other_section, position.
+    """
+    lines = body.splitlines()
+    passages: list[dict] = []
+    current: dict | None = None
+    for line in lines:
+        # New H2 or H3 starts a passage
+        m = re.match(r"^(#{2,3})\s+(.+?)\s*$", line)
+        if m:
+            if current is not None:
+                passages.append(_finalize_passage(current))
+            current = {
+                "heading": m.group(2).strip(),
+                "level": len(m.group(1)),
+                "body_lines": [],
+                "raw": line + "\n",
+            }
+            continue
+        if current is not None:
+            current["body_lines"].append(line)
+            current["raw"] += line + "\n"
+    if current is not None:
+        passages.append(_finalize_passage(current))
+    # Add position
+    for i, p in enumerate(passages):
+        p["position"] = i
+    return passages
+
+
+def _finalize_passage(p: dict) -> dict:
+    body = "\n".join(p["body_lines"]).strip()
+    words = re.findall(r"\b\w+\b", body)
+    word_count = len(words)
+    has_bullets = bool(re.search(r"^\s*[-*]\s+", body, re.MULTILINE))
+    # Question-explicit: heading or first sentence ends with "?"
+    first_sent = body.split(".")[0] if body else ""
+    has_question = ("?" in p["heading"]) or first_sent.strip().endswith("?") or bool(re.search(r"\?\s", first_sent))
+    # References to other sections
+    references_other = bool(re.search(r"\b(as (?:discussed|noted|mentioned) (?:above|below|earlier|previously)|see (?:above|below)|as we (?:saw|noted) (?:above|below))\b", body, re.IGNORECASE))
+    return {
+        "heading": p["heading"],
+        "level": p["level"],
+        "body": body,
+        "word_count": word_count,
+        "has_bullets": has_bullets,
+        "has_question": has_question,
+        "references_other_section": references_other,
+    }
+
+
+def detect_tl_dr(body: str) -> tuple[bool, int]:
+    """TL;DR up top: a heading containing 'TL;DR' / 'Summary' / 'Key takeaways' in first 200 lines."""
+    lines = body.splitlines()
+    head = "\n".join(lines[:200])
+    if re.search(r"^#{1,3}\s+(TL;?DR|Summary|Key Takeaways|At a Glance)\b", head, re.IGNORECASE | re.MULTILINE):
+        # find line number
+        for i, line in enumerate(lines):
+            if re.match(r"^#{1,3}\s+(TL;?DR|Summary|Key Takeaways|At a Glance)\b", line, re.IGNORECASE):
+                return True, i
+    return False, -1
+
+
+def detect_schema_org(body: str) -> dict[str, bool]:
+    """Detect schema.org markup blocks in the body (JSON-LD)."""
+    out = {"FAQPage": False, "HowTo": False, "Article": False, "Product": False}
+    json_ld_blocks = re.findall(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        body, re.DOTALL | re.IGNORECASE,
+    )
+    for block in json_ld_blocks:
+        try:
+            obj = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        candidates = obj if isinstance(obj, list) else [obj]
+        for c in candidates:
+            if isinstance(c, dict):
+                t = c.get("@type", "")
+                if isinstance(t, list):
+                    for ti in t:
+                        if ti in out:
+                            out[ti] = True
+                elif t in out:
+                    out[t] = True
+    # Also detect inline structured-data hints (schema:FAQPage, etc)
+    for type_name in out:
+        if re.search(r'@type["\']?\s*:\s*["\']' + type_name + r'["\']', body):
+            out[type_name] = True
+    return out
+
+
+def detect_kill_list(body: str) -> list[str]:
+    """Find kill-list words in the body. Returns list of (word, count) hits."""
+    lower = body.lower()
+    found: list[str] = []
+    for w in KILL_LIST:
+        if re.search(r"\b" + re.escape(w) + r"\b", lower):
+            found.append(w)
+    return found
+
+
+def detect_em_dashes(body: str) -> int:
+    """Count em-dashes in body copy. Per operator-voice, none in body."""
+    return body.count("—")
+
+
+def detect_throat_clearing(body: str) -> list[str]:
+    """Find throat-clearing openers in body."""
+    lower = body.lower()
+    found: list[str] = []
+    for opener in THROAT_CLEAR_OPENERS:
+        if opener in lower:
+            found.append(opener)
+    return found
+
+
+# ---------- claim extraction ----------
+
+def extract_claims(passages: list[dict]) -> list[dict]:
+    """Extract candidate claims from each passage.
+
+    Heuristic: each passage's first sentence after the heading is a claim.
+    Also pull bulleted points as claims.
+    """
+    claims: list[dict] = []
+    for p in passages:
+        body = p["body"]
+        if not body:
+            continue
+        # First sentence
+        first_match = re.match(r"\s*([A-Z][^.!?\n]{15,400}[.!?])", body)
+        if first_match:
+            claims.append({
+                "passage_heading": p["heading"],
+                "passage_position": p["position"],
+                "kind": "first_sentence",
+                "text": first_match.group(1).strip(),
+            })
+        # Bulleted claims
+        for m in re.finditer(r"^\s*[-*]\s+(.+?)$", body, re.MULTILINE):
+            t = m.group(1).strip()
+            if 15 < len(t) < 300:
+                claims.append({
+                    "passage_heading": p["heading"],
+                    "passage_position": p["position"],
+                    "kind": "bullet",
+                    "text": t,
+                })
+    return claims
+
+
+# ---------- positioning load ----------
+
+def load_positioning(client_root: Path) -> str | None:
+    """Load canonical positioning text (concatenated)."""
+    candidates = []
+    for sub in ["positioning", "substrate"]:
+        d = client_root / sub
+        if d.is_dir():
+            candidates.extend(sorted(d.glob("*canonical*.md"), reverse=True))
+            candidates.extend(sorted(d.glob("positioning*.md"), reverse=True))
+    p_md = client_root / "positioning.md"
+    if p_md.is_file():
+        candidates.append(p_md)
+    if not candidates:
+        return None
+    text = ""
+    for c in candidates[:3]:
+        try:
+            text += c.read_text(encoding="utf-8") + "\n\n"
+        except Exception:
+            pass
+    return text or None
+
+
+def load_target_prompts(client: str, override: Path | None = None) -> list[dict]:
+    """Load and parse target-prompts.md.
+
+    Format:
+      ## <prompt-id>: <intent-label>
+      <prompt text>
+      Source: <source-path>
+
+    Returns list of {id, intent, text, source}.
+    """
+    if override and override.is_file():
+        path = override
+    else:
+        path = SUBSTRATE_ROOT / "clients" / client / "aeo" / "target-prompts.md"
+    if not path.is_file():
+        return []
+    text = path.read_text(encoding="utf-8")
+    # Strip frontmatter
+    _, body = strip_frontmatter(text)
+    prompts: list[dict] = []
+    blocks = re.split(r"^##\s+", body, flags=re.MULTILINE)[1:]
+    for block in blocks:
+        lines = block.strip().splitlines()
+        if not lines:
+            continue
+        head = lines[0]
+        # Parse "<prompt-id>: <intent>" or just text
+        m = re.match(r"^([\w\-_.]+)\s*[:\-]?\s*(.+)?$", head)
+        prompt_id = m.group(1) if m else head[:30]
+        intent_label = (m.group(2) or "").strip() if m else ""
+        prompt_text_lines = []
+        source = ""
+        for l in lines[1:]:
+            if l.strip().startswith("Source:") or l.strip().startswith("source:"):
+                source = l.split(":", 1)[1].strip()
+            elif l.strip().startswith("Intent:") or l.strip().startswith("intent:"):
+                if not intent_label:
+                    intent_label = l.split(":", 1)[1].strip()
+            else:
+                prompt_text_lines.append(l)
+        prompt_text = "\n".join(prompt_text_lines).strip()
+        prompts.append({
+            "id": prompt_id,
+            "intent": intent_label,
+            "text": prompt_text,
+            "source": source,
+        })
+    return prompts
+
+
+# ---------- scoring ----------
+
+def score_passage_extractability(passages: list[dict], has_tldr: bool) -> tuple[float, dict]:
+    """Score the asset on passage extractability (0-1).
+
+    Components:
+      passage_count_signal     8-12 passages → 1.0; falls off linearly
+      avg_word_count_signal    40-90 words avg → 1.0; falls off linearly
+      bullet_density_signal    ≥30% passages with bullets → 1.0
+      question_density_signal  ≥50% passages with explicit question → 1.0
+      tldr_signal              binary; 0.15 weight on overall
+    """
+    n = len(passages)
+    if n == 0:
+        return 0.0, {"reason": "no passages"}
+    # Passage count signal
+    if 8 <= n <= 12:
+        pc = 1.0
+    elif n < 8:
+        pc = n / 8.0
+    else:
+        pc = max(0.0, 1.0 - (n - 12) / 12.0)
+    # Average word count signal
+    word_counts = [p["word_count"] for p in passages if p["word_count"] > 0]
+    avg_wc = sum(word_counts) / len(word_counts) if word_counts else 0
+    if 40 <= avg_wc <= 90:
+        wc_score = 1.0
+    elif avg_wc < 40:
+        wc_score = avg_wc / 40.0
+    else:
+        wc_score = max(0.0, 1.0 - (avg_wc - 90) / 90.0)
+    # Bullet density signal
+    bullets = sum(1 for p in passages if p["has_bullets"])
+    bullet_density = bullets / n
+    bd_score = min(1.0, bullet_density / 0.30)
+    # Question-explicit density
+    questions = sum(1 for p in passages if p["has_question"])
+    q_density = questions / n
+    q_score = min(1.0, q_density / 0.50)
+    # TL;DR signal (binary, 0.15 weight)
+    tldr_score = 1.0 if has_tldr else 0.0
+
+    weights = {
+        "passage_count": 0.20,
+        "avg_word_count": 0.30,
+        "bullet_density": 0.15,
+        "question_density": 0.20,
+        "tldr": 0.15,
+    }
+    overall = (pc * weights["passage_count"]
+               + wc_score * weights["avg_word_count"]
+               + bd_score * weights["bullet_density"]
+               + q_score * weights["question_density"]
+               + tldr_score * weights["tldr"])
+    return overall, {
+        "passage_count": n,
+        "passage_count_score": round(pc, 2),
+        "avg_word_count": round(avg_wc, 1),
+        "avg_word_count_score": round(wc_score, 2),
+        "bullet_density": round(bullet_density, 2),
+        "bullet_density_score": round(bd_score, 2),
+        "question_density": round(q_density, 2),
+        "question_density_score": round(q_score, 2),
+        "tldr_present": has_tldr,
+    }
+
+
+def score_self_containment(passages: list[dict]) -> tuple[float, dict]:
+    """Penalize passages that reference 'above'/'below'/'as discussed'."""
+    n = len(passages)
+    if n == 0:
+        return 0.0, {}
+    refs = sum(1 for p in passages if p["references_other_section"])
+    score = max(0.0, 1.0 - refs / n)
+    return score, {"passages_with_external_refs": refs, "of_total": n}
+
+
+def score_schema_markup(schema: dict[str, bool]) -> tuple[float, dict]:
+    """Binary signal across FAQPage, HowTo, Article. Any present → 1.0."""
+    if any(schema.values()):
+        return 1.0, schema
+    return 0.0, schema
+
+
+def score_positioning_alignment(claims: list[dict], positioning_text: str | None) -> tuple[float, dict]:
+    """For each claim, compute overlap of load-bearing terms with positioning text.
+
+    Heuristic: term-overlap between claim and positioning, weighted by inverse term frequency.
+    Returns mean alignment score across claims.
+    """
+    if not positioning_text or not claims:
+        return 0.5, {"reason": "no positioning text or no claims (default 0.5)"}
+    pos_terms = set(re.findall(r"\b[a-z]{5,}\b", positioning_text.lower()))
+    if not pos_terms:
+        return 0.5, {"reason": "no load-bearing positioning terms"}
+    scores = []
+    for claim in claims:
+        claim_terms = set(re.findall(r"\b[a-z]{5,}\b", claim["text"].lower()))
+        if not claim_terms:
+            scores.append(0.0)
+            continue
+        overlap = len(claim_terms & pos_terms)
+        scores.append(min(1.0, overlap / max(3, len(claim_terms) // 3)))
+    avg = sum(scores) / len(scores)
+    return avg, {"avg_alignment": round(avg, 2), "claim_count": len(claims)}
+
+
+def score_voice(body: str) -> tuple[float, dict]:
+    """Voice match: kill-list words, em-dashes, throat-clearing openers."""
+    kills = detect_kill_list(body)
+    em = detect_em_dashes(body)
+    throat = detect_throat_clearing(body)
+    total_violations = len(kills) + em + len(throat)
+    # Score: 1.0 - 0.05 per violation, floor 0.0
+    score = max(0.0, 1.0 - 0.05 * total_violations)
+    return score, {
+        "kill_list_hits": kills,
+        "em_dashes": em,
+        "throat_clearing": throat,
+        "total_violations": total_violations,
+    }
+
+
+def score_per_claim_citation_likelihood(claim: dict, positioning_text: str | None,
+                                         passages: list[dict]) -> dict:
+    """Per-claim citation likelihood.
+
+    Score 0-1 based on:
+      - is the claim in a passage with a question heading? (extraction signal)
+      - is the claim self-contained?
+      - does it have positioning alignment?
+      - is its passage 40-90 words?
+    """
+    pos = claim.get("passage_position", -1)
+    if pos < 0 or pos >= len(passages):
+        return {"score": 0.0, "reason": "no passage match"}
+    p = passages[pos]
+    score = 0.0
+    has_q = 1.0 if p["has_question"] else 0.0
+    score += 0.30 * has_q
+    self_contained = 0.0 if p["references_other_section"] else 1.0
+    score += 0.25 * self_contained
+    wc = p["word_count"]
+    if 40 <= wc <= 90:
+        wc_signal = 1.0
+    elif wc < 40:
+        wc_signal = wc / 40.0
+    else:
+        wc_signal = max(0.0, 1.0 - (wc - 90) / 90.0)
+    score += 0.20 * wc_signal
+    has_bullets = 1.0 if p["has_bullets"] else 0.0
+    score += 0.10 * has_bullets
+    # Positioning alignment
+    if positioning_text:
+        pos_terms = set(re.findall(r"\b[a-z]{5,}\b", positioning_text.lower()))
+        claim_terms = set(re.findall(r"\b[a-z]{5,}\b", claim["text"].lower()))
+        overlap = len(pos_terms & claim_terms)
+        pos_signal = min(1.0, overlap / max(2, len(claim_terms) // 4))
+    else:
+        pos_signal = 0.5
+    score += 0.15 * pos_signal
+    return {
+        "score": round(min(1.0, score), 2),
+        "components": {
+            "question_explicit": has_q,
+            "self_contained": self_contained,
+            "passage_word_count_fit": round(wc_signal, 2),
+            "has_bullets": has_bullets,
+            "positioning_alignment": round(pos_signal, 2),
+        },
+    }
+
+
+def score_prompt_match(prompt: dict, passages: list[dict],
+                       claims: list[dict], positioning_text: str | None) -> dict:
+    """For a target prompt, score the asset's likelihood of being the cited answer.
+
+    Heuristic: text similarity (term overlap) between the prompt text and each claim,
+    weighted by per-claim citation likelihood. Best-scoring claim wins.
+    """
+    prompt_terms = set(re.findall(r"\b[a-z]{4,}\b", prompt["text"].lower()))
+    if not prompt_terms or not claims:
+        return {"prompt_id": prompt["id"], "score": 0.0, "best_claim": None,
+                "reason": "no prompt terms or no claims"}
+    best_score = 0.0
+    best_claim = None
+    for c in claims:
+        claim_terms = set(re.findall(r"\b[a-z]{4,}\b", c["text"].lower()))
+        if not claim_terms:
+            continue
+        overlap = len(prompt_terms & claim_terms)
+        if not overlap:
+            continue
+        # Term overlap component
+        topical = overlap / max(3, len(prompt_terms) // 2)
+        topical = min(1.0, topical)
+        # Per-claim citation likelihood
+        likelihood = score_per_claim_citation_likelihood(c, positioning_text, passages)
+        combined = (topical * 0.6) + (likelihood["score"] * 0.4)
+        if combined > best_score:
+            best_score = combined
+            best_claim = {**c, "topical": round(topical, 2),
+                          "citation_likelihood": likelihood["score"]}
+    return {
+        "prompt_id": prompt["id"],
+        "intent": prompt["intent"],
+        "score": round(best_score, 2),
+        "best_claim": best_claim,
+    }
+
+
+def overall_score(*, passage_extract: float, self_contain: float,
+                  schema: float, positioning: float, voice: float) -> float:
+    """Weighted overall score."""
+    return round(
+        passage_extract * 0.30 +
+        self_contain * 0.20 +
+        schema * 0.15 +
+        positioning * 0.20 +
+        voice * 0.15,
+        3,
+    )
+
+
+# ---------- rendering ----------
+
+def render_score_md(*, asset_path: Path, asset_text_len: int,
+                    passages: list[dict], has_tldr: bool, tldr_position: int,
+                    schema_present: dict[str, bool],
+                    claims: list[dict], voice_details: dict,
+                    pe_details: dict, sc_details: dict, pa_details: dict,
+                    overall: float, passage_extract: float, self_contain: float,
+                    schema_score: float, positioning_score: float, voice_score: float,
+                    per_claim_scores: list[dict],
+                    client: str, today: str, asset_stem: str) -> str:
+    threshold = 0.70
+    verdict = "PASS — passage-ready" if overall >= threshold else "BELOW THRESHOLD — needs restructuring"
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: aeo-relevance-score")
+    lines.append("produced_by: aeo-relevance")
+    lines.append(f"client: {client}")
+    lines.append(f"asset: {asset_path}")
+    lines.append(f"asset_stem: {asset_stem}")
+    lines.append(f"scored_at: {today}")
+    lines.append(f"overall_score: {overall}")
+    lines.append(f"threshold: {threshold}")
+    lines.append(f"verdict: {verdict}")
+    lines.append("substrate_layers_cited: [positioning, product-knowledge, voc, market-context]")
+    lines.append("patterns_applied: [aeo-triangle, passage-as-citation-unit, agents-as-product-users, distribution-as-moat]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# AEO relevance score — {asset_stem}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"Asset `{asset_path.name}` scored **{overall}** on the AEO relevance rubric "
+                 f"(threshold: {threshold}). Verdict: **{verdict}**. The score weights passage "
+                 "extractability (0.30), self-containment (0.20), schema.org markup (0.15), positioning "
+                 "alignment (0.20), and voice match (0.15) per pat_passage-as-citation-unit. The asset "
+                 f"contains {len(passages)} passage(s) and {len(claims)} extracted claim(s).")
+    lines.append("")
+    lines.append("## Component scores")
+    lines.append("")
+    lines.append("| Dimension | Weight | Score | Pass/Fail |")
+    lines.append("|---|---:|---:|---|")
+    lines.append(f"| Passage extractability | 0.30 | {round(passage_extract, 2)} | {'PASS' if passage_extract >= 0.7 else 'FAIL'} |")
+    lines.append(f"| Self-containment | 0.20 | {round(self_contain, 2)} | {'PASS' if self_contain >= 0.7 else 'FAIL'} |")
+    lines.append(f"| Schema.org markup | 0.15 | {round(schema_score, 2)} | {'PASS' if schema_score >= 0.7 else 'FAIL'} |")
+    lines.append(f"| Positioning alignment | 0.20 | {round(positioning_score, 2)} | {'PASS' if positioning_score >= 0.7 else 'FAIL'} |")
+    lines.append(f"| Voice match | 0.15 | {round(voice_score, 2)} | {'PASS' if voice_score >= 0.7 else 'FAIL'} |")
+    lines.append(f"| **Overall** | — | **{overall}** | **{'PASS' if overall >= threshold else 'FAIL'}** |")
+    lines.append("")
+
+    lines.append("## Passage extractability detail")
+    lines.append("")
+    lines.append(f"- Passage count: **{pe_details.get('passage_count', 0)}** (target: 8-12)")
+    lines.append(f"- Average passage length: **{pe_details.get('avg_word_count', 0)}** words (target: 40-90)")
+    lines.append(f"- Bullet density: **{pe_details.get('bullet_density', 0):.0%}** of passages (target: ≥30%)")
+    lines.append(f"- Question-explicit density: **{pe_details.get('question_density', 0):.0%}** of passages (target: ≥50%)")
+    if has_tldr:
+        lines.append(f"- TL;DR detected at line {tldr_position} (PASS).")
+    else:
+        lines.append("- TL;DR not detected in first 200 lines (FAIL — add a TL;DR section at the top per pat_passage-as-citation-unit).")
+    lines.append("")
+
+    lines.append("## Self-containment detail")
+    lines.append("")
+    lines.append(f"- {sc_details.get('passages_with_external_refs', 0)} of {sc_details.get('of_total', 0)} "
+                 "passages reference 'above', 'below', 'as discussed', etc. Per pat_passage-as-citation-unit, "
+                 "AI assistants extract passages without surrounding context; references to other sections "
+                 "break extraction.")
+    lines.append("")
+
+    lines.append("## Schema.org markup detail")
+    lines.append("")
+    detected_types = [t for t, v in schema_present.items() if v]
+    if detected_types:
+        lines.append(f"- Detected types: {', '.join('`' + t + '`' for t in detected_types)}")
+    else:
+        lines.append("- No schema.org markup detected. Per Solis: machine-readable markup is the readiness signal.")
+        lines.append("- Recommended: add FAQPage markup for Q&A passages, HowTo for step sequences, Article + speakable for op-ed.")
+    lines.append("")
+
+    lines.append("## Positioning alignment detail")
+    lines.append("")
+    lines.append(f"- Average claim alignment with canonical positioning: **{pa_details.get('avg_alignment', 0)}** (over {pa_details.get('claim_count', 0)} claims)")
+    if pa_details.get("avg_alignment", 0) < 0.5:
+        lines.append("- **Drift signal**: claim language is loosely connected to canonical positioning. "
+                     "Per Dunford's launch-positioning-grounded rule, every claim should reflect the canonical "
+                     "statement; this score below 0.5 indicates the asset is drifting.")
+    lines.append("")
+
+    lines.append("## Voice match detail")
+    lines.append("")
+    lines.append(f"- Total voice violations: **{voice_details.get('total_violations', 0)}**")
+    if voice_details.get("kill_list_hits"):
+        lines.append(f"- Kill-list words: {', '.join('`' + w + '`' for w in voice_details['kill_list_hits'])}")
+    if voice_details.get("em_dashes"):
+        lines.append(f"- Em-dashes in body: {voice_details['em_dashes']} (per operator-voice, none in body copy)")
+    if voice_details.get("throat_clearing"):
+        lines.append(f"- Throat-clearing openers: {', '.join(voice_details['throat_clearing'])}")
+    if not (voice_details.get("kill_list_hits") or voice_details.get("em_dashes") or voice_details.get("throat_clearing")):
+        lines.append("- No violations detected. PASS.")
+    lines.append("")
+
+    lines.append("## Per-passage breakdown")
+    lines.append("")
+    lines.append("| # | Heading | Words | Bullets | Question? | Self-contained |")
+    lines.append("|---:|---|---:|:---:|:---:|:---:|")
+    for p in passages:
+        sc = "✓" if not p["references_other_section"] else "✗"
+        bul = "✓" if p["has_bullets"] else "—"
+        qm = "✓" if p["has_question"] else "—"
+        head_truncated = p["heading"][:60] + ("…" if len(p["heading"]) > 60 else "")
+        lines.append(f"| {p['position']} | {head_truncated} | {p['word_count']} | {bul} | {qm} | {sc} |")
+    lines.append("")
+
+    lines.append("## Per-claim citation likelihood")
+    lines.append("")
+    if per_claim_scores:
+        lines.append("| Claim | Passage | Score | Components |")
+        lines.append("|---|---|---:|---|")
+        # Show top 15 by score
+        ranked = sorted(per_claim_scores, key=lambda x: -x["score"])[:15]
+        for c in ranked:
+            head_truncated = (c.get("passage_heading") or "")[:30]
+            text_truncated = (c.get("text") or "")[:80] + ("…" if len(c.get("text") or "") > 80 else "")
+            comps = c.get("components", {})
+            comp_str = " ".join(f"{k.split('_')[0]}={v}" for k, v in comps.items())
+            lines.append(f"| {text_truncated} | {head_truncated} | {c['score']} | {comp_str} |")
+        lines.append("")
+        if len(per_claim_scores) > 15:
+            lines.append(f"… and {len(per_claim_scores) - 15} additional claims (truncated for readability).")
+            lines.append("")
+    else:
+        lines.append("No claims extracted. The asset has no first-sentences or bulleted points that meet the claim threshold.")
+        lines.append("")
+
+    lines.append("## Recommended fixes")
+    lines.append("")
+    if overall < threshold:
+        if has_tldr is False:
+            lines.append("- Add a TL;DR / Summary / Key Takeaways section at the top (≤100 words). Per "
+                         "pat_passage-as-citation-unit, the TL;DR is the most-cited passage type.")
+        if pe_details.get("avg_word_count", 0) > 120:
+            lines.append("- Tighten passages to 40-90 words. Long passages do not extract; AI assistants "
+                         "favour self-contained chunks of that length.")
+        if pe_details.get("question_density", 0) < 0.5:
+            lines.append("- Restructure section headings as questions where possible. Per Crestodina, Q&A density "
+                         "correlates with citation lift; explicit questions match the buyer's prompt.")
+        if pe_details.get("bullet_density", 0) < 0.3:
+            lines.append("- Add bulleted answer blocks under at least 30% of passages. Bulleted answers are "
+                         "structurally extractable.")
+        if not any(schema_present.values()):
+            lines.append("- Add schema.org JSON-LD markup. FAQPage for Q&A, HowTo for step sequences, Article "
+                         "+ speakable for op-ed. Solis names this the readiness signal.")
+        if voice_details.get("total_violations", 0) > 0:
+            lines.append(f"- Fix voice violations ({voice_details['total_violations']} found). Run "
+                         "`substrate voice-enforce` for the standard kill-list + em-dash + throat-clearing scrub.")
+    else:
+        lines.append("- Asset passes the AEO relevance threshold. Next: run `aeo-relevance --mode gap-analysis` "
+                     "to score against the prompt set; identify unmet prompts; brief the missing passages with "
+                     "`--mode content-brief`.")
+        lines.append("- Mirror the highest-scoring passages off-domain. Per Solis + Hufford: a YouTube short, "
+                     "a LinkedIn long-form post, and a Reddit / community placement raise the citation-rate ceiling.")
+    lines.append("")
+
+    lines.append("## Anti-fabrication notes")
+    lines.append("")
+    lines.append(f"- Source: `{asset_path}` ({asset_text_len} bytes).")
+    lines.append("- Method: per pat_passage-as-citation-unit (Pierri / Crestodina / King / Solis convergence).")
+    lines.append("- All scores computed from the body of the asset; no external API calls.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/passage-as-citation-unit.md`")
+    lines.append("- `knowledge/patterns/aeo-triangle.md`")
+    lines.append("- `skills/aeo-tune/` — per-vertical AEO pass")
+    lines.append("- `skills/aeo-manual-action/` — off-domain mention propagation")
+    return "\n".join(lines)
+
+
+def render_gap_analysis_md(*, client: str, asset_path: Path, asset_stem: str,
+                            today: str, prompt_scores: list[dict]) -> str:
+    lines: list[str] = []
+    threshold = 0.50
+    won = sum(1 for ps in prompt_scores if ps["score"] >= threshold)
+    lines.append("---")
+    lines.append("asset_type: aeo-gap-analysis")
+    lines.append("produced_by: aeo-relevance")
+    lines.append(f"client: {client}")
+    lines.append(f"asset: {asset_path}")
+    lines.append(f"analyzed_at: {today}")
+    lines.append(f"prompt_count: {len(prompt_scores)}")
+    lines.append(f"prompts_won: {won}")
+    lines.append("substrate_layers_cited: [positioning, product-knowledge, voc, market-context]")
+    lines.append("patterns_applied: [aeo-triangle, passage-as-citation-unit, distribution-as-moat]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# AEO gap analysis — {asset_stem}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"Asset `{asset_path.name}` scored against {len(prompt_scores)} target prompt(s). "
+                 f"**{won} prompt(s) won** (score ≥{threshold}); **{len(prompt_scores) - won} prompt(s) unmet**. "
+                 "Each unmet prompt is a content brief candidate.")
+    lines.append("")
+    lines.append("## Prompt × asset matrix")
+    lines.append("")
+    lines.append("| Prompt | Intent | Score | Best claim | Verdict |")
+    lines.append("|---|---|---:|---|---|")
+    for ps in sorted(prompt_scores, key=lambda x: -x["score"]):
+        verdict = "WIN" if ps["score"] >= threshold else "GAP"
+        bc_text = (ps["best_claim"]["text"][:80] if ps["best_claim"] else "—")
+        if ps["best_claim"] and len(ps["best_claim"]["text"]) > 80:
+            bc_text += "…"
+        lines.append(f"| `{ps['prompt_id']}` | {ps.get('intent', '')} | {ps['score']} | {bc_text} | {verdict} |")
+    lines.append("")
+    gaps = [ps for ps in prompt_scores if ps["score"] < threshold]
+    if gaps:
+        lines.append("## Unmet prompts (gap candidates)")
+        lines.append("")
+        for ps in sorted(gaps, key=lambda x: -x["score"]):
+            lines.append(f"### `{ps['prompt_id']}`")
+            lines.append("")
+            lines.append(f"- Intent: {ps.get('intent', 'unknown')}")
+            lines.append(f"- Current score: **{ps['score']}**")
+            if ps["best_claim"]:
+                lines.append(f"- Best matching claim: \"{ps['best_claim']['text'][:200]}\"")
+                lines.append(f"  - Topical overlap: {ps['best_claim'].get('topical', 0)}")
+                lines.append(f"  - Citation likelihood: {ps['best_claim'].get('citation_likelihood', 0)}")
+            else:
+                lines.append("- No matching claim. The asset does not surface this prompt at all.")
+            lines.append(f"- **Action**: run `aeo-relevance --mode content-brief --client {client} "
+                         f"--prompt-id {ps['prompt_id']} --asset {asset_path}` to draft the missing passage.")
+            lines.append("")
+    lines.append("## Coverage map (won prompts)")
+    lines.append("")
+    won_prompts = [ps for ps in prompt_scores if ps["score"] >= threshold]
+    if won_prompts:
+        for ps in sorted(won_prompts, key=lambda x: -x["score"]):
+            lines.append(f"- `{ps['prompt_id']}` ({ps.get('intent', '')}) — score **{ps['score']}**")
+    else:
+        lines.append("- No prompts won. The asset is not currently passage-extractable for any target prompt.")
+    lines.append("")
+    lines.append("## Anti-fabrication notes")
+    lines.append("")
+    lines.append("- Method: term-overlap × per-claim citation likelihood (per pat_passage-as-citation-unit).")
+    lines.append("- Threshold: 0.50 minimum for 'win' classification.")
+    lines.append("- Scores are heuristic; the live citation rate on each engine resolves the magnitude.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/passage-as-citation-unit.md`")
+    lines.append("- `knowledge/patterns/aeo-triangle.md`")
+    lines.append(f"- `clients/{client}/aeo/target-prompts.md`")
+    return "\n".join(lines)
+
+
+def render_content_brief_md(*, client: str, prompt: dict, asset_path: Path, today: str) -> str:
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: aeo-content-brief")
+    lines.append("produced_by: aeo-relevance")
+    lines.append(f"client: {client}")
+    lines.append(f"prompt_id: {prompt['id']}")
+    lines.append(f"intent: {prompt.get('intent', '')}")
+    lines.append(f"target_asset: {asset_path}")
+    lines.append(f"authored_at: {today}")
+    lines.append("substrate_layers_cited: [positioning, product-knowledge, voc]")
+    lines.append("patterns_applied: [aeo-triangle, passage-as-citation-unit]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# AEO content brief — {prompt['id']}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"Brief for the passage that would win citation on prompt `{prompt['id']}` "
+                 f"(intent: {prompt.get('intent', 'unknown')}). The passage drops into "
+                 f"`{asset_path.name}` (or a new sibling page) and follows the four passage-extractability "
+                 "constraints from pat_passage-as-citation-unit.")
+    lines.append("")
+    lines.append("## Target prompt")
+    lines.append("")
+    lines.append(f"> {prompt['text']}")
+    lines.append("")
+    if prompt.get("source"):
+        lines.append(f"Source: `{prompt['source']}`")
+        lines.append("")
+    lines.append("## Passage shape (the four constraints)")
+    lines.append("")
+    lines.append("Per pat_passage-as-citation-unit:")
+    lines.append("")
+    lines.append("1. **Self-contained** — the passage answers the prompt without referring to the rest of the page.")
+    lines.append("2. **40-90 words** — long enough to be substantive; short enough to be quotable.")
+    lines.append("3. **Question-explicit** — the question (or close paraphrase) appears in the H3 or first sentence.")
+    lines.append("4. **Answer-specific** — the first sentence after the question is a direct answer, not a setup.")
+    lines.append("")
+    lines.append("## Draft passage (template)")
+    lines.append("")
+    lines.append("```markdown")
+    lines.append(f"### {prompt['text'][:80] + ('…' if len(prompt['text']) > 80 else '')}")
+    lines.append("")
+    lines.append("[Direct answer in 1-2 sentences. Cite the canonical positioning here. 40-50 words.]")
+    lines.append("")
+    lines.append("- [Bulleted breakdown 1: concrete, specific, cited.]")
+    lines.append("- [Bulleted breakdown 2: differentiator, specific, cited.]")
+    lines.append("- [Bulleted breakdown 3: outcome, named, cited.]")
+    lines.append("")
+    lines.append("[Closing sentence with named-customer / source-system citation.]")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Schema.org markup")
+    lines.append("")
+    lines.append("If the asset is HTML, add this JSON-LD block:")
+    lines.append("")
+    lines.append("```json")
+    lines.append("{")
+    lines.append('  "@context": "https://schema.org",')
+    lines.append('  "@type": "FAQPage",')
+    lines.append('  "mainEntity": [{')
+    lines.append('    "@type": "Question",')
+    lines.append(f'    "name": "{prompt["text"][:120].replace(chr(34), chr(39))}",')
+    lines.append('    "acceptedAnswer": {')
+    lines.append('      "@type": "Answer",')
+    lines.append('      "text": "[Direct answer here, mirrored from the markdown body.]"')
+    lines.append('    }')
+    lines.append('  }]')
+    lines.append("}")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Voice constraints")
+    lines.append("")
+    lines.append("- No kill-list words (orchestration, seamless, leverage, transform, holistic, synergy, bespoke, unlock, etc).")
+    lines.append("- No em-dashes in body copy.")
+    lines.append("- No throat-clearing openers.")
+    lines.append("- Use customer language from `clients/" + client + "/voc/processed/`; refuse marketer-imagined buyer language.")
+    lines.append("")
+    lines.append("## Off-domain mirror plan")
+    lines.append("")
+    lines.append("Per Solis + Hufford: pair the on-page passage with off-domain mirrors for citation density:")
+    lines.append("")
+    lines.append("- A 60-90 second YouTube clip with this passage as the script.")
+    lines.append("- A LinkedIn long-form post mirroring the passage shape (question-as-hook, answer, 3 bullets, close).")
+    lines.append("- A Reddit / niche-forum response on a thread that asks this question.")
+    lines.append("")
+    lines.append("Run `aeo-manual-action --mode action-plan --client " + client + " --prompt-id " + prompt['id'] + "` to draft the propagation plan.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/passage-as-citation-unit.md`")
+    lines.append("- `knowledge/patterns/aeo-triangle.md`")
+    lines.append(f"- `{asset_path}` — the host asset")
+    lines.append(f"- `clients/{client}/aeo/target-prompts.md`")
+    return "\n".join(lines)
+
+
+# ---------- main ----------
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="aeo-relevance — score AEO relevance for an asset")
+    p.add_argument("--client", required=True)
+    p.add_argument("--asset", required=False, help="Path to the asset to score")
+    p.add_argument("--mode", default="score", choices=["score", "gap-analysis", "content-brief"])
+    p.add_argument("--prompt-set", default=None, help="Override path to target-prompts.md")
+    p.add_argument("--prompt-id", default=None, help="For content-brief mode, the prompt id")
+    p.add_argument("--engines", default="all")
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        return refuse(f"client root missing: clients/{args.client}/",
+                      f"run: bin/substrate-bootstrap-prospect {args.client}")
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Load target prompts
+    prompts_path = Path(args.prompt_set) if args.prompt_set else (client_root / "aeo" / "target-prompts.md")
+    if not prompts_path.is_file():
+        return refuse(
+            "missing-target-prompts",
+            f"target-prompts.md not found at {prompts_path}. "
+            "See templates/target-prompts-example.md for the schema. "
+            "Without the prompt set, the skill has no question to score relevance against.",
+        )
+    prompts = load_target_prompts(args.client, override=Path(args.prompt_set) if args.prompt_set else None)
+    if len(prompts) < 3 and args.mode != "content-brief":
+        return refuse(
+            "insufficient-target-prompts",
+            f"target-prompts.md has only {len(prompts)} prompt(s); the skill refuses below N=3 prompts. "
+            "AEO relevance is multi-prompt by definition; one prompt is anecdote.",
+        )
+
+    # ---------- content-brief mode ----------
+    if args.mode == "content-brief":
+        if not args.prompt_id:
+            return refuse("missing-prompt-id", "--prompt-id required for content-brief mode")
+        if not args.asset:
+            return refuse("missing-asset", "--asset required for content-brief mode (the host page)")
+        prompt = next((p for p in prompts if p["id"] == args.prompt_id), None)
+        if not prompt:
+            return refuse("missing-prompt-id",
+                          f"prompt id '{args.prompt_id}' not in target-prompts.md. "
+                          f"known: {', '.join(p['id'] for p in prompts[:10])}")
+        out_dir = Path(args.out) if args.out else (client_root / "aeo" / "briefs")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{args.prompt_id}-{today}.md"
+        out_path.write_text(render_content_brief_md(
+            client=args.client, prompt=prompt, asset_path=Path(args.asset), today=today,
+        ), encoding="utf-8")
+        sys.stderr.write(f"\n[aeo-relevance] wrote content brief: {out_path}\n")
+        print(str(out_path))
+        return 0
+
+    # ---------- score / gap-analysis mode requires asset ----------
+    if not args.asset:
+        return refuse("missing-asset", f"--asset required for --mode {args.mode}")
+    asset_path = Path(args.asset)
+    if not asset_path.is_file():
+        sys.stderr.write(f"asset not found: {asset_path}\n")
+        return 2
+
+    asset_text = asset_path.read_text(encoding="utf-8")
+    fm, body = strip_frontmatter(asset_text)
+
+    # Refuse if no passage structure
+    passages = split_passages(body)
+    if len(passages) == 0:
+        return refuse(
+            "asset-not-passage-extractable",
+            f"asset {asset_path.name} has no H2/H3 structure. "
+            "Per pat_passage-as-citation-unit, the unit of citation is the passage; an asset with no "
+            "headings has no extractable passages. Add structured H2/H3 sections, then re-run.",
+        )
+
+    # Compute structural signals
+    has_tldr, tldr_pos = detect_tl_dr(body)
+    schema_present = detect_schema_org(body)
+    claims = extract_claims(passages)
+    positioning_text = load_positioning(client_root)
+    asset_stem = asset_path.stem
+
+    # ---------- gap-analysis mode ----------
+    if args.mode == "gap-analysis":
+        if len(prompts) < 2:
+            return refuse(
+                "insufficient-target-prompts",
+                f"target-prompts.md has only {len(prompts)} prompt(s); gap-analysis is multi-prompt by definition.",
+            )
+        prompt_scores = [
+            score_prompt_match(prompt, passages, claims, positioning_text)
+            for prompt in prompts
+        ]
+        out_dir = Path(args.out) if args.out else (client_root / "aeo" / "gap-analysis")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{asset_stem}-{today}.md"
+        out_path.write_text(render_gap_analysis_md(
+            client=args.client, asset_path=asset_path, asset_stem=asset_stem,
+            today=today, prompt_scores=prompt_scores,
+        ), encoding="utf-8")
+        won = sum(1 for ps in prompt_scores if ps["score"] >= 0.50)
+        sys.stderr.write(f"\n[aeo-relevance] gap analysis: {asset_stem}\n")
+        sys.stderr.write(f"  prompts: {len(prompt_scores)}  won: {won}  unmet: {len(prompt_scores) - won}\n")
+        sys.stderr.write(f"  output: {out_path}\n")
+        print(str(out_path))
+        if won < len(prompts) // 2:
+            return 1
+        return 0
+
+    # ---------- score mode ----------
+    pe_score, pe_details = score_passage_extractability(passages, has_tldr)
+    sc_score, sc_details = score_self_containment(passages)
+    sm_score, sm_details = score_schema_markup(schema_present)
+    pa_score, pa_details = score_positioning_alignment(claims, positioning_text)
+    voice_score, voice_details = score_voice(body)
+
+    # Per-claim
+    per_claim_scores = []
+    for c in claims:
+        s = score_per_claim_citation_likelihood(c, positioning_text, passages)
+        per_claim_scores.append({**c, **s})
+
+    overall = overall_score(
+        passage_extract=pe_score, self_contain=sc_score,
+        schema=sm_score, positioning=pa_score, voice=voice_score,
+    )
+
+    out_dir = Path(args.out) if args.out else (client_root / "aeo" / "relevance-runs")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{asset_stem}-{today}.md"
+    out_path.write_text(render_score_md(
+        asset_path=asset_path, asset_text_len=len(asset_text),
+        passages=passages, has_tldr=has_tldr, tldr_position=tldr_pos,
+        schema_present=schema_present,
+        claims=claims, voice_details=voice_details,
+        pe_details=pe_details, sc_details=sc_details, pa_details=pa_details,
+        overall=overall, passage_extract=pe_score, self_contain=sc_score,
+        schema_score=sm_score, positioning_score=pa_score, voice_score=voice_score,
+        per_claim_scores=per_claim_scores,
+        client=args.client, today=today, asset_stem=asset_stem,
+    ), encoding="utf-8")
+
+    sys.stderr.write(f"\n[aeo-relevance] {asset_stem}\n")
+    sys.stderr.write(f"  passages: {len(passages)}  claims: {len(claims)}\n")
+    sys.stderr.write(f"  TL;DR: {'yes' if has_tldr else 'no'}  schema: {[t for t,v in schema_present.items() if v] or 'none'}\n")
+    sys.stderr.write(f"  scores: pe={round(pe_score, 2)} sc={round(sc_score, 2)} sm={round(sm_score, 2)} pa={round(pa_score, 2)} v={round(voice_score, 2)}\n")
+    sys.stderr.write(f"  overall: {overall} (threshold 0.70 — {'PASS' if overall >= 0.70 else 'BELOW'})\n")
+    sys.stderr.write(f"  output: {out_path}\n")
+    print(str(out_path))
+
+    if overall < 0.70:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

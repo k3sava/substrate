@@ -1,0 +1,47 @@
+# Branded-term dictionary — consumed by caption-gen (and any other agent
+# doing ASR / transcription / auto-capitalization of product content).
+#
+# ASR engines often mistranscribe brand-specific terms (a single-word product
+# name gets split into two common words; a feature name gets converted to its
+# generic synonym). This file is the override map. One per client.
+
+version: 1
+
+# Canonical capitalization for product + company terms. The agent enforces
+# these over whatever the ASR engine produced.
+canonical_terms:
+  - "[Vendor]"                  # placeholder — replace with the actual product name when configuring per-client
+  - "[Vendor] AI"
+  # Add feature names, product lines, acquired-product names here.
+  # - "<product feature 1>"
+  # - "<product line 2>"
+
+# Homophone overrides — ASR hears ambiguous audio and picks the wrong word.
+# Listed pairs force the correct one in product context.
+homophones:
+  # source_spoken: [wrong_transcription_guess, correct_in_product_context]
+  # Example: "dialer" often gets transcribed as "dialler" (UK spelling) in en-US ASR.
+  # - source: "dialer"
+  #   prefer: "dialer"
+  # Populate as drift is observed.
+
+# Disallowed substitutions — ASR sometimes paraphrases. Flag any output that
+# contains these strings so the human reviewer catches positioning drift.
+flagged_substitutions:
+  # - "<reductive descriptor>"   # e.g., positioning we explicitly reject
+  # Add as the positioning-propagator flags drift patterns in spoken content.
+
+# Pronunciation guides — for TTS / voice content (not caption-gen specifically,
+# but co-located here so the brand lead has one place to edit).
+pronunciation_guides:
+  # - term: "<product>"
+  #   ipa: "/<phonetic>/"
+  # Add if/when TTS-based content enters the flow.
+
+# Per-language overrides — when captions are generated for multiple locales.
+language_overrides:
+  en-US: {}
+  en-GB:
+    # If any UK spellings should override US — list here.
+    # "organization": "organisation"
+  # Add when target language set expands.

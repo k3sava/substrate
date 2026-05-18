@@ -1,0 +1,9 @@
+# knowledge/intel/
+
+Skills and routines write audit reports here:
+- competitive-scout summaries (competitive-scout-<client>-<date>.md)
+- substrate decay audits (context-decay-<date>.md)
+- brief freshness reports (brief-freshness-<client>-<date>.md)
+- quarterly recap drafts (durability-recap-<client>-<Q>-<year>.md)
+
+Files here bypass the publishing voice + cite gates (intel/ is internal).

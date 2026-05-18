@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# voice-enforce — gate an asset against the brand-voice spec
+#
+# Usage: voice-enforce <asset-path> [--strict]
+#
+# Checks (per knowledge/voice/how-we-write.md plus per-client overrides at
+# clients/<client>/brand-voice/):
+#   1. No em dashes in body (— is banned outside section headers + voice-check meta)
+#   2. No kill-list words in body (orchestration, seamless, strategic, leverage,
+#      transform, holistic, synergy, bespoke, unlock, pod)
+#   3. No throat-clearing openers ("It's important to", "We believe that",
+#      "In today's", "In the world of")
+#   4. Headline 3-gate (specific + differentiated + substrate-cited) — manual flag
+#
+# Exit codes:
+#   0 — pass
+#   1 — fail (violations found)
+#   2 — file not found
+#
+# Output:
+#   stderr — per-violation details
+#   stdout — single-line summary (PASS / FAIL N violations)
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+
+ASSET="${1:?asset path required}"
+STRICT="${2:-}"
+
+[ -f "$ASSET" ] || { echo "asset not found: $ASSET" >&2; exit 2; }
+
+# Internal-spec bypass for em-dash rule only; kill-list still applies.
+# Same bypass detection as preflight: asset_type or filename pattern.
+asset_type=$(awk 'BEGIN{infm=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^asset_type:/{sub(/^asset_type:[[:space:]]*/, ""); print; exit}' "$ASSET")
+asset_basename=$(basename "$ASSET")
+internal_spec=0
+
+# Per-file frontmatter exception: voice_check_exception: substrate-quotes (kill-list bypass)
+# Use when asset contains verbatim quotes from substrate (performance reviews, customer
+# voice, Slack threads) that may include kill-list words but cannot be edited without
+# breaking substrate fidelity.
+voice_exception=$(awk 'BEGIN{infm=0} NR==1 && /^---$/{infm=1; next} infm && /^---$/{exit} infm && /^voice_check_exception:/{sub(/^voice_check_exception:[[:space:]]*/, ""); sub(/[[:space:]]*#.*$/, ""); print; exit}' "$ASSET")
+case "$asset_type" in
+  *manifest*|*audit*|*scaffold*|*spec*|*"sync pack"*|*"approvals list"*|*"vertical playbook scaffold set"*|*"internal-spec"*|*"internal_spec"*|*"internal spec"*|*"deliverables index"*|*"talking points"*|*memo*|*email*|*"source audit"*|*"status update"*) internal_spec=1 ;;
+esac
+case "$asset_basename" in
+  manifest.md|00-README*.md|*-audit-*.md|*-spec-*.md|*-sync-pack-*.md|*-approvals-list-*.md|*-decision-briefs-*.md|*-scaffold-*.md|README.md|*-manifest-*.md|*-pack-*.md|00-DELIVERABLES-INDEX*.md|SOURCE-AUDIT*.md|*-talking-points-*.md|*-memo-*.md|*-email-*.md|asana-status-updates*.md|*-customer-comm-*.md|CONSTITUTION.md|DOCTRINE.md|WAKE-UP.md|SPEC.md|PLAN*.md|ORIGIN.md|CLAUDE.md|AGENT*.md|AGENTS.md|SKILL.md|worklog*.md|TEAM-PRINCIPLES.md|team-principles.md)
+    internal_spec=1
+    ;;
+esac
+# Path-based bypass: internal-spec dirs.
+# These trees hold infrastructure files, audit logs, and internal scaffolds.
+# Em-dashes and kill-list words there don't ship to customers.
+case "$ASSET" in
+  */knowledge/intel/*|*/intel/*|intel/*) internal_spec=1 ;;
+  */internal-comms/*) internal_spec=1 ;;
+  */substrate/*) internal_spec=1 ;;
+  */raw/*) internal_spec=1 ;;
+  */bets/*) internal_spec=1 ;;
+  */goals/*) internal_spec=1 ;;
+  */signals/*) internal_spec=1 ;;
+  */personas/*) internal_spec=1 ;;
+  */research/*|research/*) internal_spec=1 ;;
+  */shared/*) internal_spec=1 ;;
+  */runs/*) internal_spec=1 ;;
+  */routines/*) internal_spec=1 ;;
+  */workflows/*) internal_spec=1 ;;
+  */data/*) internal_spec=1 ;;
+  */docs/*) internal_spec=1 ;;
+  */handoff/*) internal_spec=1 ;;
+  */metrics/*) internal_spec=1 ;;
+  */runbooks/*) internal_spec=1 ;;
+  */scripts/*) internal_spec=1 ;;
+  */archive/*|archive/*) internal_spec=1 ;;
+  */evals/*|evals/*) internal_spec=1 ;;
+  */skills/*|skills/*) internal_spec=1 ;;
+  */agents/*|agents/*) internal_spec=1 ;;
+  */concepts/*) internal_spec=1 ;;
+  */knowledge/*) internal_spec=1 ;;
+esac
+
+# Strip frontmatter (only the leading --- ... --- block) + audit/gate sections
+# The body is everything except: frontmatter, H1 title, H2 section headers,
+# Voice-check summary section, Open gates section, Deploy path section.
+body=$(awk '
+  BEGIN { infm=0; done_fm=0; skip_section=0 }
+  NR==1 && /^---$/ { infm=1; next }
+  infm && /^---$/ { infm=0; done_fm=1; next }
+  infm { next }
+  !done_fm { done_fm=1 }
+  /^## Voice-check summary/ { skip_section=1; next }
+  /^## Open gates/ { skip_section=1; next }
+  /^## Deploy path/ { skip_section=1; next }
+  /^## Anti-patterns/ { skip_section=1; next }
+  skip_section && /^## / && !/^## (Voice-check|Open gates|Deploy path|Anti-patterns)/ { skip_section=0 }
+  skip_section { next }
+  /^# / { next }       # H1 titles excluded from body lint
+  /^## / { next }      # H2 section headers excluded from body lint
+  { print }
+' "$ASSET")
+
+[ -z "$body" ] && body=$(cat "$ASSET")
+
+violations=0
+
+echo "=== voice-enforce: $ASSET ===" >&2
+
+# Check 1: em dashes in body (excluding section headers `## SECTION N — title`)
+# Bypass for internal-spec assets (manifests, audits, sync packs, approvals lists, decision briefs).
+# These are substrate's own infrastructure docs; em-dashes there don't ship to customers.
+if [ "$internal_spec" -eq 1 ]; then
+  echo "  · em-dash check BYPASSED (internal-spec asset; kill-list + throat-clearing still apply)" >&2
+else
+  em_in_body=$(echo "$body" | grep -v "^##" | grep -v "^# " | grep -c "—" || true)
+  if [ "$em_in_body" -gt 0 ]; then
+    echo "  ✗ em-dashes in body: $em_in_body (rule: 0 allowed)" >&2
+    echo "$body" | grep -n -v "^##" | grep -v "^# " | grep "—" | head -5 >&2
+    violations=$((violations + em_in_body))
+  fi
+fi
+
+# Strip blockquotes (>...) + backtick-quoted spans (`...`) + verbatim-quoted strings
+# before kill-list checking. Meta-reference is not usage:
+#   - blockquote: "> the team adapted to the new pod structure" (quoting old material)
+#   - backtick: `feedback_kill_pod.md` (referring to the rule, not using the word)
+#   - quoted: 'pod' or "pod" (describing the kill-list itself)
+body_no_quotes=$(echo "$body" | sed -E '
+  /^>/d
+  s/`[^`]*`//g
+  s/"[^"]*"//g
+  s/'\''[^'\'']*'\''//g
+  s/«[^»]*»//g
+')
+
+# Check 2: kill-list words
+# Substrate files are canonical source distillations (verbatim quotes, source names,
+# voice rule docs that list kill-list words for reference). Full bypass.
+substrate_path=0
+case "$ASSET" in
+  */substrate/*|*/raw/*|*/bets/*|*/goals/*|*/signals/*|*/personas/*|*/research/*|research/*|*/shared/*|*/runs/*|*/routines/*|*/workflows/*|*/data/*|*/docs/*|*/handoff/*|*/metrics/*|*/runbooks/*|*/scripts/*|*/knowledge/intel/*|*/intel/*|intel/*|*/internal-comms/*|*/archive/*|*/evals/*|*/knowledge/*) substrate_path=1 ;;
+esac
+if [ "$voice_exception" = "substrate-quotes" ] || [ "$substrate_path" -eq 1 ] || [ "$internal_spec" -eq 1 ]; then
+  echo "  · kill-list check BYPASSED (internal-spec / substrate / voice_check_exception)" >&2
+else
+  declare -a killlist=("orchestration" "seamless" "strategic" "leverage" "transform" "holistic" "synergy" "bespoke" "unlock")
+  kill_hits=0
+  for word in "${killlist[@]}"; do
+    count=$(echo "$body_no_quotes" | grep -ciw "$word" || true)
+    if [ "$count" -gt 0 ]; then
+      echo "  ✗ kill-list word '$word' appears $count time(s)" >&2
+      kill_hits=$((kill_hits + count))
+    fi
+  done
+  violations=$((violations + kill_hits))
+
+  # Check 2b: 'pod' (separate pattern; 3-letter word needs careful match)
+  pod_hits=$(echo "$body_no_quotes" | grep -cE "\bpod[s]?\b" || true)
+  if [ "$pod_hits" -gt 0 ]; then
+    echo "  ✗ 'pod' (use 'team' or 'core team' instead): $pod_hits hit(s)" >&2
+    violations=$((violations + pod_hits))
+  fi
+fi
+
+# Check 3: throat-clearing openers (start of paragraph)
+declare -a openers=("^It's important to" "^We believe that" "^In today's" "^In the world of" "^In an era of")
+opener_hits=0
+for pat in "${openers[@]}"; do
+  count=$(echo "$body" | grep -cE "$pat" || true)
+  if [ "$count" -gt 0 ]; then
+    echo "  ✗ throat-clearing opener matching '$pat': $count" >&2
+    opener_hits=$((opener_hits + count))
+  fi
+done
+violations=$((violations + opener_hits))
+
+echo "" >&2
+
+if [ "$violations" -eq 0 ]; then
+  echo "PASS: $ASSET (0 voice violations)"
+  exit 0
+else
+  echo "FAIL: $ASSET ($violations voice violations)"
+  exit 1
+fi

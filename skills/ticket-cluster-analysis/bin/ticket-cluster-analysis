@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""ticket-cluster-analysis, cluster a support ticket export by theme.
+
+Reads a support tickets CSV, runs a manual taxonomy pass plus TF-IDF residual
+clustering on the subject + body, and writes a per-cluster report covering
+sizes, sample tickets verbatim, common tokens, suggested help-content topics
+in customer language, and the recommended downstream skill.
+
+Usage:
+    ticket-cluster-analysis --client <client> --tickets <path> \
+        [--top-clusters 10] [--min-cluster-size 3] [--out-dir <path>]
+
+Outputs:
+    clients/<client>/support/ticket-clusters-<date>.md
+    clients/<client>/support/ticket-clusters-<date>.json
+    clients/<client>/support/ticket-clusters-<date>.csv
+
+Exit codes:
+    0, report written
+    3, preflight refusal (substrate gap, empty-corpus, too-few-tickets, schema-mismatch)
+    4, invalid args
+
+Per the tickets-are-product-feedback-channel pattern, this skill treats the
+ticket corpus as product knowledge. Per frontline-as-pmm-substrate, the cluster
+output is the operator-readable index into that source. Clustering is
+deterministic (manual taxonomy + TF-IDF residuals); operators can audit every
+assignment.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+MIN_TICKETS = 50
+
+# Manual taxonomy of support themes. Each entry: (theme_id, keywords list,
+# label, suggested help-content topic stem, recommended downstream skill).
+# Keywords match against subject + body, lowercased, word-boundary regex.
+# Tickets can match multiple themes (cluster is the union).
+TAXONOMY: list[tuple[str, list[str], str, str, str]] = [
+    ("onboarding-confusion",
+     ["lost", "confused", "cannot find", "first time", "first login",
+      "where is", "where do i", "how do i start", "still cannot figure",
+      "onboarding tour", "where is the activation", "complete the activation",
+      "first day", "do not see how", "not where the screenshot",
+      "i still cannot find", "lost in the dashboard"],
+     "Onboarding confusion",
+     "Getting started: a 5-minute walkthrough",
+     "help-docs"),
+    ("billing-question",
+     ["invoice", "billing", "renewal", "annual", "monthly billing",
+      "billing period", "prorate", "annual invoice", "monthly invoice",
+      "downgrade", "upgrade billing", "switch from monthly", "annual upgrade",
+      "billing cycle"],
+     "Billing question",
+     "How billing works: invoices, renewals, plan changes",
+     "help-docs"),
+    ("cancel-or-refund",
+     ["cancel", "refund", "cancelling", "considering switching",
+      "considering cancelling", "moving back", "i am cancelling",
+      "want to cancel", "process the refund", "partial refund"],
+     "Cancellation or refund",
+     "How to cancel and what happens to your data",
+     "churn-signal-from-support"),
+    ("integration-question",
+     ["webhook", "api", "oauth", "sso", "rate limit", "json shape",
+      "redirect uri", "hmac", "api authentication", "api token",
+      "zapier", "integration setup"],
+     "Integration setup question",
+     "Integration setup: webhooks, API, SSO",
+     "help-docs"),
+    ("integration-broken",
+     ["integration broken", "stopped firing", "stopped working",
+      "zap stopped", "still broken", "401 after rotating",
+      "slack notifications stopped", "zap is still broken", "zap broken",
+      "still failing"],
+     "Integration broken",
+     "Troubleshooting a broken integration",
+     "help-docs"),
+    ("bug-blocking",
+     ["page not loading", "spins forever", "crash", "crashing",
+      "data missing", "data is missing", "search broken", "search not finding",
+      "export not working", "file is empty", "data loss",
+      "i cannot find anything", "search bug"],
+     "Blocking bug",
+     "Resolving common errors",
+     "help-docs"),
+    ("bug-cosmetic",
+     ["duplicate notifications", "notification spam", "notification loop",
+      "slow performance", "loading times", "very slow", "logged out",
+      "login loop"],
+     "Performance or notification bug",
+     "Common notification and performance issues",
+     "help-docs"),
+    ("how-to-bulk-action",
+     ["bulk", "multiple at once", "apply the same setting",
+      "delete multiple", "bulk delete", "bulk edit"],
+     "Bulk actions",
+     "How to bulk-edit or bulk-delete",
+     "help-docs"),
+    ("how-to-export",
+     ["export", "csv", "download my data", "export to csv",
+      "export as pdf", "export a report", "csv format", "csv is missing",
+      "missing some columns"],
+     "Export and reporting",
+     "How to export your data and reports",
+     "help-docs"),
+    ("how-to-permissions",
+     ["admin", "member roles", "permission", "permissions matrix",
+      "deactivate a user", "external users", "invite people from outside",
+      "team-wide settings", "team settings"],
+     "Permissions and roles",
+     "Roles, permissions, and team settings",
+     "help-docs"),
+    ("how-to-mobile",
+     ["mobile app", "ios", "android", "iphone", "mobile feature parity",
+      "mobile crash"],
+     "Mobile app",
+     "Using the mobile app",
+     "help-docs"),
+    ("how-to-workflow",
+     ["workflow", "trigger", "trigger an action", "field value change",
+      "automation", "recipe page", "trigger a workflow"],
+     "Workflow automation",
+     "Setting up workflows and triggers",
+     "help-docs"),
+    ("how-to-customization",
+     ["custom field", "custom fields", "custom field types",
+      "tag management", "tags across", "best practices"],
+     "Customization",
+     "Customizing fields, tags, and views",
+     "help-docs"),
+    ("feature-request",
+     ["feature request", "i wish", "would be great if",
+      "is there a way to", "do you support", "do you have",
+      "looking for a", "is there a list"],
+     "Feature request or capability question",
+     "Feature roadmap and capability matrix",
+     "help-docs"),
+    ("escalation",
+     ["unacceptable", "very disappointed", "regret", "moving back to",
+      "switching to your competitor", "second time this has happened",
+      "still happening", "still broken", "very annoying", "considering switching"],
+     "Escalation or sentiment-flagged",
+     "Escalation handling",
+     "churn-signal-from-support"),
+]
+
+# Stop words for TF-IDF on residual cluster pass. Standard English short list
+# plus product-language stop-words common in support contexts.
+STOP_WORDS = {
+    "the", "and", "for", "this", "that", "with", "from", "have", "has",
+    "had", "you", "your", "are", "was", "were", "but", "not", "all", "can",
+    "will", "would", "could", "should", "did", "does", "doing", "done",
+    "about", "into", "onto", "upon", "out", "off", "over", "than", "then",
+    "there", "their", "they", "them", "what", "when", "where", "who",
+    "how", "why", "which", "while", "any", "some", "one", "two", "three",
+    "very", "much", "more", "most", "less", "few", "lot", "lots", "just",
+    "like", "also", "too", "still", "even", "again", "back", "down", "now",
+    "here", "his", "her", "its", "our", "ours", "yours", "his", "hers",
+    "him", "she", "it", "we", "us", "our", "my", "me", "i", "a", "an",
+    "is", "be", "to", "of", "in", "on", "as", "or", "if", "by",
+    "do", "so", "no", "yes", "ok", "okay", "well", "kinda", "sort",
+    "thanks", "please", "hi", "hello", "thank", "regards", "cheers",
+    "received", "received", "pricing", "tier", "trying", "got", "get",
+    "getting", "going", "gone", "make", "made", "making", "use", "used",
+    "using", "want", "wanted", "wants", "need", "needed", "needs",
+    "see", "saw", "seeing", "look", "looked", "looking", "find", "found",
+    "finding", "tell", "told", "telling", "show", "showed", "showing",
+    "good", "bad", "fine", "okay", "issue", "issues", "problem", "problems",
+    "happen", "happens", "happened", "happening", "tried", "tries", "try",
+    "trying", "set", "sets", "setting", "settings", "thing", "things",
+    "stuff", "way", "ways", "every", "each", "many", "few", "first",
+    "second", "third", "next", "previous", "last", "least", "tool",
+    "feature", "features", "across", "around", "after", "before",
+    "during", "within", "without", "instead", "between", "among",
+    "him", "ourselves", "yourselves", "themselves", "myself", "yourself",
+    "itself", "until", "upon", "via", "etc",
+}
+
+
+def slugify(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s[:60] or "cluster"
+
+
+def tokenize(text: str) -> list[str]:
+    """Lowercase, alphanumeric tokens, drop stop words and tokens shorter than 3."""
+    raw = re.findall(r"[a-z][a-z0-9_-]{2,}", (text or "").lower())
+    return [t for t in raw if t not in STOP_WORDS and len(t) >= 3]
+
+
+def load_tickets(path: Path) -> tuple[list[dict], list[str]]:
+    rows: list[dict] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("tickets CSV has no header")
+        required = {"ticket_id", "opened_at", "category", "subject", "body"}
+        missing = required - set(reader.fieldnames)
+        if missing:
+            raise ValueError(
+                f"tickets CSV missing required columns: {sorted(missing)}"
+            )
+        for raw in reader:
+            rows.append(dict(raw))
+        return rows, list(reader.fieldnames)
+
+
+def match_taxonomy(text: str) -> list[str]:
+    """Return list of theme_ids whose keywords hit the text."""
+    lower = text.lower()
+    hits: list[str] = []
+    for theme_id, keywords, _, _, _ in TAXONOMY:
+        for kw in keywords:
+            # Word-boundary-ish: keyword surrounded by non-letter or string boundary.
+            pattern = r"(?:^|[^a-z])" + re.escape(kw) + r"(?:[^a-z]|$)"
+            if re.search(pattern, lower):
+                hits.append(theme_id)
+                break
+    return hits
+
+
+def assign_taxonomy(rows: list[dict]) -> dict[str, list[dict]]:
+    """Bucket rows by theme_id. Unmatched go in 'unmatched'."""
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        text = f"{r.get('subject', '')} {r.get('body', '')}"
+        hits = match_taxonomy(text)
+        if hits:
+            for theme in hits:
+                buckets[theme].append(r)
+        else:
+            buckets["unmatched"].append(r)
+    return dict(buckets)
+
+
+def compute_idf(corpus_tokens: list[list[str]]) -> dict[str, float]:
+    """Compute inverse document frequency over a token corpus."""
+    n_docs = len(corpus_tokens)
+    if n_docs == 0:
+        return {}
+    df: Counter = Counter()
+    for tokens in corpus_tokens:
+        for t in set(tokens):
+            df[t] += 1
+    idf: dict[str, float] = {}
+    for t, freq in df.items():
+        idf[t] = math.log(1 + n_docs / (1 + freq))
+    return idf
+
+
+def tfidf_top_tokens(rows: list[dict], idf: dict[str, float], top_n: int = 5) -> list[tuple[str, float]]:
+    """Aggregate TF-IDF across all tickets in the cluster, return top-N tokens."""
+    aggregate: Counter = Counter()
+    for r in rows:
+        text = f"{r.get('subject', '')} {r.get('body', '')}"
+        tokens = tokenize(text)
+        if not tokens:
+            continue
+        tf: Counter = Counter(tokens)
+        total = sum(tf.values())
+        for t, count in tf.items():
+            score = (count / total) * idf.get(t, 0.0)
+            aggregate[t] += score
+    return aggregate.most_common(top_n)
+
+
+def cluster_residuals(
+    unmatched: list[dict],
+    idf: dict[str, float],
+    min_cluster_size: int,
+) -> list[dict]:
+    """TF-IDF residual cluster: bucket unmatched tickets by their highest-IDF token."""
+    if not unmatched:
+        return []
+    # Each ticket gets a "lead token" = highest-IDF token in its body.
+    by_lead: dict[str, list[dict]] = defaultdict(list)
+    for r in unmatched:
+        text = f"{r.get('subject', '')} {r.get('body', '')}"
+        tokens = tokenize(text)
+        if not tokens:
+            by_lead["[no-tokens]"].append(r)
+            continue
+        token_scores = [(t, idf.get(t, 0.0)) for t in set(tokens)]
+        token_scores.sort(key=lambda x: -x[1])
+        if not token_scores or token_scores[0][1] == 0:
+            by_lead["[low-idf]"].append(r)
+            continue
+        lead = token_scores[0][0]
+        by_lead[lead].append(r)
+    # Filter to clusters meeting min size; merge orphans into a catch-all.
+    clusters: list[dict] = []
+    orphans: list[dict] = []
+    for lead, rows in by_lead.items():
+        if lead in ("[no-tokens]", "[low-idf]") or len(rows) < min_cluster_size:
+            orphans.extend(rows)
+            continue
+        # Top tokens for this cluster (re-run TF-IDF on this subset only; the
+        # subset's top tokens characterise the cluster better than the lead alone).
+        top_tokens = tfidf_top_tokens(rows, idf, top_n=5)
+        clusters.append({
+            "lead_token": lead,
+            "rows": rows,
+            "top_tokens": top_tokens,
+            "size": len(rows),
+        })
+    if orphans:
+        top_tokens = tfidf_top_tokens(orphans, idf, top_n=5)
+        clusters.append({
+            "lead_token": "[orphans]",
+            "rows": orphans,
+            "top_tokens": top_tokens,
+            "size": len(orphans),
+        })
+    clusters.sort(key=lambda c: -c["size"])
+    return clusters
+
+
+def to_int(val) -> int | None:
+    try:
+        if val is None or val == "":
+            return None
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
+def to_float(val) -> float | None:
+    try:
+        if val is None or val == "":
+            return None
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def cluster_csat(rows: list[dict]) -> dict | None:
+    scores = [to_int(r.get("csat", "")) for r in rows]
+    scores = [s for s in scores if s is not None]
+    if not scores:
+        return None
+    n = len(scores)
+    return {
+        "n": n,
+        "median": sorted(scores)[n // 2],
+        "mean": round(sum(scores) / n, 2),
+        "promoters_pct": round(sum(1 for s in scores if s >= 5) / n * 100, 1),
+        "detractors_pct": round(sum(1 for s in scores if s <= 2) / n * 100, 1),
+    }
+
+
+def cluster_resolution_time(rows: list[dict]) -> dict | None:
+    rt = [to_float(r.get("resolution_time_hours", "")) for r in rows]
+    rt = [v for v in rt if v is not None]
+    if not rt:
+        return None
+    rt.sort()
+    n = len(rt)
+    return {
+        "n": n,
+        "median_hours": round(rt[n // 2], 2),
+        "p90_hours": round(rt[min(n - 1, int(n * 0.9))], 2),
+    }
+
+
+def sample_tickets(rows: list[dict], n: int = 3) -> list[dict]:
+    """Surface the highest-information samples: low-CSAT or escalated first."""
+    scored: list[tuple[float, dict]] = []
+    for r in rows:
+        score = 0.0
+        csat = to_int(r.get("csat", ""))
+        if csat is not None:
+            score += (5 - csat) * 2  # lower CSAT = higher info
+        if r.get("escalated", "").lower() in ("true", "1", "yes"):
+            score += 3
+        if r.get("priority", "").lower() == "high":
+            score += 1
+        scored.append((score, r))
+    scored.sort(key=lambda x: -x[0])
+    return [r for _, r in scored[:n]]
+
+
+def suggested_topic_from_taxonomy(theme_id: str) -> tuple[str, str, str]:
+    """Return (label, suggested_topic, recommended_skill) for a taxonomy theme."""
+    for tid, _, label, topic, skill in TAXONOMY:
+        if tid == theme_id:
+            return label, topic, skill
+    return theme_id, theme_id, "help-docs"
+
+
+def suggested_topic_from_residual(top_tokens: list[tuple[str, float]]) -> str:
+    """Phrase a help-content topic from residual cluster tokens, in customer language."""
+    if not top_tokens:
+        return "Untitled cluster (operator review needed)"
+    head = top_tokens[0][0]
+    rest = ", ".join(t for t, _ in top_tokens[1:3])
+    if rest:
+        return f"How {head} works ({rest})"
+    return f"How {head} works"
+
+
+def write_md(
+    out_path: Path,
+    client: str,
+    tickets_path: Path,
+    rows: list[dict],
+    taxonomy_clusters: list[dict],
+    residual_clusters: list[dict],
+    today: str,
+    top_clusters: int,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(rows)
+
+    # Distinct ticket counts (a ticket can match multiple taxonomy themes; share
+    # against the corpus uses distinct ticket_ids, not the cluster-row total).
+    matched_distinct = set()
+    for c in taxonomy_clusters:
+        for r in c.get("rows", []):
+            tid = r.get("ticket_id", "")
+            if tid:
+                matched_distinct.add(tid)
+    novel_distinct = set()
+    for c in residual_clusters:
+        for r in c.get("rows", []):
+            tid = r.get("ticket_id", "")
+            if tid:
+                novel_distinct.add(tid)
+    matched_n = len(matched_distinct)
+    novel_n = len(novel_distinct)
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: ticket cluster analysis, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [tickets-are-product-feedback-channel, frontline-as-pmm-substrate]")
+    lines.append("contradictions_aware: []")
+    lines.append(f"client: {client}")
+    lines.append(f"tickets_source: {tickets_path}")
+    lines.append(f"tickets_n: {n}")
+    lines.append(f"taxonomy_match_share_pct: {round(matched_n / max(1, n) * 100, 1)}")
+    lines.append("produced_by: ticket-cluster-analysis")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Ticket cluster analysis, {client}, {today}")
+    lines.append("")
+    lines.append(
+        f"Source: `{tickets_path}` (rows: {n}; ingested {today}). Per the `tickets-are-product-feedback-channel` pattern, this corpus is read as product knowledge. The cluster output is the operator-readable index into the verbatim language buyers use when they ask for help. Per `frontline-as-pmm-substrate`, this is the highest-fidelity buyer-language source on hand; downstream skills (`help-content-gap-detect`, `help-docs`, `churn-signal-from-support`, `deflection-experiment-design`) read from this output."
+    )
+    lines.append("")
+
+    # Corpus summary
+    lines.append("## 1. Corpus summary")
+    lines.append("")
+    cat_counts: Counter = Counter(r.get("category", "uncategorized") for r in rows)
+    lines.append(f"- Tickets: {n}")
+    lines.append(f"- Taxonomy match (at least one theme): {matched_n} distinct tickets ({matched_n / n * 100:.1f}%)")
+    lines.append(f"- Novel (TF-IDF residual cluster): {novel_n} distinct tickets ({novel_n / n * 100:.1f}%)")
+    lines.append(f"- (A ticket may match more than one taxonomy theme; total cluster rows can exceed the corpus size.)")
+    lines.append("")
+    lines.append("Provided category distribution (raw export field):")
+    lines.append("")
+    lines.append("| Category | n | % of corpus |")
+    lines.append("|---|---:|---:|")
+    for cat, count in cat_counts.most_common():
+        lines.append(f"| {cat} | {count} | {count / n * 100:.1f}% |")
+    lines.append("")
+
+    # Top clusters table
+    lines.append(f"## 2. Top {top_clusters} clusters (taxonomy + residual, ranked by size)")
+    lines.append("")
+    all_clusters = taxonomy_clusters + residual_clusters
+    all_clusters.sort(key=lambda c: -c["size"])
+    top = all_clusters[:top_clusters]
+    lines.append("| Cluster | Size | Share | Median CSAT | Median resolution (h) | Suggested topic | Recommended skill |")
+    lines.append("|---|---:|---:|---:|---:|---|---|")
+    for c in top:
+        size = c["size"]
+        share = size / n * 100
+        csat_summary = c.get("csat_summary")
+        rt_summary = c.get("resolution_summary")
+        csat_text = f"{csat_summary['median']}" if csat_summary else "n/a"
+        rt_text = f"{rt_summary['median_hours']}" if rt_summary else "n/a"
+        topic = c.get("suggested_topic", "")
+        skill = c.get("recommended_skill", "")
+        lines.append(
+            f"| {c['label']} | {size} | {share:.1f}% | {csat_text} | {rt_text} | {topic} | `{skill}` |"
+        )
+    lines.append("")
+
+    # Per-cluster sections
+    lines.append("## 3. Per-cluster detail")
+    lines.append("")
+    for c in top:
+        lines.append(f"### {c['label']} (size: {c['size']}, share: {c['size'] / n * 100:.1f}%)")
+        lines.append("")
+        if c.get("kind") == "taxonomy":
+            lines.append(f"_Taxonomy theme: `{c['theme_id']}`._")
+        else:
+            lines.append(f"_Novel cluster (lead token: `{c['lead_token']}`)._")
+        lines.append("")
+
+        # CSAT and resolution time
+        csat_summary = c.get("csat_summary")
+        if csat_summary:
+            lines.append(
+                f"- CSAT: n={csat_summary['n']}, median {csat_summary['median']}, "
+                f"mean {csat_summary['mean']}, "
+                f"promoters {csat_summary['promoters_pct']}%, detractors {csat_summary['detractors_pct']}%."
+            )
+        rt_summary = c.get("resolution_summary")
+        if rt_summary:
+            lines.append(
+                f"- Resolution time: n={rt_summary['n']}, median {rt_summary['median_hours']}h, p90 {rt_summary['p90_hours']}h."
+            )
+        if csat_summary or rt_summary:
+            lines.append("")
+
+        # Top tokens
+        tokens = c.get("top_tokens") or []
+        if tokens:
+            token_text = ", ".join(f"`{t}` ({s:.2f})" for t, s in tokens)
+            lines.append(f"- Top TF-IDF tokens: {token_text}")
+            lines.append("")
+
+        # Sample tickets
+        samples = c.get("sample_tickets") or []
+        if samples:
+            lines.append("Sample tickets (highest-information first: low-CSAT or escalated):")
+            lines.append("")
+            for s in samples:
+                tid = s.get("ticket_id", "?")
+                subj = s.get("subject", "")
+                body = (s.get("body", "") or "")
+                if len(body) > 220:
+                    body = body[:217] + "..."
+                csat = s.get("csat", "")
+                lines.append(f"- `{tid}` (CSAT: {csat or 'n/a'}) — \"{subj}\" — {body}")
+            lines.append("")
+
+        topic = c.get("suggested_topic", "")
+        skill = c.get("recommended_skill", "")
+        if topic:
+            lines.append(f"**Suggested help-content topic** (in customer language): _{topic}_")
+            lines.append("")
+        if skill:
+            lines.append(f"**Recommended downstream skill:** `{skill}`")
+            lines.append("")
+
+    # Novel cluster track
+    if residual_clusters:
+        lines.append("## 4. Novel-cluster track")
+        lines.append("")
+        lines.append(
+            "Tickets that did not match the manual taxonomy. The TF-IDF lead token defines each cluster; the operator reviews these to decide whether to extend the taxonomy. A taxonomy-match share below 60% indicates the taxonomy is stale or incomplete."
+        )
+        lines.append("")
+        lines.append("| Lead token | Size | Top co-occurring tokens |")
+        lines.append("|---|---:|---|")
+        for rc in residual_clusters[: top_clusters]:
+            cooc = ", ".join(f"`{t}`" for t, _ in (rc.get("top_tokens") or [])[1:5])
+            lines.append(f"| `{rc['lead_token']}` | {rc['size']} | {cooc} |")
+        lines.append("")
+
+    # Substrate citations
+    lines.append("## 5. Substrate citations")
+    lines.append("")
+    lines.append(f"- Tickets export: `{tickets_path}` (rows: {n})")
+    lines.append(f"- VoC layer: `clients/{client}/voc/voc.md`")
+    lines.append(f"- Product knowledge: `clients/{client}/product-knowledge/product-knowledge.md`")
+    lines.append(f"- ICP layer: `clients/{client}/icp/icp.md`")
+    lines.append("- Pattern grounding: `knowledge/patterns/tickets-are-product-feedback-channel.md` (tickets are the highest-fidelity product feedback channel; treat as product knowledge).")
+    lines.append("- Pattern grounding: `knowledge/patterns/frontline-as-pmm-substrate.md` (the support corpus is the highest-fidelity buyer-language source).")
+    lines.append("")
+
+    # Next reads
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append(f"- `skills/help-content-gap-detect/bin/help-content-gap-detect --client {client} --clusters {out_path.stem}.json`, cross-reference with help-docs catalog.")
+    lines.append(f"- `skills/churn-signal-from-support/bin/churn-signal-from-support --client {client} --tickets {tickets_path}`, extract churn leading indicators.")
+    lines.append(f"- `skills/deflection-experiment-design/bin/deflection-experiment-design --client {client} --clusters {out_path.stem}.json`, design deflection tests for the highest-volume clusters.")
+    lines.append(f"- `routines/support-cluster-monthly.md`, schedule the next read.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_json_csv(
+    json_path: Path,
+    csv_path: Path,
+    client: str,
+    tickets_path: Path,
+    rows: list[dict],
+    taxonomy_clusters: list[dict],
+    residual_clusters: list[dict],
+    today: str,
+) -> None:
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_clusters: list[dict] = []
+    ticket_assignments: list[dict] = []
+    for c in taxonomy_clusters + residual_clusters:
+        cluster_id = c.get("theme_id") or f"residual-{slugify(c['lead_token'])}"
+        cluster_label = c.get("label") or c.get("lead_token")
+        payload_clusters.append({
+            "cluster_id": cluster_id,
+            "label": cluster_label,
+            "kind": c.get("kind"),
+            "size": c["size"],
+            "share_pct": round(c["size"] / max(1, len(rows)) * 100, 2),
+            "top_tokens": [{"token": t, "tfidf": round(s, 4)} for t, s in (c.get("top_tokens") or [])],
+            "csat_summary": c.get("csat_summary"),
+            "resolution_summary": c.get("resolution_summary"),
+            "suggested_topic": c.get("suggested_topic"),
+            "recommended_skill": c.get("recommended_skill"),
+            "sample_ticket_ids": [s.get("ticket_id") for s in (c.get("sample_tickets") or [])],
+        })
+        for r in c.get("rows", []):
+            ticket_assignments.append({
+                "ticket_id": r.get("ticket_id", ""),
+                "cluster_id": cluster_id,
+                "kind": c.get("kind"),
+            })
+
+    payload = {
+        "client": client,
+        "generated_at": today,
+        "tickets_source": str(tickets_path),
+        "tickets_n": len(rows),
+        "clusters": payload_clusters,
+    }
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["ticket_id", "cluster_id", "kind"])
+        writer.writeheader()
+        for ta in ticket_assignments:
+            writer.writerow(ta)
+
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "voc").is_dir() and not (client_root / "voc.md").is_file():
+        fails.append(f"voc layer missing: clients/{client}/voc/")
+    if not (client_root / "product-knowledge").is_dir() and not (client_root / "product-knowledge.md").is_file():
+        fails.append(f"product-knowledge layer missing: clients/{client}/product-knowledge/")
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/")
+    return len(fails) == 0, fails
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--tickets", required=True, help="tickets CSV path")
+    parser.add_argument("--top-clusters", type=int, default=10)
+    parser.add_argument("--min-cluster-size", type=int, default=3)
+    parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--strict-substrate", action="store_true")
+    args = parser.parse_args()
+
+    tickets_path = Path(args.tickets).resolve()
+    if not tickets_path.is_file():
+        print(f"REFUSED: missing-tickets, {tickets_path} not found", file=sys.stderr)
+        return 3
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        if args.strict_substrate:
+            return 3
+        print("  (continuing without substrate; outputs will mark layers as gaps and tag low-confidence)", file=sys.stderr)
+
+    try:
+        rows, fields = load_tickets(tickets_path)
+    except ValueError as e:
+        print(f"REFUSED: schema-mismatch, {e}", file=sys.stderr)
+        return 3
+
+    if not rows:
+        print("REFUSED: empty-corpus, tickets CSV had no data rows", file=sys.stderr)
+        return 3
+
+    if len(rows) < MIN_TICKETS:
+        print(
+            f"REFUSED: too-few-tickets, corpus has {len(rows)} tickets (minimum {MIN_TICKETS}). "
+            f"Smaller corpora produce noise, not signal.",
+            file=sys.stderr,
+        )
+        return 3
+
+    print(f"[ticket-cluster-analysis] client={args.client} tickets_n={len(rows)}", file=sys.stderr)
+
+    # 1. Taxonomy assignment
+    taxonomy_buckets = assign_taxonomy(rows)
+    matched_rows: set[str] = set()
+    for theme_id, bucket in taxonomy_buckets.items():
+        if theme_id == "unmatched":
+            continue
+        for r in bucket:
+            matched_rows.add(r.get("ticket_id", ""))
+    unmatched = taxonomy_buckets.get("unmatched", [])
+
+    # 2. Compute IDF over the full corpus
+    corpus_tokens = [tokenize(f"{r.get('subject', '')} {r.get('body', '')}") for r in rows]
+    idf = compute_idf(corpus_tokens)
+
+    # 3. Build taxonomy cluster summaries
+    taxonomy_clusters: list[dict] = []
+    for theme_id, _, label, topic, skill in TAXONOMY:
+        bucket_rows = taxonomy_buckets.get(theme_id, [])
+        if len(bucket_rows) < args.min_cluster_size:
+            continue
+        top_tokens = tfidf_top_tokens(bucket_rows, idf, top_n=5)
+        taxonomy_clusters.append({
+            "kind": "taxonomy",
+            "theme_id": theme_id,
+            "label": label,
+            "rows": bucket_rows,
+            "size": len(bucket_rows),
+            "top_tokens": top_tokens,
+            "csat_summary": cluster_csat(bucket_rows),
+            "resolution_summary": cluster_resolution_time(bucket_rows),
+            "suggested_topic": topic,
+            "recommended_skill": skill,
+            "sample_tickets": sample_tickets(bucket_rows, 3),
+        })
+
+    # 4. Residual clusters
+    residual_clusters_raw = cluster_residuals(unmatched, idf, args.min_cluster_size)
+    residual_clusters: list[dict] = []
+    for rc in residual_clusters_raw:
+        residual_clusters.append({
+            "kind": "residual",
+            "lead_token": rc["lead_token"],
+            "label": f"Residual: {rc['lead_token']}",
+            "rows": rc["rows"],
+            "size": rc["size"],
+            "top_tokens": rc["top_tokens"],
+            "csat_summary": cluster_csat(rc["rows"]),
+            "resolution_summary": cluster_resolution_time(rc["rows"]),
+            "suggested_topic": suggested_topic_from_residual(rc["top_tokens"]),
+            "recommended_skill": "help-docs",
+            "sample_tickets": sample_tickets(rc["rows"], 3),
+        })
+
+    # 5. Compose outputs
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else SUBSTRATE_ROOT / "clients" / args.client / "support"
+    md_path = out_dir / f"ticket-clusters-{today}.md"
+    json_path = out_dir / f"ticket-clusters-{today}.json"
+    csv_path = out_dir / f"ticket-clusters-{today}.csv"
+
+    write_md(
+        md_path,
+        client=args.client,
+        tickets_path=tickets_path,
+        rows=rows,
+        taxonomy_clusters=taxonomy_clusters,
+        residual_clusters=residual_clusters,
+        today=today,
+        top_clusters=args.top_clusters,
+    )
+    write_json_csv(
+        json_path,
+        csv_path,
+        client=args.client,
+        tickets_path=tickets_path,
+        rows=rows,
+        taxonomy_clusters=taxonomy_clusters,
+        residual_clusters=residual_clusters,
+        today=today,
+    )
+
+    print(f"[ticket-cluster-analysis] taxonomy clusters: {len(taxonomy_clusters)}", file=sys.stderr)
+    print(f"[ticket-cluster-analysis] residual clusters: {len(residual_clusters)}", file=sys.stderr)
+    print(f"[ticket-cluster-analysis] markdown: {md_path}")
+    print(f"[ticket-cluster-analysis] json:     {json_path}")
+    print(f"[ticket-cluster-analysis] csv:      {csv_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

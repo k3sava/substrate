@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# narrative-compose — message-house gate ladder.
+# Usage: narrative-compose <asset> [--dry-run|--stage|--prod]
+# Gates: voice-enforce + ≤3 reframings + every pillar has evidence_path + master_cta declared.
+set -uo pipefail
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+A="${1:?asset required}"; [ -f "$A" ] || { echo "asset not found: $A" >&2; exit 2; }
+echo "=== narrative-compose: $A ===" >&2
+"$SUBSTRATE_ROOT/skills/voice-enforce/bin/voice-enforce" "$A" >/dev/null 2>&1 || { echo "  ✗ voice-enforce FAIL" >&2; exit 1; }
+echo "  ✓ voice-enforce PASS" >&2
+
+fm() { awk -v k="$1" 'BEGIN{f=0} NR==1&&/^---$/{f=1;next} f&&/^---$/{exit} f{ if (match($0, "^"k":[[:space:]]*")) { v=substr($0, RSTART+RLENGTH); print v; exit } }' "$A"; }
+
+# Gate: master_cta declared (single canonical CTA = no message-house drift)
+MCTA=$(fm master_cta)
+[ -z "$MCTA" ] && { echo "  ✗ master_cta missing — message-house requires one canonical CTA" >&2; exit 1; }
+echo "  ✓ master_cta=$MCTA" >&2
+
+# Gate: ≤3 audience reframings
+REFRAMES=$(grep -ciE "^(##|reframe|audience):" "$A" | head -1)
+REFRAME_COUNT=$(grep -ciE "^### *[Rr]eframe" "$A")
+[ -z "$REFRAME_COUNT" ] && REFRAME_COUNT=0
+if [ "$REFRAME_COUNT" -gt 3 ]; then echo "  ✗ $REFRAME_COUNT audience reframings > 3 (cut)" >&2; exit 1; fi
+echo "  ✓ reframings=$REFRAME_COUNT (≤3)" >&2
+
+# Gate: every pillar has an evidence_path. Pillars match `### Pillar` headers.
+PILLARS=$(grep -cE "^### *[Pp]illar" "$A")
+[ -z "$PILLARS" ] && PILLARS=0
+EV_PATHS=$(grep -cE "evidence_path: *[^[:space:]]" "$A")
+[ -z "$EV_PATHS" ] && EV_PATHS=0
+if [ "$PILLARS" -gt 0 ] && [ "$EV_PATHS" -lt "$PILLARS" ]; then
+  echo "  ✗ $PILLARS pillars but only $EV_PATHS evidence_path entries — pillar without evidence rejected" >&2; exit 1
+fi
+echo "  ✓ pillars=$PILLARS, evidence_paths=$EV_PATHS" >&2
+
+echo "PASS-DRY: $A"

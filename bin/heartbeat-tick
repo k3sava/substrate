@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# heartbeat-tick — optional per-minute tick for an always-on substrate session.
+#
+# Fires a headless `claude -p` that:
+#   1. pulls the substrate repo
+#   2. checks any inbound request channel the operator has wired (e.g. Commons MCP)
+#   3. responds / acks any pending request
+#   4. appends a worklog row
+#   5. pushes
+# Cost: ~200 tokens/tick. Cheap. Survives session death.
+#
+# This wrapper is optional. Substrate runs fine without it. It's here as a
+# reference for operators who want a low-cost always-on presence loop.
+#
+# Configure via env:
+#   SUBSTRATE_ROOT — substrate repo root (required)
+#   SUBSTRATE_LOG_DIR — log directory (default: $SUBSTRATE_ROOT/.logs)
+#
+# Install (suggested label: com.substrate.heartbeat):
+#   launchctl load ~/Library/LaunchAgents/com.substrate.heartbeat.plist
+
+set -euo pipefail
+
+# Backwards-compat: accept FLYWHEEL_ROOT as deprecated alias for SUBSTRATE_ROOT.
+if [ -n "${FLYWHEEL_ROOT:-}" ] && [ -z "${SUBSTRATE_ROOT:-}" ]; then
+  echo "DEPRECATED: FLYWHEEL_ROOT is deprecated; use SUBSTRATE_ROOT." >&2
+  SUBSTRATE_ROOT="$FLYWHEEL_ROOT"
+fi
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+LOG_DIR="${SUBSTRATE_LOG_DIR:-$SUBSTRATE_ROOT/.logs}"
+LOG="$LOG_DIR/heartbeat.log"
+mkdir -p "$LOG_DIR"
+
+# Avoid concurrent runs. macOS has no flock; use mkdir as atomic lock.
+LOCK="/tmp/substrate-heartbeat.lock.d"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [[ -d "$LOCK" ]]; then
+    AGE=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || echo 0) ))
+    if (( AGE > 300 )); then
+      rm -rf "$LOCK" && mkdir "$LOCK" 2>/dev/null
+    else
+      echo "[$(date +%H:%M:%S)] skipped (prior tick still running, lock age ${AGE}s)" >> "$LOG"
+      exit 0
+    fi
+  fi
+fi
+trap 'rm -rf "$LOCK"' EXIT
+
+cd "$SUBSTRATE_ROOT"
+
+# Pull repo cheaply (no token cost; git only). Best-effort.
+git pull --rebase --autostash 2>&1 | tail -1 >> "$LOG" || true
+
+# Tick prompt — concise, action-oriented, bounded output.
+TICK_PROMPT='You are the substrate heartbeat-tick session. ONE tick only. No explanations to user (no user is reading; output just goes to log).
+
+DO IN ORDER:
+1. Check the operator-wired request inbox if one is configured (e.g. an MCP server).
+2. If any URGENT or recent (this-session) request: drain it with a brief ack (<= 120 chars) noting state-tag. Do NOT do build work this tick.
+3. Append exactly ONE row to handoff/worklog-active.md (or create the file) following the format:
+   YYYY-MM-DDTHH:MM:SSZ | substrate-heartbeat | <state> | <chunk-or-idle> | <hash-or-meta> | meta=heartbeat-tick
+   where <state> = "shipped" if drained inbox, else "idle-but-watching".
+4. git add handoff/worklog-active.md && git commit -m "heartbeat: <state> tick $(date -u +%H:%MZ)" && git push.
+5. Stop. Output ONE line: "tick OK <state>".
+
+Constraints:
+- Hard cap <= 8 tool calls.
+- No build work this tick (heartbeat is presence-only).
+- If git push conflicts, pull --rebase --autostash + retry once. If still failing, log and exit.'
+
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+echo "[$TS] tick start" >> "$LOG"
+
+if ! command -v claude > /dev/null 2>&1; then
+  echo "[$TS] claude CLI not on PATH; heartbeat is a no-op without it" >> "$LOG"
+  exit 0
+fi
+
+OUT=$(claude --print \
+  --output-format text \
+  --allowed-tools "Bash(git pull:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Edit,Read" \
+  --model claude-haiku-4-5-20251001 \
+  "$TICK_PROMPT" 2>&1) || {
+    echo "[$(date -u +%H:%M:%SZ)] tick FAILED: $OUT" | head -c 500 >> "$LOG"
+    exit 1
+  }
+
+echo "[$(date -u +%H:%M:%SZ)] $OUT" | tail -c 500 >> "$LOG"
+echo "[$(date -u +%H:%M:%SZ)] tick end" >> "$LOG"

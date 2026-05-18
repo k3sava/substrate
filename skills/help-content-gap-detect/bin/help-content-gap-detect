@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""help-content-gap-detect, cross-reference ticket clusters with help-docs catalog.
+
+Reads cluster JSON output from `ticket-cluster-analysis` and an existing help
+catalog (markdown directory, CSV, or JSON). Computes per-cluster coverage via
+Jaccard token overlap, flags content gaps, drift candidates, and stale
+articles. Outputs a ranked gap queue with suggested topics in customer
+language pulled verbatim from cluster sample tickets.
+
+Usage:
+    help-content-gap-detect --client <client> \
+        --clusters <clusters.json> \
+        --help-catalog <path-or-dir> \
+        [--match-threshold 0.30] [--out-dir <path>]
+
+Outputs:
+    clients/<client>/support/help-content-gaps-<date>.md
+    clients/<client>/support/help-content-gaps-<date>.json
+    clients/<client>/support/help-content-gap-queue-<date>.csv
+
+Exit codes:
+    0, gap report written
+    3, preflight refusal (substrate-gap, missing-clusters, missing-help-catalog)
+    4, invalid args
+
+Per the tickets-are-product-feedback-channel pattern, the ticket corpus is the
+substrate the help catalog should match. Per distribution-as-moat, help docs
+are an AEO-citation surface; gaps cost both deflection and AEO presence.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+# Stop words for token signatures. Conservative; we want article titles and
+# cluster topics to retain their content words for the Jaccard match.
+STOP_WORDS = {
+    "the", "and", "for", "this", "that", "with", "from", "have", "has",
+    "had", "you", "your", "are", "was", "were", "but", "not", "all", "can",
+    "will", "would", "could", "should", "did", "does", "doing", "done",
+    "about", "into", "onto", "upon", "out", "off", "over", "than", "then",
+    "there", "their", "they", "them", "what", "when", "where", "who",
+    "how", "why", "which", "while", "any", "some", "one", "two", "three",
+    "very", "much", "more", "most", "less", "few", "lot", "lots", "just",
+    "like", "also", "too", "still", "even", "again", "back", "down", "now",
+    "here", "his", "her", "its", "our", "ours", "yours",
+    "him", "she", "it", "we", "us", "my", "me", "i", "a", "an",
+    "is", "be", "to", "of", "in", "on", "as", "or", "if", "by",
+    "do", "so", "no", "yes", "ok", "okay",
+    "want", "need", "see", "look", "find", "tell", "show",
+    "good", "bad", "fine", "issue", "problem", "happen", "tried",
+}
+
+
+def tokenize(text: str) -> set[str]:
+    """Lowercase, alphanumeric tokens, stop words removed, length >= 3."""
+    raw = re.findall(r"[a-z][a-z0-9_-]{2,}", (text or "").lower())
+    return {t for t in raw if t not in STOP_WORDS and len(t) >= 3}
+
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = a & b
+    union = a | b
+    if not union:
+        return 0.0
+    return len(inter) / len(union)
+
+
+def parse_md_frontmatter(path: Path) -> tuple[dict, str]:
+    """Parse YAML-style frontmatter and return (frontmatter_dict, body)."""
+    text = path.read_text(encoding="utf-8")
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}, text
+    fm: dict[str, str | list[str]] = {}
+    body_start = len(lines)
+    in_fm = True
+    current_list_key: str | None = None
+    for i, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            body_start = i + 1
+            in_fm = False
+            break
+        if not in_fm:
+            break
+        # Inline list: key: [a, b]
+        m = re.match(r"^([a-zA-Z0-9_-]+):\s*(.*)$", line)
+        if m:
+            key, val = m.group(1), m.group(2).strip()
+            if val.startswith("[") and val.endswith("]"):
+                items = [s.strip().strip('"').strip("'") for s in val[1:-1].split(",") if s.strip()]
+                fm[key] = items
+                current_list_key = None
+            elif val == "":
+                # block list candidate
+                fm[key] = []
+                current_list_key = key
+            else:
+                fm[key] = val.strip('"').strip("'")
+                current_list_key = None
+            continue
+        m2 = re.match(r"^\s*-\s*(.+)$", line)
+        if m2 and current_list_key is not None:
+            existing = fm.get(current_list_key)
+            if isinstance(existing, list):
+                existing.append(m2.group(1).strip().strip('"').strip("'"))
+    body = "\n".join(lines[body_start:])
+    return fm, body
+
+
+def load_help_catalog(path: Path) -> list[dict]:
+    """Return list of {article_id, title, topic, slug, source_clusters, signature_tokens}."""
+    if not path.exists():
+        raise FileNotFoundError(f"help catalog not found: {path}")
+    articles: list[dict] = []
+
+    if path.is_dir():
+        for md_file in sorted(path.rglob("*.md")):
+            fm, body = parse_md_frontmatter(md_file)
+            title = fm.get("title") or md_file.stem.replace("-", " ").title()
+            topic = fm.get("topic", "")
+            slug = fm.get("slug") or md_file.stem
+            sc = fm.get("source_clusters", [])
+            if isinstance(sc, str):
+                sc = [s.strip() for s in sc.split(";") if s.strip()]
+            signature_text = " ".join([
+                str(title or ""),
+                str(topic or ""),
+                str(slug or ""),
+                (body or "")[:800],
+            ])
+            articles.append({
+                "article_id": str(slug),
+                "title": str(title),
+                "topic": str(topic),
+                "slug": str(slug),
+                "source_clusters": list(sc) if isinstance(sc, list) else [],
+                "signature_tokens": tokenize(signature_text),
+                "source_path": str(md_file.resolve()),
+            })
+        return articles
+
+    if path.suffix.lower() == ".csv":
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                raise ValueError("help catalog CSV has no header")
+            required = {"title"}
+            missing = required - set(reader.fieldnames)
+            if missing:
+                raise ValueError(f"help catalog CSV missing required columns: {sorted(missing)}")
+            for raw in reader:
+                title = raw.get("title", "")
+                topic = raw.get("topic", "")
+                slug = raw.get("slug") or raw.get("article_id") or re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+                sc_raw = raw.get("source_clusters", "")
+                sc = [s.strip() for s in sc_raw.split(";") if s.strip()] if sc_raw else []
+                articles.append({
+                    "article_id": raw.get("article_id") or slug,
+                    "title": title,
+                    "topic": topic,
+                    "slug": slug,
+                    "source_clusters": sc,
+                    "signature_tokens": tokenize(f"{title} {topic} {slug}"),
+                    "source_path": str(path.resolve()) + f"#{slug}",
+                })
+        return articles
+
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "articles" in data:
+            data = data["articles"]
+        if not isinstance(data, list):
+            raise ValueError("help catalog JSON must be a list or {articles: list}")
+        for raw in data:
+            title = raw.get("title", "")
+            topic = raw.get("topic", "")
+            slug = raw.get("slug") or raw.get("article_id") or re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+            sc = raw.get("source_clusters", []) or []
+            articles.append({
+                "article_id": raw.get("article_id") or slug,
+                "title": title,
+                "topic": topic,
+                "slug": slug,
+                "source_clusters": sc if isinstance(sc, list) else [],
+                "signature_tokens": tokenize(f"{title} {topic} {slug}"),
+                "source_path": str(path.resolve()) + f"#{slug}",
+            })
+        return articles
+
+    raise ValueError(f"unsupported help catalog format: {path}")
+
+
+def load_clusters_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def cluster_signature_tokens(cluster: dict) -> set[str]:
+    """Build the cluster's matching token set from label, top tokens, and topic."""
+    tokens: set[str] = set()
+    tokens |= tokenize(cluster.get("label", ""))
+    tokens |= tokenize(cluster.get("suggested_topic", ""))
+    for entry in cluster.get("top_tokens", []):
+        if isinstance(entry, dict):
+            tokens.add(entry.get("token", ""))
+        elif isinstance(entry, (list, tuple)) and entry:
+            tokens.add(entry[0])
+    tokens.discard("")
+    return tokens
+
+
+def cluster_priority_score(cluster: dict) -> float:
+    """Rank score: size × CSAT-deficit (lower CSAT raises priority)."""
+    size = float(cluster.get("size", 0))
+    csat_summary = cluster.get("csat_summary") or {}
+    csat_median = float(csat_summary.get("median", 5)) if csat_summary.get("median") is not None else 5.0
+    csat_deficit = max(0.0, 5.0 - csat_median) + 1.0  # 1.0 floor so size still ranks for high-CSAT clusters
+    return size * csat_deficit
+
+
+def detect_drift(
+    clusters: list[dict],
+    articles: list[dict],
+    threshold: float,
+) -> list[dict]:
+    """Articles with declared source_clusters where current cluster tokens diverge."""
+    cluster_by_id: dict[str, dict] = {c.get("cluster_id", ""): c for c in clusters}
+    drift_findings: list[dict] = []
+    for article in articles:
+        sc_list = article.get("source_clusters") or []
+        if not sc_list:
+            continue
+        for sc_id in sc_list:
+            current = cluster_by_id.get(sc_id)
+            if not current:
+                drift_findings.append({
+                    "article_id": article.get("article_id", ""),
+                    "article_title": article.get("title", ""),
+                    "declared_cluster": sc_id,
+                    "kind": "declared-cluster-vanished",
+                    "detail": f"article declares source cluster '{sc_id}' but no such cluster exists in the current run",
+                })
+                continue
+            sig = cluster_signature_tokens(current)
+            sim = jaccard(article.get("signature_tokens", set()), sig)
+            if sim < threshold:
+                drift_findings.append({
+                    "article_id": article.get("article_id", ""),
+                    "article_title": article.get("title", ""),
+                    "declared_cluster": sc_id,
+                    "current_cluster_label": current.get("label", ""),
+                    "jaccard_similarity": round(sim, 3),
+                    "kind": "low-similarity-to-declared-cluster",
+                    "detail": f"article tokens overlap with current cluster '{sc_id}' at Jaccard {sim:.3f} (below threshold {threshold:.2f})",
+                })
+    return drift_findings
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--clusters", required=True, help="ticket-cluster-analysis JSON output")
+    parser.add_argument("--help-catalog", required=True, help="help-docs catalog (dir of .md, or CSV, or JSON)")
+    parser.add_argument("--match-threshold", type=float, default=0.30)
+    parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--strict-substrate", action="store_true")
+    args = parser.parse_args()
+
+    clusters_path = Path(args.clusters).resolve()
+    if not clusters_path.is_file():
+        print(f"REFUSED: missing-clusters, {clusters_path} not found", file=sys.stderr)
+        return 3
+    catalog_path = Path(args.help_catalog).resolve()
+    if not catalog_path.exists():
+        print(f"REFUSED: missing-help-catalog, {catalog_path} not found", file=sys.stderr)
+        return 3
+
+    # Preflight on substrate layers
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    fails: list[str] = []
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{args.client}/")
+    else:
+        if not (client_root / "voc").is_dir() and not (client_root / "voc.md").is_file():
+            fails.append(f"voc layer missing: clients/{args.client}/voc/")
+        if not (client_root / "product-knowledge").is_dir() and not (client_root / "product-knowledge.md").is_file():
+            fails.append(f"product-knowledge layer missing: clients/{args.client}/product-knowledge/")
+    if fails:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        if args.strict_substrate:
+            return 3
+        print("  (continuing without substrate; outputs will mark layers as gaps)", file=sys.stderr)
+
+    try:
+        catalog = load_help_catalog(catalog_path)
+    except (ValueError, FileNotFoundError) as e:
+        print(f"REFUSED: missing-help-catalog, {e}", file=sys.stderr)
+        return 3
+
+    try:
+        clusters_doc = load_clusters_json(clusters_path)
+    except json.JSONDecodeError as e:
+        print(f"REFUSED: missing-clusters, JSON parse error: {e}", file=sys.stderr)
+        return 3
+
+    clusters = clusters_doc.get("clusters", [])
+    if not clusters:
+        print("REFUSED: missing-clusters, clusters JSON has no clusters", file=sys.stderr)
+        return 3
+
+    print(f"[help-content-gap-detect] client={args.client} clusters_n={len(clusters)} catalog_n={len(catalog)}", file=sys.stderr)
+
+    # 1. Match each cluster to best-fit article
+    coverage: list[dict] = []
+    for c in clusters:
+        sig = cluster_signature_tokens(c)
+        best = (0.0, None)
+        for art in catalog:
+            sim = jaccard(sig, art.get("signature_tokens", set()))
+            if sim > best[0]:
+                best = (sim, art)
+        sim, art = best
+        if sim >= args.match_threshold:
+            status = "covered"
+        elif sim >= 0.15:
+            status = "partial"
+        else:
+            status = "gap"
+        coverage.append({
+            "cluster_id": c.get("cluster_id", ""),
+            "cluster_label": c.get("label", ""),
+            "cluster_size": c.get("size", 0),
+            "cluster_csat_median": (c.get("csat_summary") or {}).get("median"),
+            "cluster_top_tokens": [
+                e.get("token") if isinstance(e, dict) else (e[0] if isinstance(e, (list, tuple)) and e else None)
+                for e in c.get("top_tokens", [])
+            ],
+            "best_match_article_id": art.get("article_id") if art else None,
+            "best_match_title": art.get("title") if art else None,
+            "best_match_jaccard": round(sim, 3),
+            "status": status,
+            "priority_score": round(cluster_priority_score(c), 2),
+            "suggested_topic": c.get("suggested_topic"),
+            "sample_ticket_ids": c.get("sample_ticket_ids", []),
+        })
+
+    # 2. Drift detection
+    drift = detect_drift(clusters, catalog, args.match_threshold)
+
+    # 3. Stale article detection
+    article_match_map: dict[str, list[dict]] = {a.get("article_id", ""): [] for a in catalog}
+    for cov in coverage:
+        if cov["status"] == "covered" and cov["best_match_article_id"]:
+            article_match_map.setdefault(cov["best_match_article_id"], []).append(cov)
+    stale_candidates: list[dict] = []
+    for article in catalog:
+        if not article_match_map.get(article.get("article_id", "")):
+            stale_candidates.append({
+                "article_id": article.get("article_id", ""),
+                "article_title": article.get("title", ""),
+                "source_clusters_declared": article.get("source_clusters", []),
+                "source_path": article.get("source_path", ""),
+            })
+
+    # 4. Build gap queue (gap clusters ranked by priority)
+    gap_queue = sorted(
+        [cov for cov in coverage if cov["status"] in ("gap", "partial")],
+        key=lambda cov: -cov["priority_score"],
+    )
+
+    # 5. Compose outputs
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else SUBSTRATE_ROOT / "clients" / args.client / "support"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    md_path = out_dir / f"help-content-gaps-{today}.md"
+    json_path = out_dir / f"help-content-gaps-{today}.json"
+    queue_path = out_dir / f"help-content-gap-queue-{today}.csv"
+
+    n_clusters = len(clusters)
+    n_covered = sum(1 for c in coverage if c["status"] == "covered")
+    n_gap = sum(1 for c in coverage if c["status"] == "gap")
+    n_partial = sum(1 for c in coverage if c["status"] == "partial")
+    coverage_pct = round(n_covered / max(1, n_clusters) * 100, 1)
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: help content gaps, {args.client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [tickets-are-product-feedback-channel, distribution-as-moat]")
+    lines.append("contradictions_aware: []")
+    lines.append(f"client: {args.client}")
+    lines.append(f"clusters_source: {clusters_path}")
+    lines.append(f"help_catalog_source: {catalog_path}")
+    lines.append(f"clusters_n: {n_clusters}")
+    lines.append(f"articles_n: {len(catalog)}")
+    lines.append(f"coverage_pct: {coverage_pct}")
+    lines.append(f"match_threshold: {args.match_threshold}")
+    lines.append("produced_by: help-content-gap-detect")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Help content gaps, {args.client}, {today}")
+    lines.append("")
+    lines.append(
+        f"Source: cluster JSON `{clusters_path}` × help catalog `{catalog_path}`. Matched on Jaccard token overlap (threshold: {args.match_threshold}). Per `tickets-are-product-feedback-channel`, the ticket clusters are the substrate the help catalog should match. Per `distribution-as-moat`, gaps in the help catalog cost both ticket deflection and AEO citation presence; closing the highest-priority gaps compounds both."
+    )
+    lines.append("")
+    lines.append("## 1. Catalog and coverage summary")
+    lines.append("")
+    lines.append(f"- Help catalog: {len(catalog)} articles")
+    lines.append(f"- Ticket clusters: {n_clusters}")
+    lines.append(f"- Covered (Jaccard ≥ {args.match_threshold}): {n_covered} ({coverage_pct}%)")
+    lines.append(f"- Partial (0.15 ≤ Jaccard < {args.match_threshold}): {n_partial}")
+    lines.append(f"- Gap (Jaccard < 0.15): {n_gap}")
+    lines.append("")
+    if n_clusters > 0 and (n_gap + n_partial) / n_clusters > 0.7:
+        lines.append("> **WARN: low-coverage**. Over 70% of clusters fall in gap or partial status. The catalog is systematically thin against current ticket language; consider a broader content-build sprint, not just the queue below.")
+        lines.append("")
+
+    # Gap queue
+    lines.append("## 2. Ranked content gap queue")
+    lines.append("")
+    lines.append(
+        "Priority score = cluster size × CSAT deficit (lower CSAT raises priority; the floor of 1.0 keeps high-CSAT but high-volume clusters in the rank). The top of this queue is what the docs team should write next."
+    )
+    lines.append("")
+    if gap_queue:
+        lines.append("| Rank | Cluster | Size | Median CSAT | Status | Priority | Suggested topic |")
+        lines.append("|---:|---|---:|---:|---|---:|---|")
+        for i, cov in enumerate(gap_queue[:20], 1):
+            csat = cov["cluster_csat_median"]
+            csat_text = str(csat) if csat is not None else "n/a"
+            lines.append(
+                f"| {i} | {cov['cluster_label']} | {cov['cluster_size']} | {csat_text} | {cov['status']} | {cov['priority_score']} | {cov['suggested_topic'] or 'n/a'} |"
+            )
+    else:
+        lines.append("_No gaps detected at the configured match threshold._")
+    lines.append("")
+
+    # Per-gap detail
+    if gap_queue:
+        lines.append("## 3. Gap detail (top 10 by priority)")
+        lines.append("")
+        for i, cov in enumerate(gap_queue[:10], 1):
+            lines.append(f"### {i}. {cov['cluster_label']} (size: {cov['cluster_size']}, priority: {cov['priority_score']})")
+            lines.append("")
+            lines.append(f"- Cluster id: `{cov['cluster_id']}`")
+            lines.append(f"- Status: **{cov['status']}** (best Jaccard match: {cov['best_match_jaccard']})")
+            if cov["best_match_title"]:
+                lines.append(f"- Closest article: \"{cov['best_match_title']}\" (insufficient overlap)")
+            top_tokens = [t for t in cov.get("cluster_top_tokens") or [] if t]
+            if top_tokens:
+                lines.append(f"- Cluster top tokens: {', '.join(f'`{t}`' for t in top_tokens[:5])}")
+            if cov["suggested_topic"]:
+                lines.append(f"- Suggested topic (in customer language): _{cov['suggested_topic']}_")
+            sample_ids = cov.get("sample_ticket_ids", [])
+            if sample_ids:
+                lines.append(f"- Source sample tickets: {', '.join(f'`{t}`' for t in sample_ids[:3])}")
+            lines.append("")
+            lines.append(f"_Recommended next step: `skills/help-docs/bin/help-docs --client {args.client} --mode article --topic {cov['cluster_id']}` (with the cluster JSON as `--source-clusters` input)._")
+            lines.append("")
+
+    # Drift
+    lines.append("## 4. Drift candidates")
+    lines.append("")
+    if drift:
+        lines.append(
+            "Articles whose declared source clusters now have token signatures that diverge from the article. Candidates for refresh, not deprecation. Operator reviews before acting."
+        )
+        lines.append("")
+        lines.append("| Article | Declared cluster | Kind | Detail |")
+        lines.append("|---|---|---|---|")
+        for d in drift:
+            lines.append(
+                f"| {d['article_title']} | {d['declared_cluster']} | {d['kind']} | {d['detail']} |"
+            )
+    else:
+        lines.append("_No drift candidates. Articles with declared source clusters still match current cluster signatures._")
+    lines.append("")
+
+    # Stale
+    lines.append("## 5. Stale article candidates")
+    lines.append("")
+    if stale_candidates:
+        lines.append(
+            "Articles in the catalog with no matching cluster in this run. Surfaced as deprecation candidates; the operator decides whether to deprecate, refresh, or leave (some articles remain useful even when the underlying ticket cluster has resolved)."
+        )
+        lines.append("")
+        lines.append("| Article | Declared source clusters | Source path |")
+        lines.append("|---|---|---|")
+        for s in stale_candidates[:30]:
+            sc_text = ", ".join(s["source_clusters_declared"]) if s["source_clusters_declared"] else "(none declared)"
+            lines.append(f"| {s['article_title']} | {sc_text} | `{s['source_path']}` |")
+    else:
+        lines.append("_No stale candidates. Every article in the catalog matches at least one current cluster._")
+    lines.append("")
+
+    # Substrate
+    lines.append("## 6. Substrate citations")
+    lines.append("")
+    lines.append(f"- Cluster source: `{clusters_path}`")
+    lines.append(f"- Help catalog: `{catalog_path}`")
+    lines.append(f"- VoC layer: `clients/{args.client}/voc/voc.md`")
+    lines.append(f"- Product knowledge: `clients/{args.client}/product-knowledge/product-knowledge.md`")
+    lines.append("- Pattern grounding: `knowledge/patterns/tickets-are-product-feedback-channel.md` (the tickets are the substrate the help catalog should match).")
+    lines.append("- Pattern grounding: `knowledge/patterns/distribution-as-moat.md` (help docs are an AEO citation surface and a long-term distribution moat; gaps cost both).")
+    lines.append("")
+
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append(f"- Run `skills/help-docs/bin/help-docs --client {args.client} --mode article --topic <cluster_id>` for each top gap.")
+    lines.append(f"- Run `skills/aeo-relevance/bin/aeo-relevance --client {args.client}` after new articles ship to track AEO presence on the gap topics.")
+    lines.append(f"- Schedule via `routines/support-cluster-monthly.md`.")
+
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+
+    # JSON sidecar
+    payload = {
+        "client": args.client,
+        "generated_at": today,
+        "clusters_source": str(clusters_path),
+        "help_catalog_source": str(catalog_path),
+        "match_threshold": args.match_threshold,
+        "summary": {
+            "clusters_n": n_clusters,
+            "articles_n": len(catalog),
+            "covered": n_covered,
+            "partial": n_partial,
+            "gap": n_gap,
+            "coverage_pct": coverage_pct,
+        },
+        "coverage": coverage,
+        "drift": drift,
+        "stale_candidates": stale_candidates,
+        "gap_queue_top20": gap_queue[:20],
+    }
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    # Gap queue CSV
+    with queue_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "rank", "cluster_id", "cluster_label", "cluster_size",
+            "cluster_csat_median", "status", "priority_score",
+            "best_match_jaccard", "suggested_topic",
+        ])
+        writer.writeheader()
+        for i, cov in enumerate(gap_queue, 1):
+            writer.writerow({
+                "rank": i,
+                "cluster_id": cov["cluster_id"],
+                "cluster_label": cov["cluster_label"],
+                "cluster_size": cov["cluster_size"],
+                "cluster_csat_median": cov["cluster_csat_median"] if cov["cluster_csat_median"] is not None else "",
+                "status": cov["status"],
+                "priority_score": cov["priority_score"],
+                "best_match_jaccard": cov["best_match_jaccard"],
+                "suggested_topic": cov["suggested_topic"] or "",
+            })
+
+    print(f"[help-content-gap-detect] coverage: {n_covered}/{n_clusters} ({coverage_pct}%)", file=sys.stderr)
+    print(f"[help-content-gap-detect] gap queue: {len(gap_queue)}", file=sys.stderr)
+    print(f"[help-content-gap-detect] drift: {len(drift)}", file=sys.stderr)
+    print(f"[help-content-gap-detect] stale: {len(stale_candidates)}", file=sys.stderr)
+    print(f"[help-content-gap-detect] markdown: {md_path}")
+    print(f"[help-content-gap-detect] json:     {json_path}")
+    print(f"[help-content-gap-detect] queue:    {queue_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

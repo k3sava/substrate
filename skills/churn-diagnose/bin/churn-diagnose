@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""churn-diagnose, surface ranked drivers of churn from a churned-accounts CSV.
+
+Reads churned-accounts data plus optional events/support history and produces
+ranked churn drivers scored on population coverage × addressability. Conditions
+the save-vs-let-go recommendation on the ICP fit score per the
+save-everyone-vs-let-the-wrong-fit-go contradiction.
+
+Usage:
+    churn-diagnose --client <client> --churned <path> \
+        [--events <events.csv>] [--support-tickets <tickets.csv>] \
+        [--top-drivers 5]
+
+Outputs:
+    clients/<client>/retention/churn-diagnosis-<date>.md
+    clients/<client>/retention/churn-diagnosis-<date>.json
+    clients/<client>/retention/churn-diagnosis-<date>-drivers.csv
+
+Exit codes:
+    0, diagnosis written
+    3, preflight refusal (substrate gap, missing inputs)
+    4, invalid args
+
+This skill diagnoses; it does not predict. The save-vs-let-go recommendation
+is conditioned on ICP fit per the contradiction file. No global default is
+applied; the choice is logged on each artifact.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from statistics import median, mean
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+# Driver definitions: (driver_id, addressability_1to5, lambda over churned-row -> bool, label)
+# Addressability:
+#   5 = onboarding/email tweak (days)
+#   4 = pricing or messaging change (weeks)
+#   3 = feature add or product flow change (1-2 quarters)
+#   2 = ICP redefinition + GTM rework (multiple quarters)
+#   1 = market shift, hard to move
+DRIVER_DEFS: list[tuple[str, int, str, str]] = [
+    ("activation-gap-never-hit", 5,
+     "row.get('first_value_event_hit', 'true').lower() in ('false', '0', 'no', '')",
+     "Never hit the activation / first-value event"),
+    ("activation-gap-slow", 4,
+     "(_to_int(row.get('days_to_first_value', '')) is not None) and (_to_int(row.get('days_to_first_value', '')) >= 7)",
+     "Slow to first value (>=7 days)"),
+    ("usage-decayed-to-zero", 3,
+     "_to_int(row.get('sessions_30d_pre_churn', '0')) == 0",
+     "Zero sessions in 30 days pre-churn"),
+    ("usage-low-but-nonzero", 4,
+     "1 <= (_to_int(row.get('sessions_30d_pre_churn', '0')) or 0) <= 2",
+     "Low usage in 30 days pre-churn (1-2 sessions)"),
+    ("low-icp-fit", 2,
+     "_to_float(row.get('icp_fit_score', '')) is not None and _to_float(row.get('icp_fit_score', '')) < 0.5",
+     "Low ICP fit score (<0.5)"),
+    ("price-sensitivity", 4,
+     "'price' in row.get('churn_reason_self_reported', '').lower() or 'expensive' in row.get('churn_reason_self_reported', '').lower() or 'cost' in row.get('churn_reason_self_reported', '').lower()",
+     "Self-reported price sensitivity"),
+    ("workflow-mismatch", 3,
+     "any(t in row.get('churn_reason_self_reported', '').lower() for t in ['workflow', 'fit', 'expected', 'not what'])",
+     "Self-reported workflow / expectation mismatch"),
+    ("complexity-confusion", 5,
+     "any(t in row.get('churn_reason_self_reported', '').lower() for t in ['complicated', 'complex', 'figured out', 'confusing', 'hard to use'])",
+     "Self-reported complexity / confusion"),
+    ("competitor-displacement", 4,
+     "'competitor' in row.get('churn_reason_self_reported', '').lower() or 'switched to' in row.get('churn_reason_self_reported', '').lower() or 'free year' in row.get('churn_reason_self_reported', '').lower()",
+     "Self-reported competitor displacement"),
+    ("champion-departure", 3,
+     "'champion' in row.get('churn_reason_self_reported', '').lower() or 'left the company' in row.get('churn_reason_self_reported', '').lower() or 'team consolidated' in row.get('churn_reason_self_reported', '').lower()",
+     "Champion or buyer departure"),
+    ("support-volume-spike", 3,
+     "_to_int(row.get('support_tickets_30d_pre_churn', '0')) >= 2",
+     "Elevated support ticket volume in 30 days pre-churn"),
+    ("nps-detractor", 3,
+     "_to_int(row.get('nps_score_last', '')) is not None and (_to_int(row.get('nps_score_last', '')) or 10) <= 6",
+     "NPS detractor at last survey"),
+]
+
+
+def _to_int(val):
+    if val is None or val == "":
+        return None
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_float(val):
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def evaluate_driver(predicate: str, row: dict) -> bool:
+    """Eval a driver predicate against a row. Predicates are static strings;
+    this is intentional, no user input goes through eval."""
+    try:
+        return bool(eval(predicate, {"_to_int": _to_int, "_to_float": _to_float, "row": row}))
+    except Exception:
+        return False
+
+
+def load_churned(path: Path) -> tuple[list[dict], list[str]]:
+    rows: list[dict] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("churned-accounts CSV has no header")
+        required = {"account_id", "user_id", "signup_date", "churn_date"}
+        missing = required - set(reader.fieldnames)
+        if missing:
+            raise ValueError(f"churned-accounts CSV missing required columns: {sorted(missing)}")
+        for raw in reader:
+            rows.append(dict(raw))
+        return rows, list(reader.fieldnames)
+
+
+def load_support_tickets(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for raw in reader:
+            rows.append(dict(raw))
+    return rows
+
+
+def cluster_self_reasons(rows: list[dict]) -> list[tuple[str, int, list[str]]]:
+    """Bucket the self-reported reasons by simple keyword stems. Return
+    (bucket_label, count, sample_reasons)."""
+    buckets: dict[str, list[str]] = defaultdict(list)
+    KEYWORDS = [
+        ("price", "Price / cost"),
+        ("expensive", "Price / cost"),
+        ("cost", "Price / cost"),
+        ("complicated", "Complexity / confusion"),
+        ("complex", "Complexity / confusion"),
+        ("confusing", "Complexity / confusion"),
+        ("figured out", "Complexity / confusion"),
+        ("hard to use", "Complexity / confusion"),
+        ("competitor", "Competitor displacement"),
+        ("free year", "Competitor displacement"),
+        ("switched to", "Competitor displacement"),
+        ("workflow", "Workflow / fit mismatch"),
+        ("fit", "Workflow / fit mismatch"),
+        ("expected", "Workflow / fit mismatch"),
+        ("not what", "Workflow / fit mismatch"),
+        ("champion", "Champion / buyer departure"),
+        ("left the company", "Champion / buyer departure"),
+        ("team consolidated", "Champion / buyer departure"),
+    ]
+    other: list[str] = []
+    for r in rows:
+        reason = r.get("churn_reason_self_reported", "").strip()
+        if not reason:
+            continue
+        rl = reason.lower()
+        bucketed = False
+        for needle, label in KEYWORDS:
+            if needle in rl:
+                buckets[label].append(reason)
+                bucketed = True
+                break
+        if not bucketed:
+            other.append(reason)
+    if other:
+        buckets["Other"] = other
+    out = sorted(
+        ((label, len(items), items[:3]) for label, items in buckets.items()),
+        key=lambda x: -x[1],
+    )
+    return out
+
+
+def split_by_icp_band(rows: list[dict]) -> dict[str, list[dict]]:
+    bands: dict[str, list[dict]] = {"high-fit (>=0.75)": [], "mid-fit (0.5-0.75)": [], "low-fit (<0.5)": [], "unknown": []}
+    for r in rows:
+        score = _to_float(r.get("icp_fit_score"))
+        if score is None:
+            bands["unknown"].append(r)
+        elif score >= 0.75:
+            bands["high-fit (>=0.75)"].append(r)
+        elif score >= 0.5:
+            bands["mid-fit (0.5-0.75)"].append(r)
+        else:
+            bands["low-fit (<0.5)"].append(r)
+    return bands
+
+
+def time_in_product_days(row: dict) -> int | None:
+    try:
+        signup = datetime.strptime(row["signup_date"], "%Y-%m-%d")
+        churn = datetime.strptime(row["churn_date"], "%Y-%m-%d")
+        return (churn - signup).days
+    except (KeyError, ValueError):
+        return None
+
+
+def stage_label(days: int | None) -> str:
+    if days is None:
+        return "unknown"
+    if days < 30:
+        return "early-stage (<30d)"
+    if days < 90:
+        return "mid-stage (30-90d)"
+    return "late-stage (>=90d)"
+
+
+def rank_drivers(rows: list[dict], top_n: int) -> list[dict]:
+    n = len(rows)
+    drivers: list[dict] = []
+    for driver_id, addressability, predicate, label in DRIVER_DEFS:
+        hits = [r for r in rows if evaluate_driver(predicate, r)]
+        coverage = len(hits) / n * 100.0 if n else 0.0
+        if coverage == 0:
+            continue
+        rank_score = coverage * addressability
+        drivers.append({
+            "driver_id": driver_id,
+            "label": label,
+            "coverage_pct": round(coverage, 1),
+            "addressability_1to5": addressability,
+            "rank_score": round(rank_score, 2),
+            "hits_n": len(hits),
+            "sample_account_ids": [r.get("account_id", "") for r in hits[:5]],
+        })
+    drivers.sort(key=lambda d: -d["rank_score"])
+    return drivers[:top_n]
+
+
+def driver_breakdown_by_band(rows: list[dict], top_n: int) -> dict[str, list[dict]]:
+    bands = split_by_icp_band(rows)
+    out: dict[str, list[dict]] = {}
+    for band, band_rows in bands.items():
+        if not band_rows:
+            continue
+        out[band] = rank_drivers(band_rows, top_n)
+    return out
+
+
+def save_vs_let_go_recommendation(band: str, band_rows: list[dict]) -> dict:
+    """Pick the contradiction position per the conditioning."""
+    n = len(band_rows)
+    if n == 0:
+        return {"position": "n/a", "rationale": "empty band"}
+    # Time-in-product distribution
+    days = [time_in_product_days(r) for r in band_rows]
+    days_clean = [d for d in days if d is not None]
+    median_days = int(median(days_clean)) if days_clean else None
+    late_share = sum(1 for d in days_clean if d >= 90) / len(days_clean) if days_clean else 0.0
+
+    if "low-fit" in band or "unknown" in band:
+        return {
+            "position": "B (let go; per Reichheld / Elliott-McCrea)",
+            "rationale": (
+                f"ICP fit is low (band={band}); the cohort is poor-fit churn. "
+                f"Investing in saves produces a treadmill. Recommended: cheapest possible "
+                f"in-product save attempt or honest 'we may not be the right fit' close. "
+                f"Reallocate CS hours to high-fit retention."
+            ),
+            "median_days_in_product": median_days,
+            "late_stage_share_pct": round(late_share * 100.0, 1),
+        }
+    if "high-fit" in band:
+        if late_share >= 0.5:
+            return {
+                "position": "A (save; per Murphy / Mehta)",
+                "rationale": (
+                    f"ICP fit is high (band={band}) and the majority churned late-stage "
+                    f"({round(late_share * 100, 1)}% past day 90). The full save playbook "
+                    f"(named champion outreach, executive call, outcome reset) has positive "
+                    f"expected value here. Run save calls; feed losses back into product/pricing."
+                ),
+                "median_days_in_product": median_days,
+                "late_stage_share_pct": round(late_share * 100.0, 1),
+            }
+        return {
+            "position": "Mixed (high-fit but early-stage)",
+            "rationale": (
+                f"ICP fit is high (band={band}) but the cohort churned early "
+                f"(late-stage share={round(late_share * 100, 1)}%). Early high-fit churn "
+                f"usually points at activation/onboarding failure, not loyalty failure. "
+                f"Run a low-cost in-product save AND fix the activation gap upstream "
+                f"(see activation-funnel-audit)."
+            ),
+            "median_days_in_product": median_days,
+            "late_stage_share_pct": round(late_share * 100.0, 1),
+        }
+    # mid-fit
+    return {
+        "position": "Mixed (condition on stage and expansion potential)",
+        "rationale": (
+            f"ICP fit is mid (band={band}). Apply Position A only when expansion potential "
+            f"or late-stage tenure suggests recoverable LTV. Apply Position B when usage "
+            f"never reached activation. Per-account triage required."
+        ),
+        "median_days_in_product": median_days,
+        "late_stage_share_pct": round(late_share * 100.0, 1),
+    }
+
+
+def usage_distribution(rows: list[dict]) -> dict:
+    sessions = [_to_int(r.get("sessions_30d_pre_churn", "")) for r in rows]
+    sessions = [s for s in sessions if s is not None]
+    if not sessions:
+        return {}
+    return {
+        "n": len(sessions),
+        "median": median(sessions),
+        "mean": round(mean(sessions), 1),
+        "zero_sessions_pct": round(sum(1 for s in sessions if s == 0) / len(sessions) * 100.0, 1),
+    }
+
+
+def support_cluster(rows: list[dict], churned_account_ids: set[str]) -> list[tuple[str, int]]:
+    if not rows:
+        return []
+    counter: Counter = Counter()
+    for r in rows:
+        if r.get("account_id") in churned_account_ids:
+            cat = r.get("category", "uncategorized") or "uncategorized"
+            counter[cat] += 1
+    return counter.most_common(10)
+
+
+def nps_distribution(rows: list[dict]) -> dict:
+    scores = [_to_int(r.get("nps_score_last", "")) for r in rows]
+    scores = [s for s in scores if s is not None]
+    if not scores:
+        return {}
+    return {
+        "n": len(scores),
+        "promoters_pct": round(sum(1 for s in scores if s >= 9) / len(scores) * 100.0, 1),
+        "passives_pct": round(sum(1 for s in scores if 7 <= s <= 8) / len(scores) * 100.0, 1),
+        "detractors_pct": round(sum(1 for s in scores if s <= 6) / len(scores) * 100.0, 1),
+        "median": median(scores),
+    }
+
+
+def write_md(
+    out_path: Path,
+    client: str,
+    churned_path: Path,
+    rows: list[dict],
+    drivers_overall: list[dict],
+    drivers_by_band: dict,
+    band_recommendations: dict,
+    usage_dist: dict,
+    support_top: list,
+    nps_dist: dict,
+    self_reason_buckets: list,
+    today: str,
+    icp_fit_present: bool,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n = len(rows)
+    total_arr = sum(_to_float(r.get("arr_at_churn", 0)) or 0 for r in rows)
+    arr_by_plan: dict[str, float] = defaultdict(float)
+    for r in rows:
+        arr_by_plan[r.get("plan_at_churn", "unknown")] += _to_float(r.get("arr_at_churn", 0)) or 0
+
+    bands = split_by_icp_band(rows)
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: churn diagnosis, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [churn-prediction-vs-churn-diagnosis, retention-cohort-curves-over-blended-rates]")
+    lines.append("contradictions_aware: [save-everyone-vs-let-the-wrong-fit-go]")
+    lines.append(f"client: {client}")
+    lines.append(f"churned_source: {churned_path}")
+    lines.append(f"churned_n: {n}")
+    lines.append(f"icp_fit_score_present: {icp_fit_present}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Churn diagnosis, {client}, {today}")
+    lines.append("")
+    lines.append(
+        f"Source: `{churned_path}` (rows: {n}; ingested {today}). This document diagnoses the population that has *already* churned. It does not predict which accounts will churn next; per the `churn-prediction-vs-churn-diagnosis` pattern, diagnosis comes first."
+    )
+    lines.append("")
+
+    lines.append("## 1. Cohort summary")
+    lines.append("")
+    lines.append(f"- Churned accounts: {n}")
+    lines.append(f"- ARR lost: ${total_arr:,.0f}")
+    lines.append("")
+    lines.append("ARR lost by plan:")
+    lines.append("")
+    lines.append("| Plan | Churned | ARR lost |")
+    lines.append("|---|---:|---:|")
+    plan_counts: Counter = Counter(r.get("plan_at_churn", "unknown") for r in rows)
+    for plan, plan_n in plan_counts.most_common():
+        lines.append(f"| {plan} | {plan_n} | ${arr_by_plan[plan]:,.0f} |")
+    lines.append("")
+
+    lines.append("Cohort size by ICP fit band:")
+    lines.append("")
+    lines.append("| Band | n | % of churned |")
+    lines.append("|---|---:|---:|")
+    for band, band_rows in bands.items():
+        if band_rows:
+            lines.append(f"| {band} | {len(band_rows)} | {len(band_rows) / n * 100:.1f}% |")
+    lines.append("")
+
+    lines.append("## 2. Ranked churn drivers (overall population)")
+    lines.append("")
+    lines.append(
+        "Each driver is scored on: (a) population coverage (% of churns it explains), and (b) addressability (1=hard market shift, 5=onboarding tweak). Rank score = coverage × addressability. A high-coverage but low-addressability driver and a low-coverage but high-addressability driver are both interesting; the rank surfaces both axes."
+    )
+    lines.append("")
+    lines.append("| Rank | Driver | Coverage | Addressability | Rank score | Hits |")
+    lines.append("|---:|---|---:|---:|---:|---:|")
+    for i, d in enumerate(drivers_overall, 1):
+        lines.append(
+            f"| {i} | {d['label']} | {d['coverage_pct']}% | {d['addressability_1to5']}/5 | {d['rank_score']} | {d['hits_n']} |"
+        )
+    lines.append("")
+
+    lines.append("## 3. Drivers by ICP-fit band")
+    lines.append("")
+    lines.append(
+        "Per the `save-everyone-vs-let-the-wrong-fit-go` contradiction, drivers behave differently across ICP-fit bands. The recommendation per band conditions on (a) which drivers dominate, and (b) the median time-in-product."
+    )
+    lines.append("")
+    for band, band_drivers in drivers_by_band.items():
+        if not band_drivers:
+            continue
+        rec = band_recommendations.get(band, {})
+        lines.append(f"### Band: {band} (n={len(bands[band])})")
+        lines.append("")
+        lines.append("| Driver | Coverage | Addressability |")
+        lines.append("|---|---:|---:|")
+        for d in band_drivers:
+            lines.append(f"| {d['label']} | {d['coverage_pct']}% | {d['addressability_1to5']}/5 |")
+        lines.append("")
+        lines.append(f"**Save-vs-let-go recommendation:** {rec.get('position', 'n/a')}")
+        lines.append("")
+        lines.append(f"_Rationale:_ {rec.get('rationale', '')}")
+        lines.append("")
+        if rec.get("median_days_in_product") is not None:
+            lines.append(f"_Median days in product:_ {rec['median_days_in_product']}; _late-stage share:_ {rec.get('late_stage_share_pct', 0)}%.")
+            lines.append("")
+
+    lines.append("## 4. Activation gap")
+    lines.append("")
+    activation_field_present = any("activation_event_hit" in r or "first_value_event_hit" in r for r in rows)
+    if activation_field_present:
+        never_activated = [r for r in rows if r.get("first_value_event_hit", "true").lower() in ("false", "0", "no", "")]
+        n_never = len(never_activated)
+        lines.append(
+            f"{n_never} of {n} churned accounts ({n_never / n * 100:.1f}%) never hit the first value event."
+        )
+        lines.append("")
+        if never_activated:
+            sources_never: Counter = Counter(r.get("signup_source", "unknown") for r in never_activated)
+            lines.append("Never-activated breakdown by signup source:")
+            lines.append("")
+            lines.append("| Source | n | % of never-activated |")
+            lines.append("|---|---:|---:|")
+            for source, count in sources_never.most_common():
+                lines.append(f"| {source} | {count} | {count / n_never * 100:.1f}% |")
+            lines.append("")
+    else:
+        lines.append("_Activation gap not computed: events data and activation flag missing._")
+        lines.append("")
+
+    lines.append("## 5. Usage decay pattern (30 days pre-churn)")
+    lines.append("")
+    if usage_dist:
+        lines.append(
+            f"Of {usage_dist['n']} accounts with usage data, median sessions in 30 days pre-churn: {usage_dist['median']}; mean {usage_dist['mean']}; zero-session share {usage_dist['zero_sessions_pct']}%."
+        )
+        lines.append("")
+        if usage_dist["zero_sessions_pct"] > 50:
+            lines.append(
+                "_Most churned accounts went silent before the formal cancellation. The leading signal of churn is silence; renewal-only outreach catches the cancellation but misses the leading indicator._"
+            )
+            lines.append("")
+    else:
+        lines.append("_Usage data missing._")
+        lines.append("")
+
+    lines.append("## 6. Support cluster signals")
+    lines.append("")
+    if support_top:
+        lines.append("| Category | Tickets among churned |")
+        lines.append("|---|---:|")
+        for cat, count in support_top:
+            lines.append(f"| {cat} | {count} |")
+        lines.append("")
+    else:
+        lines.append("_No support tickets data passed._")
+        lines.append("")
+
+    lines.append("## 7. NPS distribution among churned accounts")
+    lines.append("")
+    if nps_dist:
+        lines.append(
+            f"Of {nps_dist['n']} accounts with NPS, promoters {nps_dist['promoters_pct']}%, passives {nps_dist['passives_pct']}%, detractors {nps_dist['detractors_pct']}%; median {nps_dist['median']}."
+        )
+        lines.append("")
+        if nps_dist["detractors_pct"] >= 40:
+            lines.append("_Detractor share above 40% in churned cohort suggests the loyalty signal predates the cancellation. NPS data is leading; cancellation is lagging._")
+            lines.append("")
+    else:
+        lines.append("_NPS data missing._")
+        lines.append("")
+
+    lines.append("## 8. Self-reported reason clusters")
+    lines.append("")
+    if self_reason_buckets:
+        lines.append("| Bucket | n | Sample reasons |")
+        lines.append("|---|---:|---|")
+        for label, count, samples in self_reason_buckets:
+            sample_text = "; ".join(f'"{s}"' for s in samples)
+            lines.append(f"| {label} | {count} | {sample_text} |")
+        lines.append("")
+    else:
+        lines.append("_No self-reported reasons present._")
+        lines.append("")
+
+    lines.append("## 9. Substrate citations")
+    lines.append("")
+    lines.append(f"- Churned accounts: `{churned_path}` (rows: {n})")
+    lines.append(f"- ICP layer: `clients/{client}/icp/icp.md`")
+    lines.append(f"- VoC: `clients/{client}/voc/voc.md`")
+    lines.append(f"- Positioning: `clients/{client}/positioning/positioning.md`")
+    lines.append("- Pattern grounding: `knowledge/patterns/churn-prediction-vs-churn-diagnosis.md` (diagnose first, predict later).")
+    lines.append("- Pattern grounding: `knowledge/patterns/retention-cohort-curves-over-blended-rates.md` (cohort decomposition).")
+    lines.append("- Contradiction: `knowledge/contradictions/save-everyone-vs-let-the-wrong-fit-go.md` (per-band position pick logged).")
+    lines.append("")
+
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append(f"- `skills/win-back-sequence/bin/win-back-sequence --client {client} --diagnosis {out_path.name}`, design save sequences per band recommendation.")
+    lines.append(f"- `skills/icp-cut/bin/icp-cut --client {client}`, if low-fit churn dominates, the ICP layer needs sharpening.")
+    lines.append(f"- `skills/positioning-forge/bin/positioning-forge --client {client}`, if workflow-mismatch and 'not what I expected' dominate, positioning may be drifting.")
+    lines.append(f"- `routines/retention-monthly.md`, schedule the next read.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_json_and_csv(
+    json_path: Path,
+    csv_path: Path,
+    payload: dict,
+    drivers_overall: list[dict],
+) -> None:
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    cols = ["driver_id", "label", "coverage_pct", "addressability_1to5", "rank_score", "hits_n"]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=cols)
+        writer.writeheader()
+        for d in drivers_overall:
+            writer.writerow({k: d.get(k) for k in cols})
+
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/ (refusing, required for save-vs-let-go conditioning)")
+    return len(fails) == 0, fails
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--churned", required=True, help="churned-accounts CSV path")
+    parser.add_argument("--events", default=None, help="optional events CSV")
+    parser.add_argument("--support-tickets", default=None, help="optional support tickets CSV")
+    parser.add_argument("--top-drivers", type=int, default=5)
+    parser.add_argument("--strict-substrate", action="store_true")
+    args = parser.parse_args()
+
+    churned_path = Path(args.churned).resolve()
+    if not churned_path.is_file():
+        print(f"REFUSED: missing-churned-accounts, {churned_path} not found", file=sys.stderr)
+        return 3
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap (ICP layer required for save-vs-let-go conditioning)", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        if args.strict_substrate:
+            return 3
+        print("  (continuing without substrate; outputs will mark layers as gaps and tag low-confidence)", file=sys.stderr)
+
+    try:
+        rows, fields = load_churned(churned_path)
+    except ValueError as e:
+        print(f"REFUSED: missing-churned-accounts, {e}", file=sys.stderr)
+        return 3
+
+    if not rows:
+        print("REFUSED: missing-churned-accounts, CSV had no data rows", file=sys.stderr)
+        return 3
+
+    icp_fit_present = "icp_fit_score" in fields
+    if not icp_fit_present:
+        print("WARN: low-confidence, icp_fit_score column missing; band recommendations will use 'unknown'", file=sys.stderr)
+
+    print(f"[churn-diagnose] client={args.client} churned_n={len(rows)}", file=sys.stderr)
+
+    drivers_overall = rank_drivers(rows, args.top_drivers)
+    drivers_by_band = driver_breakdown_by_band(rows, args.top_drivers)
+    band_recommendations = {
+        band: save_vs_let_go_recommendation(band, band_rows)
+        for band, band_rows in split_by_icp_band(rows).items()
+        if band_rows
+    }
+    usage_dist = usage_distribution(rows)
+    nps_dist = nps_distribution(rows)
+    self_reason_buckets = cluster_self_reasons(rows)
+
+    support_top: list = []
+    if args.support_tickets:
+        try:
+            tickets = load_support_tickets(Path(args.support_tickets).resolve())
+            churned_ids = {r["account_id"] for r in rows}
+            support_top = support_cluster(tickets, churned_ids)
+        except Exception as e:
+            print(f"WARN: support-tickets unreadable, {e}", file=sys.stderr)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = SUBSTRATE_ROOT / "clients" / args.client / "retention"
+    md_path = out_dir / f"churn-diagnosis-{today}.md"
+    json_path = out_dir / f"churn-diagnosis-{today}.json"
+    csv_path = out_dir / f"churn-diagnosis-{today}-drivers.csv"
+
+    write_md(
+        md_path,
+        client=args.client,
+        churned_path=churned_path,
+        rows=rows,
+        drivers_overall=drivers_overall,
+        drivers_by_band=drivers_by_band,
+        band_recommendations=band_recommendations,
+        usage_dist=usage_dist,
+        support_top=support_top,
+        nps_dist=nps_dist,
+        self_reason_buckets=self_reason_buckets,
+        today=today,
+        icp_fit_present=icp_fit_present,
+    )
+    write_json_and_csv(
+        json_path,
+        csv_path,
+        payload={
+            "client": args.client,
+            "generated_at": today,
+            "churned_source": str(churned_path),
+            "churned_n": len(rows),
+            "drivers_overall": drivers_overall,
+            "drivers_by_band": drivers_by_band,
+            "band_recommendations": band_recommendations,
+            "usage_distribution": usage_dist,
+            "nps_distribution": nps_dist,
+            "self_reason_buckets": [
+                {"label": label, "n": count, "samples": samples}
+                for label, count, samples in self_reason_buckets
+            ],
+            "support_top": [{"category": c, "n": n} for c, n in support_top],
+            "icp_fit_present": icp_fit_present,
+        },
+        drivers_overall=drivers_overall,
+    )
+
+    print(f"[churn-diagnose] markdown: {md_path}")
+    print(f"[churn-diagnose] json:     {json_path}")
+    print(f"[churn-diagnose] csv:      {csv_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""csat-loop-design, design a closed-loop CSAT program spec.
+
+Reads ICP, VoC, brand-voice substrate; composes survey copy in brand voice;
+runs voice gate (kill-list, em-dash, throat-clearing); designs response
+routing per band with detractor conditioning on ICP fit per the
+save-everyone-vs-let-the-wrong-fit-go contradiction; writes a measurement
+contract; outputs a program spec markdown plus a JSON sidecar for lifecycle
+tooling.
+
+Usage:
+    csat-loop-design --client <client> \
+        [--cadence-floor-days 14] \
+        [--detractor-routing conditional|save-call|honest-close] \
+        [--promoter-routing all|reference|review-request|case-study] \
+        [--no-ask-share 0.30]
+
+Outputs:
+    clients/<client>/support/csat-program-spec-<date>.md
+    clients/<client>/support/csat-program-spec-<date>.json
+
+Exit codes:
+    0, spec written
+    3, preflight refusal (substrate-gap, missing-icp, missing-brand-voice,
+       cadence-too-frequent, voice-gate-failed)
+    4, invalid args
+
+Per the deflection-is-not-the-goal pattern, the CSAT loop is part of the
+right-routing system; the metric is "customer got the right answer," not
+"tickets deflected." Per tickets-are-product-feedback-channel, the open-text
+response is product-feedback substrate.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+# Voice gate. Mirrors the kill-list applied in voice-enforce.
+KILL_LIST = {
+    "orchestration", "seamless", "strategic", "leverage", "transform",
+    "holistic", "synergy", "bespoke", "unlock", "robust", "sophisticated",
+    "comprehensive",
+}
+THROAT_CLEAR_OPENERS = [
+    "we hope you're well", "we hope this finds you", "thanks so much for being",
+    "as you know", "we are excited to", "we are thrilled to",
+    "we wanted to reach out",
+]
+EM_DASH_RE = re.compile(r"—")  # em-dash
+EN_DASH_RE = re.compile(r"–")  # en-dash (also flagged in body)
+DOUBLE_HYPHEN_RE = re.compile(r"--")  # ASCII em-dash proxy
+
+
+def voice_gate(copy: str) -> tuple[bool, list[str]]:
+    """Run the voice gate. Returns (passed, list_of_findings)."""
+    findings: list[str] = []
+    lower = copy.lower()
+    for word in KILL_LIST:
+        pattern = r"(?:^|[^a-z])" + re.escape(word) + r"(?:[^a-z]|$)"
+        if re.search(pattern, lower):
+            findings.append(f"kill-list word: '{word}'")
+    if EM_DASH_RE.search(copy):
+        findings.append("em-dash (—) found in body")
+    if DOUBLE_HYPHEN_RE.search(copy):
+        findings.append("double-hyphen (--) found in body (em-dash proxy)")
+    for opener in THROAT_CLEAR_OPENERS:
+        if opener in lower:
+            findings.append(f"throat-clearing opener: '{opener}'")
+    return (len(findings) == 0, findings)
+
+
+def load_text_or_default(path: Path, default: str = "") -> str:
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    if path.is_dir():
+        # Concatenate any *.md inside, capped to 4 files
+        pieces: list[str] = []
+        for p in sorted(path.rglob("*.md"))[:4]:
+            try:
+                pieces.append(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+        return "\n\n".join(pieces)
+    return default
+
+
+def latest_diagnosis_json(client: str) -> Path | None:
+    retention_dir = SUBSTRATE_ROOT / "clients" / client / "retention"
+    if not retention_dir.is_dir():
+        return None
+    candidates = sorted(retention_dir.glob("churn-diagnosis-*.json"), reverse=True)
+    return candidates[0] if candidates else None
+
+
+def design_survey_copy(client_name: str) -> dict:
+    """Compose the survey copy. Plain English, customer-facing, voice-gated."""
+    primary = (
+        "On a scale of 1 (very dissatisfied) to 5 (very satisfied), "
+        "how satisfied were you with the support you received today?"
+    )
+    follow_up = "What is the primary reason for your score?"
+    consent_line = (
+        f"Your answer goes to the {client_name} support team. We read every reply. "
+        "We will not add you to any marketing list."
+    )
+    no_ask_thank_you = (
+        "Thanks for the 5. We are not going to ask you for anything. "
+        "Just wanted to say it lands; the team appreciates it."
+    )
+    save_call_invite = (
+        "Your last interaction did not land. We would like 15 minutes "
+        "to understand what is breaking, name a concrete next step, and "
+        "follow up in 7 days. Reply with a time that works."
+    )
+    honest_close = (
+        "Your last interaction did not land, and reading the history we want to be honest: "
+        "we may not be the right fit for what you are trying to do. "
+        "If that is the case, we want to make the off-ramp clean for you. "
+        "Reply if you would like a quick call to figure out next steps."
+    )
+    re_engage = (
+        "Thanks for the rating. The follow-up question we have for you: "
+        "what would have made this a 5? Whatever you write goes straight "
+        "into our product feedback queue."
+    )
+    return {
+        "primary_question": primary,
+        "follow_up_question": follow_up,
+        "consent_line": consent_line,
+        "no_ask_thank_you": no_ask_thank_you,
+        "save_call_invite": save_call_invite,
+        "honest_close": honest_close,
+        "re_engage_followup": re_engage,
+    }
+
+
+def detractor_routing_logic(detractor_routing: str) -> dict:
+    """Compose the detractor routing logic spec."""
+    if detractor_routing == "save-call":
+        return {
+            "mode": "save-call",
+            "all_detractors_route_to": "save-call",
+            "rationale": (
+                "Operator picked save-call for every detractor. Per the contradiction file, this is "
+                "Position A (Murphy/Mehta save-program orthodoxy). Note: applied as a global default, "
+                "this can produce a treadmill on low-fit detractors. Recommend reviewing at 90 days "
+                "against the band-conditioned alternative."
+            ),
+            "contradiction_position": "A",
+            "conditioning": "operator override (global)",
+        }
+    if detractor_routing == "honest-close":
+        return {
+            "mode": "honest-close",
+            "all_detractors_route_to": "honest-close",
+            "rationale": (
+                "Operator picked honest-close for every detractor. Per the contradiction file, this is "
+                "Position B (Reichheld/Elliott-McCrea correction). Applied globally on a healthy ICP this "
+                "could under-serve high-fit detractors who would respond to a save call. Recommend "
+                "reviewing at 90 days."
+            ),
+            "contradiction_position": "B",
+            "conditioning": "operator override (global)",
+        }
+    # conditional
+    return {
+        "mode": "conditional",
+        "high_fit_late_stage_route_to": "save-call",
+        "high_fit_early_stage_route_to": "save-call-with-activation-fix",
+        "mid_fit_route_to": "triage-on-tenure-and-expansion",
+        "low_fit_route_to": "honest-close",
+        "unknown_fit_route_to": "honest-close-default-with-flag",
+        "rationale": (
+            "Per the save-everyone-vs-let-the-wrong-fit-go contradiction, detractor routing conditions "
+            "on ICP fit and time-in-product. High-fit late-stage detractors get the save call (Position A). "
+            "Low-fit and unknown-fit detractors get the honest close (Position B); investing CS hours "
+            "in low-fit saves produces a treadmill. Mid-fit triages on tenure and expansion potential. "
+            "High-fit early-stage gets the save call paired with an activation-fix loop, since early "
+            "high-fit churn usually points at activation/onboarding failure, not loyalty failure."
+        ),
+        "contradiction_position": "Conditioned (per-band)",
+        "conditioning": "ICP fit band × time-in-product",
+    }
+
+
+def promoter_routing_logic(promoter_routing: str, no_ask_share: float) -> dict:
+    """Compose the promoter routing logic spec."""
+    branches: list[dict] = [
+        {
+            "branch_id": "no-ask",
+            "share_floor_pct": round(no_ask_share * 100, 1),
+            "trigger": "fraction of promoters per cycle",
+            "action": "send the no-ask thank-you note; do not request a reference, review, or case study.",
+            "rationale": (
+                "Reichheld: most loyalty programs over-ask promoters and burn goodwill. The no-ask "
+                "branch is required regardless of which other branches the operator picked. Floor: "
+                "the configured no-ask share."
+            ),
+        },
+    ]
+    if promoter_routing in ("all", "reference"):
+        branches.append({
+            "branch_id": "reference-request",
+            "trigger": "high-fit, late-stage, no reference asked in last 90 days",
+            "action": "send the reference-request copy with explicit '90-day no-ask' clause.",
+            "rationale": "References work when the customer is late-stage and high-fit. Cap at quarterly per account.",
+        })
+    if promoter_routing in ("all", "review-request"):
+        branches.append({
+            "branch_id": "review-request",
+            "trigger": "high-fit, active in a public review channel (G2 / Capterra / vertical site)",
+            "action": "send a review-request with a direct link.",
+            "rationale": "Public reviews compound on AEO presence over time; ask the right segment.",
+        })
+    if promoter_routing in ("all", "case-study"):
+        branches.append({
+            "branch_id": "case-study-track",
+            "trigger": "high-fit late-stage, hit a quantifiable outcome in the last 60 days",
+            "action": "route to the case-study production track.",
+            "rationale": "Case studies require a real outcome; route only when the outcome is fresh.",
+        })
+    return {
+        "mode": promoter_routing,
+        "branches": branches,
+        "no_ask_share": no_ask_share,
+    }
+
+
+def measurement_contract(client: str, today: str) -> dict:
+    """Compose the measurement contract."""
+    resolution = (datetime.fromisoformat(today) + timedelta(days=90)).strftime("%Y-%m-%d")
+    return {
+        "baseline_window_days": 28,
+        "predicted_metrics": [
+            {
+                "metric": "close-the-loop rate",
+                "definition": "share of CSAT responses that produce a routed action within 7 days",
+                "baseline_required": True,
+                "predicted_lift_pct": "operator-set after baseline window",
+                "resolution_date": resolution,
+            },
+            {
+                "metric": "promoter-to-reference conversion",
+                "definition": "share of routed promoter requests that produce a reference/review/case-study within 90 days",
+                "baseline_required": True,
+                "predicted_lift_pct": "operator-set after baseline window",
+                "resolution_date": resolution,
+            },
+            {
+                "metric": "detractor reactivation rate",
+                "definition": "share of routed detractor saves that result in account retention at 90 days",
+                "baseline_required": True,
+                "predicted_lift_pct": "operator-set after baseline window",
+                "resolution_date": resolution,
+            },
+        ],
+        "calibration_taste_types": ["retention", "narrative"],
+    }
+
+
+def write_md(
+    out_path: Path,
+    client: str,
+    today: str,
+    cadence_floor_days: int,
+    survey_copy: dict,
+    detractor_logic: dict,
+    promoter_logic: dict,
+    contract: dict,
+    voice_gate_findings: list[str],
+    diagnosis_path: Path | None,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: CSAT program spec, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [deflection-is-not-the-goal, tickets-are-product-feedback-channel]")
+    lines.append("contradictions_aware: [save-everyone-vs-let-the-wrong-fit-go]")
+    lines.append(f"client: {client}")
+    lines.append(f"cadence_floor_days: {cadence_floor_days}")
+    lines.append(f"detractor_routing_mode: {detractor_logic['mode']}")
+    lines.append(f"promoter_routing_mode: {promoter_logic['mode']}")
+    lines.append(f"contradiction_positions: [{detractor_logic.get('contradiction_position','Conditioned (per-band)')}]")
+    lines.append(f"position_rationale: {detractor_logic.get('conditioning','ICP fit band × time-in-product')}")
+    lines.append("produced_by: csat-loop-design")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# CSAT program spec, {client}, {today}")
+    lines.append("")
+    lines.append(
+        "Per `deflection-is-not-the-goal`, the CSAT loop is part of the right-routing system; the goal is the customer got the right answer, not tickets deflected. Per `tickets-are-product-feedback-channel`, the open-text response is product-feedback substrate that flows back into the cluster analysis."
+    )
+    lines.append("")
+
+    # 1. Survey design
+    lines.append("## 1. Survey design")
+    lines.append("")
+    lines.append("Single primary question:")
+    lines.append("")
+    lines.append(f"> {survey_copy['primary_question']}")
+    lines.append("")
+    lines.append("Single follow-up question:")
+    lines.append("")
+    lines.append(f"> {survey_copy['follow_up_question']}")
+    lines.append("")
+    lines.append(f"_{survey_copy['consent_line']}_")
+    lines.append("")
+
+    # 2. Send timing
+    lines.append("## 2. Send timing rules")
+    lines.append("")
+    lines.append("- Fires within 30 minutes of ticket resolution.")
+    lines.append("- Does not fire if the ticket was reopened within the last 7 days.")
+    lines.append(f"- Per-account cadence floor: {cadence_floor_days} days. A given account does not receive a CSAT survey more than once per floor window.")
+    lines.append("- Transactional only. Relational satisfaction is the NPS loop's job; do not blend.")
+    lines.append("")
+
+    # 3. Routing
+    lines.append("## 3. Response routing")
+    lines.append("")
+
+    # Promoter
+    lines.append("### Promoter band (score 5)")
+    lines.append("")
+    for b in promoter_logic["branches"]:
+        lines.append(f"- **{b['branch_id']}** — trigger: {b['trigger']}; action: {b['action']}")
+        lines.append(f"  _Rationale:_ {b['rationale']}")
+    lines.append("")
+    no_ask_share_pct = round(promoter_logic["no_ask_share"] * 100, 1)
+    lines.append(f"_The no-ask branch is required and routes a floor of {no_ask_share_pct}% of promoters per cycle. The branch sends a thank-you that does not ask for anything; per Reichheld, most loyalty programs over-ask promoters and burn the goodwill._")
+    lines.append("")
+    lines.append("Sample no-ask copy:")
+    lines.append("")
+    lines.append(f"> {survey_copy['no_ask_thank_you']}")
+    lines.append("")
+
+    # Passive
+    lines.append("### Passive band (score 3 or 4)")
+    lines.append("")
+    lines.append("- **re-engage** — trigger: any passive score; action: send the open-question follow-up below; route the verbatim answer into the product-feedback queue plus the next ticket-cluster-analysis run.")
+    lines.append("")
+    lines.append("Sample re-engage copy:")
+    lines.append("")
+    lines.append(f"> {survey_copy['re_engage_followup']}")
+    lines.append("")
+
+    # Detractor
+    lines.append("### Detractor band (score 1 or 2)")
+    lines.append("")
+    lines.append(f"Routing mode: **{detractor_logic['mode']}**")
+    lines.append("")
+    lines.append(
+        f"[contradiction:save-everyone-vs-let-the-wrong-fit-go] picked Position {detractor_logic.get('contradiction_position','Conditioned (per-band)')} because: {detractor_logic.get('conditioning','ICP fit band × time-in-product')}."
+    )
+    lines.append("")
+    lines.append(f"_Rationale:_ {detractor_logic.get('rationale','')}")
+    lines.append("")
+    if detractor_logic["mode"] == "conditional":
+        lines.append("Per-band routing:")
+        lines.append("")
+        lines.append("| ICP-fit band | Time-in-product | Route |")
+        lines.append("|---|---|---|")
+        lines.append(f"| high-fit | late-stage (>=90d) | {detractor_logic['high_fit_late_stage_route_to']} |")
+        lines.append(f"| high-fit | early-stage (<90d) | {detractor_logic['high_fit_early_stage_route_to']} |")
+        lines.append(f"| mid-fit | any | {detractor_logic['mid_fit_route_to']} |")
+        lines.append(f"| low-fit | any | {detractor_logic['low_fit_route_to']} |")
+        lines.append(f"| unknown | any | {detractor_logic['unknown_fit_route_to']} |")
+        lines.append("")
+    lines.append("Sample save-call copy (routed to high-fit detractors):")
+    lines.append("")
+    lines.append(f"> {survey_copy['save_call_invite']}")
+    lines.append("")
+    lines.append("Sample honest-close copy (routed to low-fit detractors):")
+    lines.append("")
+    lines.append(f"> {survey_copy['honest_close']}")
+    lines.append("")
+
+    # 4. Voice gate
+    lines.append("## 4. Voice gate result")
+    lines.append("")
+    if voice_gate_findings:
+        lines.append("Voice gate failed:")
+        lines.append("")
+        for f in voice_gate_findings:
+            lines.append(f"- {f}")
+    else:
+        lines.append("- All survey copy passes the voice gate (no kill-list words, no em-dashes in body, no throat-clearing openers).")
+    lines.append("")
+
+    # 5. Measurement contract
+    lines.append("## 5. Measurement contract")
+    lines.append("")
+    lines.append(f"- Baseline window: {contract['baseline_window_days']} days. The team measures current performance for this window before opening the goal; predicted lift is operator-set after baseline.")
+    lines.append("")
+    lines.append("| Metric | Definition | Resolution date |")
+    lines.append("|---|---|---|")
+    for m in contract["predicted_metrics"]:
+        lines.append(f"| {m['metric']} | {m['definition']} | {m['resolution_date']} |")
+    lines.append("")
+    lines.append(f"Calibration taste-types: `{', '.join(contract['calibration_taste_types'])}`. Honest losses count.")
+    lines.append("")
+
+    # 6. Substrate citations
+    lines.append("## 6. Substrate citations")
+    lines.append("")
+    lines.append(f"- ICP layer: `clients/{client}/icp/icp.md` (drives detractor routing band selection).")
+    lines.append(f"- VoC layer: `clients/{client}/voc/voc.md` (mirrors customer language in survey body).")
+    lines.append(f"- Brand voice: `clients/{client}/brand-voice/brand-voice.md` (drives the voice gate).")
+    if diagnosis_path:
+        lines.append(f"- Latest churn diagnosis: `{diagnosis_path.relative_to(SUBSTRATE_ROOT) if diagnosis_path.is_relative_to(SUBSTRATE_ROOT) else diagnosis_path}` (aligns detractor routing with the diagnosis recommendation per band).")
+    lines.append("- Pattern grounding: `knowledge/patterns/deflection-is-not-the-goal.md` (the goal is right-routing, not deflection).")
+    lines.append("- Pattern grounding: `knowledge/patterns/tickets-are-product-feedback-channel.md` (the open-text response is product feedback substrate).")
+    lines.append("- Contradiction: `knowledge/contradictions/save-everyone-vs-let-the-wrong-fit-go.md` (detractor routing position picked per band; conditioning logged above).")
+    lines.append("")
+
+    # 7. Composition / next reads
+    lines.append("## 7. Next reads")
+    lines.append("")
+    lines.append(f"- `skills/win-back-sequence/bin/win-back-sequence --client {client}` for the detractor save sequences (high-fit late-stage band).")
+    lines.append(f"- `skills/ticket-cluster-analysis/bin/ticket-cluster-analysis --client {client}` to feed survey open-text responses into the next cluster run.")
+    lines.append(f"- `skills/help-content-gap-detect/bin/help-content-gap-detect --client {client}` to use passive feedback to refine the gap queue.")
+    lines.append(f"- `routines/support-cluster-monthly.md` schedules the recurring loop.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--cadence-floor-days", type=int, default=14)
+    parser.add_argument("--detractor-routing", choices=["save-call", "honest-close", "conditional"], default="conditional")
+    parser.add_argument("--promoter-routing", choices=["all", "reference", "review-request", "case-study"], default="all")
+    parser.add_argument("--no-ask-share", type=float, default=0.30)
+    parser.add_argument("--out-dir", default=None)
+    args = parser.parse_args()
+
+    # Cadence floor refusal
+    if args.cadence_floor_days < 14:
+        print(
+            f"REFUSED: cadence-too-frequent, --cadence-floor-days={args.cadence_floor_days} below per-interaction floor of 14 days. "
+            "Per Reichheld and Bain CES research, sub-14-day per-account survey fatigue compounds quickly.",
+            file=sys.stderr,
+        )
+        return 3
+
+    # No-ask floor refusal (>= 0.20)
+    if args.no_ask_share < 0.20:
+        print(
+            f"REFUSED: no-ask-share-too-low, --no-ask-share={args.no_ask_share} is below the 0.20 floor. "
+            "Per Reichheld, the no-ask branch must route at least 20% of promoters; otherwise the program over-asks and burns goodwill.",
+            file=sys.stderr,
+        )
+        return 3
+
+    # Substrate preflight
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    fails: list[str] = []
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{args.client}/")
+    else:
+        if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+            fails.append(f"icp layer missing: clients/{args.client}/icp/")
+        if not (client_root / "voc").is_dir() and not (client_root / "voc.md").is_file():
+            fails.append(f"voc layer missing: clients/{args.client}/voc/")
+        if not (client_root / "brand-voice").is_dir() and not (client_root / "brand-voice.md").is_file():
+            fails.append(f"brand-voice layer missing: clients/{args.client}/brand-voice/")
+    if fails:
+        print("REFUSED: substrate-gap (icp + voc + brand-voice required for detractor routing and voice gate)", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        return 3
+
+    # Resolve client display name from BRIEF.md if present, else slug.
+    client_display = args.client
+    brief = client_root / "BRIEF.md"
+    if brief.is_file():
+        text = brief.read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r"^#\s+(.+)", text, re.MULTILINE)
+        if m:
+            client_display = m.group(1).strip()
+
+    # Compose copy
+    survey_copy = design_survey_copy(client_display)
+
+    # Voice gate: aggregate every customer-facing string and gate the union.
+    facing_keys = [
+        "primary_question", "follow_up_question",
+        "no_ask_thank_you", "save_call_invite", "honest_close", "re_engage_followup",
+    ]
+    aggregate = "\n\n".join(survey_copy[k] for k in facing_keys)
+    passed, findings = voice_gate(aggregate)
+    if not passed:
+        print("REFUSED: voice-gate-failed", file=sys.stderr)
+        for f in findings:
+            print(f"  - {f}", file=sys.stderr)
+        return 3
+
+    # Routing logic
+    detractor_logic = detractor_routing_logic(args.detractor_routing)
+    promoter_logic = promoter_routing_logic(args.promoter_routing, args.no_ask_share)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    contract = measurement_contract(args.client, today)
+
+    diagnosis_path = latest_diagnosis_json(args.client)
+
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else SUBSTRATE_ROOT / "clients" / args.client / "support"
+    md_path = out_dir / f"csat-program-spec-{today}.md"
+    json_path = out_dir / f"csat-program-spec-{today}.json"
+
+    write_md(
+        md_path,
+        client=client_display,
+        today=today,
+        cadence_floor_days=args.cadence_floor_days,
+        survey_copy=survey_copy,
+        detractor_logic=detractor_logic,
+        promoter_logic=promoter_logic,
+        contract=contract,
+        voice_gate_findings=findings,
+        diagnosis_path=diagnosis_path,
+    )
+
+    json_payload = {
+        "client": args.client,
+        "client_display": client_display,
+        "generated_at": today,
+        "cadence_floor_days": args.cadence_floor_days,
+        "survey_copy": survey_copy,
+        "detractor_logic": detractor_logic,
+        "promoter_logic": promoter_logic,
+        "measurement_contract": contract,
+        "voice_gate_passed": passed,
+        "voice_gate_findings": findings,
+        "diagnosis_alignment_source": str(diagnosis_path) if diagnosis_path else None,
+        "patterns_grounded": ["deflection-is-not-the-goal", "tickets-are-product-feedback-channel"],
+        "contradictions_aware": ["save-everyone-vs-let-the-wrong-fit-go"],
+    }
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(json_payload, indent=2), encoding="utf-8")
+
+    print(f"[csat-loop-design] markdown: {md_path}")
+    print(f"[csat-loop-design] json:     {json_path}")
+    if diagnosis_path:
+        print(f"[csat-loop-design] aligned with diagnosis: {diagnosis_path}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

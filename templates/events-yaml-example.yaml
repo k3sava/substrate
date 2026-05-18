@@ -1,0 +1,126 @@
+# events-yaml-example.yaml — starter template for clients/<client>/events.yaml.
+#
+# Read by skills/email-cohort-trigger and skills/email-sequence-design.
+#
+# Schema rules the skill enforces:
+#   - last_updated within freshness_window_days; otherwise refusal.
+#   - source_system declared (amplitude / segment / posthog / mixpanel / custom).
+#   - every event has last_observed; events past 90 days are flagged "decommissioned"
+#     candidates and the cohort-trigger skill refuses unless --accept-stale-events.
+#   - every cohort has enter_on, exit_on, timeout_days, and icp_cell.
+
+version: 0.1
+last_updated: 2026-05-08
+freshness_window_days: 30
+source_system: amplitude
+
+events:
+  - name: trial.started
+    description: A user created a new trial account.
+    surface: signup-flow
+    properties:
+      - email
+      - signup_source
+    icp_cells: [smb-ops-lead, mid-market-rev-ops]
+    last_observed: 2026-05-07
+
+  - name: trial.activated
+    description: User completed the activation milestone (first key product action).
+    surface: product-core
+    properties:
+      - first_activation_event
+      - account_id
+    icp_cells: [smb-ops-lead, mid-market-rev-ops]
+    last_observed: 2026-05-07
+
+  - name: trial.activated.no-teammate-96h
+    description: Trial activated but no teammate invited within 96 hours.
+    surface: derived-trigger
+    properties:
+      - account_id
+    icp_cells: [smb-ops-lead, mid-market-rev-ops]
+    last_observed: 2026-05-07
+
+  - name: team.member.invited
+    description: A teammate received an invite to the workspace.
+    surface: team-management
+    properties:
+      - inviter_id
+      - invitee_email
+    icp_cells: [smb-ops-lead, mid-market-rev-ops]
+    last_observed: 2026-05-07
+
+  - name: trial.cancelled
+    description: User cancelled the trial before conversion.
+    surface: billing
+    properties:
+      - cancellation_reason
+      - account_id
+    icp_cells: [smb-ops-lead, mid-market-rev-ops]
+    last_observed: 2026-05-04
+
+  - name: trial.converted
+    description: Trial converted to a paid plan.
+    surface: billing
+    properties:
+      - plan_tier
+      - mrr
+      - account_id
+    icp_cells: [smb-ops-lead, mid-market-rev-ops]
+    last_observed: 2026-05-07
+
+  - name: feature.advanced.used
+    description: User triggered an advanced feature for the first time, indicating power-user emergence.
+    surface: product-core
+    properties:
+      - feature_name
+      - account_id
+    icp_cells: [mid-market-rev-ops]
+    last_observed: 2026-05-06
+
+  - name: subscription.churn-risk-detected
+    description: Account flagged by the churn-risk model with score above threshold.
+    surface: derived-trigger
+    properties:
+      - score
+      - account_id
+    icp_cells: [smb-ops-lead, mid-market-rev-ops]
+    last_observed: 2026-05-07
+
+cohorts:
+  - id: paid-trial-stuck-on-activation
+    description: Trial users who activated but did not invite a teammate within 96 hours.
+    enter_on: trial.activated.no-teammate-96h
+    exit_on:
+      - team.member.invited
+      - trial.cancelled
+      - trial.converted
+      - cohort.timeout
+    timeout_days: 14
+    icp_cell: smb-ops-lead
+
+  - id: post-conversion-onboarding
+    description: New paying customers in their first 30 days.
+    enter_on: trial.converted
+    exit_on:
+      - subscription.churn-risk-detected
+      - cohort.timeout
+    timeout_days: 30
+    icp_cell: smb-ops-lead
+
+  - id: power-user-emerging
+    description: Customers who used an advanced feature for the first time; candidates for case-study or expansion outreach.
+    enter_on: feature.advanced.used
+    exit_on:
+      - cohort.timeout
+    timeout_days: 14
+    icp_cell: mid-market-rev-ops
+
+  - id: churn-risk-save
+    description: Accounts flagged as churn risk by the model.
+    enter_on: subscription.churn-risk-detected
+    exit_on:
+      - feature.advanced.used
+      - cohort.timeout
+    timeout_days: 21
+    icp_cell: mid-market-rev-ops

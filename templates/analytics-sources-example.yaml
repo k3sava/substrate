@@ -1,0 +1,169 @@
+# analytics-sources-example.yaml, starter template for clients/<client>/analytics/sources.yaml.
+#
+# Read by skills/analytics-pull, skills/attribution-model-design, skills/dashboard-spec.
+#
+# Schema rules the skills enforce:
+#   - At least one source must be declared, or analytics-pull refuses.
+#   - Each declared source must reference a known schema (amplitude, posthog,
+#     mixpanel, hubspot, stripe, segment, ga4). Unknown sources warn but skip.
+#   - Each source declares: api_base, project_id (or property_id / account_id),
+#     api_key_env (the env var name that holds the API key), refresh_cadence,
+#     last_audited (date last reviewed).
+#   - When api_key_env is set but the env var is missing at run time,
+#     analytics-pull falls back to mock-mode and logs the fallback.
+#   - The `channels` block declares which marketing/sales channels send traffic
+#     and the source-system that records each. attribution-model-design refuses
+#     without this block when the requested model needs multi-touch data.
+
+version: 0.1
+last_updated: 2026-05-08
+freshness_window_days: 90
+
+sources:
+  - name: amplitude
+    api_base: https://amplitude.com/api/2
+    project_id: 12345                          # Amplitude project (app) id
+    api_key_env: AMPLITUDE_API_KEY
+    secret_key_env: AMPLITUDE_SECRET_KEY
+    refresh_cadence: daily
+    last_audited: 2026-05-01
+    role: primary-product-analytics
+    notes: "Primary product event store. All in-product behavior lands here."
+
+  - name: posthog
+    api_base: https://app.posthog.com/api/projects/67890
+    project_id: 67890
+    api_key_env: POSTHOG_API_KEY
+    refresh_cadence: daily
+    last_audited: 2026-04-15
+    role: secondary-event-store
+    notes: "Mirror of marketing-site events plus session replay backing data."
+
+  - name: mixpanel
+    api_base: https://data.mixpanel.com/api/2.0
+    project_id: 1011121
+    api_key_env: MIXPANEL_API_KEY
+    api_secret_env: MIXPANEL_API_SECRET
+    refresh_cadence: daily
+    last_audited: 2026-04-10
+    role: deprecated-mirror
+    notes: "Decommission target. Migrating off in Q3 2026."
+
+  - name: hubspot
+    api_base: https://api.hubapi.com
+    portal_id: 8675309
+    api_key_env: HUBSPOT_API_KEY
+    refresh_cadence: hourly
+    last_audited: 2026-05-05
+    role: crm-and-marketing-events
+    notes: "Source of CRM truth. Owns lifecycle stages, deal data, marketing email events."
+
+  - name: stripe
+    api_base: https://api.stripe.com/v1
+    api_key_env: STRIPE_API_KEY
+    refresh_cadence: hourly
+    last_audited: 2026-05-05
+    role: revenue-and-subscription
+    notes: "Source of revenue truth. Owns invoice / charge / subscription events."
+
+  - name: segment
+    api_base: https://api.segmentapis.com
+    workspace_id: ws_abc123
+    api_key_env: SEGMENT_API_KEY
+    refresh_cadence: daily
+    last_audited: 2026-04-30
+    role: cdp-fan-out
+    notes: "CDP that fans events to amplitude + hubspot + warehouse. Read for cross-source reconciliation."
+
+  - name: ga4
+    api_base: https://analyticsdata.googleapis.com/v1beta
+    property_id: 314159265
+    api_key_env: GA4_API_KEY
+    refresh_cadence: daily
+    last_audited: 2026-04-20
+    role: marketing-site-attribution
+    notes: "Marketing-site analytics. Used for landing-page funnel + organic-search attribution only."
+
+# Marketing / sales channels, with the source-system that records each.
+# attribution-model-design reads this block to know which channels to credit and
+# which source-system has the corroborating signal.
+channels:
+  - name: paid-search
+    platform: google-ads
+    source_systems: [ga4, hubspot]
+    notes: "Google Ads campaigns. UTM-tagged. Referenced in HubSpot first-touch source."
+
+  - name: paid-social
+    platform: meta-ads
+    source_systems: [ga4, hubspot]
+    notes: "Meta paid campaigns. UTM-tagged. Pixel-tracked."
+
+  - name: linkedin-ads
+    platform: linkedin
+    source_systems: [linkedin-ads-api, hubspot]
+    notes: "B2B paid campaigns. Conversion lift studies run quarterly."
+
+  - name: organic-search
+    platform: google-organic
+    source_systems: [ga4]
+    notes: "Organic-search referrals. AEO + SEO surface."
+
+  - name: organic-social
+    platform: linkedin-twitter-organic
+    source_systems: [ga4]
+    notes: "Organic posts on linkedin / twitter. Tracked via UTM tags + referrer."
+
+  - name: email
+    platform: hubspot-marketing-email
+    source_systems: [hubspot, segment]
+    notes: "Lifecycle + nurture email."
+
+  - name: outbound
+    platform: outreach-or-equivalent
+    source_systems: [hubspot]
+    notes: "SDR outbound sequences. Touchpoint logged in HubSpot."
+
+  - name: referral
+    platform: word-of-mouth
+    source_systems: [ga4, hubspot]
+    notes: "Referral landings. Hard to attribute precisely; credit by self-report at signup."
+
+  - name: direct
+    platform: typed-url
+    source_systems: [ga4]
+    notes: "Direct visits. Mostly returning users + brand-search."
+
+  - name: content
+    platform: organic-blog-and-newsletter
+    source_systems: [ga4, hubspot]
+    notes: "Blog + newsletter referrals. Content-marketing surface."
+
+# Cohort definitions used across multiple skills (attribution + dashboards).
+# Each cohort references substrate (ICP) so the cohort moves with reality.
+cohorts:
+  - id: high-intent-trial
+    description: Trial users from paid-search or referral, mid-market team size
+    source_systems: [amplitude, hubspot]
+    icp_cell: mid-market-rev-ops
+    enter_on: signup
+    filters:
+      property_signup_source: [paid-search, referral]
+
+  - id: enterprise-pipeline
+    description: Active deals over $50K ARR
+    source_systems: [hubspot]
+    icp_cell: enterprise-rev-ops
+    enter_on: deal_created
+    filters:
+      property_company_size: ["501-1000", "1001+"]
+
+# Identity-resolution policy (which id is the canonical user-id across sources).
+# Read by analytics-pull's downstream consumers; the skill itself does not
+# unify identities, it just preserves each source's id field.
+identity_resolution:
+  primary_id: hubspot.contact_id
+  fallbacks:
+    - amplitude.user_id
+    - segment.user_id
+    - stripe.customer_id
+  join_strategy: "Resolution lives in the warehouse, not in analytics-pull. Each per-source CSV preserves the source-native id."

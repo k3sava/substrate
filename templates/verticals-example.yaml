@@ -1,0 +1,35 @@
+# verticals.yaml — per-client vertical registry
+#
+# Used by:
+#   - skills/pre-publish-check  (auto-detects vertical LP page-type)
+#   - skills/icp-cut            (vertical scoring inputs)
+#
+# Drop this file at: clients/<client>/verticals.yaml
+# Verticals are the named industries / customer segments the team builds
+# vertical playbooks for. Each vertical's slug + aliases are used by the
+# preflight gate to recognize a vertical landing page from its filename.
+#
+# Field reference:
+#   slug             required   short kebab-case identifier; must be unique
+#   display_name     optional   pretty name (default: humanized slug)
+#   aliases          optional   filename fragments that should match this vertical
+#                               (defaults to [slug]; supply alternates here)
+#   playbook_path    optional   relative path to the vertical playbook in the
+#                               client's substrate (used by audit tools, not gates)
+#
+# If this file is missing, pre-publish-check defaults vertical LP detection to
+# 'lead-capture'. No failure — the gate just runs the generic LP rubric.
+
+verticals:
+  - slug: example-industry-a
+    display_name: Example Industry A
+    aliases: [industry-a, example-a]
+    playbook_path: clients/sample-client/verticals/example-industry-a.md
+
+  - slug: example-industry-b
+    display_name: Example Industry B
+    aliases: [industry-b, example-b, b-vertical]
+
+  - slug: example-industry-c
+    display_name: Example Industry C
+    aliases: [industry-c]

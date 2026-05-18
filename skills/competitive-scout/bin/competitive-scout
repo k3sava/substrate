@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""competitive-scout — weekly competitive intel refresh via Exa search.
+
+Reads the competitive data bank, identifies stale competitor files,
+writes signal YAML files to the signals inbox for human approval.
+Runs headlessly via LaunchAgent or manually via: substrate competitive-scout
+
+The competitor registry lives at:
+    clients/<client>/competitors.yaml
+
+It is a per-client file. The skill refuses if the file is missing, since
+shipping a generic registry would force every operator's competitive analysis
+to start from someone else's defaults. See templates/competitors-example.yaml
+for the schema.
+
+Usage:
+    substrate competitive-scout --client <client>            # T1 competitors
+    substrate competitive-scout --client <client> --tier all # all tiers
+    substrate competitive-scout --client <client> --tier T2  # specific tier
+    substrate competitive-scout --client <client> --competitor <slug>  # single competitor
+    substrate competitive-scout --client <client> --dry-run  # print, don't write
+    substrate competitive-scout --client <client> --force    # ignore decay dates
+
+Exit codes:
+    0 — scout complete, signals written (or dry-run OK)
+    1 — no stale competitors found (nothing to do)
+    2 — Exa unavailable or runtime error
+    3 — refused (missing competitors.yaml or referenced client not found)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# SUBSTRATE_ROOT, with FLYWHEEL_ROOT as the deprecated fallback. Skill resolves
+# from its own location if neither is set.
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+# Decay defaults applied when a competitor's tier is named but the per-tier
+# decay fields are missing. The defaults block in competitors.yaml overrides
+# these.
+TIER_DEFAULTS = {
+    "T1": {"pricing_decay_days": 30, "features_decay_days": 60},
+    "T2": {"pricing_decay_days": 30, "features_decay_days": 90},
+    "T3": {"pricing_decay_days": 60, "features_decay_days": 90},
+    "T4": {"pricing_decay_days": 30, "features_decay_days": 90},
+}
+
+# Exa search templates per competitor. {name} = display_name; {brand} = the
+# operator's own brand from BRIEF.md (best-effort; falls back to the client slug).
+SEARCH_TEMPLATES = [
+    "{name} pricing {year}",
+    "{name} vs {brand}",
+    "{name} new features product update {year}",
+    "{name} G2 reviews {year}",
+    "{name} {brand} alternative",
+]
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    return 3
+
+
+def load_yaml(path: Path) -> dict | None:
+    """Tiny YAML parser. We avoid PyYAML so the skill ships zero-deps.
+
+    Supports the subset we use here: top-level keys, nested mappings two levels
+    deep, list-of-maps, and inline-array values for `aliases`. If the operator
+    has PyYAML installed we use it instead for robustness.
+    """
+    try:
+        import yaml  # type: ignore[import-not-found]
+
+        return yaml.safe_load(path.read_text())
+    except ImportError:
+        pass
+
+    text = path.read_text()
+    return _parse_minimal_yaml(text)
+
+
+def _parse_minimal_yaml(text: str) -> dict:
+    """Hand-rolled mini parser for competitors.yaml shape.
+
+    Limitations: no flow-style `{a: b}` mappings, no anchors, no multi-line
+    strings. The schema published in templates/competitors-example.yaml fits.
+    """
+    root: dict = {}
+    stack: list[tuple[int, dict | list]] = [(-1, root)]
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        # strip trailing comments
+        line = re.sub(r"(\s)#.*$", r"\1", raw).rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        # pop stack to current indent
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        stripped = line.strip()
+        # list item
+        if stripped.startswith("- "):
+            value_part = stripped[2:].strip()
+            if isinstance(parent, list):
+                # value-only list item
+                if ":" in value_part and not value_part.endswith(":"):
+                    k, _, v = value_part.partition(":")
+                    new_map = {k.strip(): _scalar(v.strip())}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+                elif value_part:
+                    parent.append(_scalar(value_part))
+                else:
+                    new_map = {}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+            else:
+                # parent should be list — coerce
+                pass
+            i += 1
+            continue
+        # key: value
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if not val:
+                # nested map or list begins next line
+                # peek ahead to decide
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines):
+                    next_line = lines[j]
+                    next_indent = len(next_line) - len(next_line.lstrip())
+                    if next_indent > indent and next_line.strip().startswith("- "):
+                        new_list: list = []
+                        if isinstance(parent, dict):
+                            parent[key] = new_list
+                        stack.append((indent, new_list))
+                    else:
+                        new_map: dict = {}
+                        if isinstance(parent, dict):
+                            parent[key] = new_map
+                        stack.append((indent, new_map))
+                else:
+                    if isinstance(parent, dict):
+                        parent[key] = {}
+            else:
+                if isinstance(parent, dict):
+                    parent[key] = _scalar_or_inline(val)
+        i += 1
+    return root
+
+
+def _scalar(v: str):
+    if v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    if v.startswith("'") and v.endswith("'"):
+        return v[1:-1]
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    if v.lower() in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    if re.fullmatch(r"-?\d+\.\d+", v):
+        return float(v)
+    return v
+
+
+def _scalar_or_inline(v: str):
+    """Handle inline arrays [a, b] and inline maps { k: v, k2: v2 }."""
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        if not inner:
+            return []
+        return [_scalar(p.strip()) for p in inner.split(",")]
+    if v.startswith("{") and v.endswith("}"):
+        inner = v[1:-1].strip()
+        out: dict = {}
+        if not inner:
+            return out
+        for pair in inner.split(","):
+            if ":" in pair:
+                k, _, vv = pair.partition(":")
+                out[k.strip()] = _scalar(vv.strip())
+        return out
+    return _scalar(v)
+
+
+def load_competitor_registry(client: str) -> dict:
+    """Load and normalize clients/<client>/competitors.yaml.
+
+    Returns dict: { slug: {tier, pricing_decay_days, features_decay_days,
+                          display_name, aliases, url} }.
+    Raises FileNotFoundError if competitors.yaml is missing.
+    """
+    yaml_path = SUBSTRATE_ROOT / "clients" / client / "competitors.yaml"
+    if not yaml_path.is_file():
+        raise FileNotFoundError(str(yaml_path))
+    raw = load_yaml(yaml_path) or {}
+    defaults = {**TIER_DEFAULTS, **(raw.get("defaults") or {})}
+    competitors = raw.get("competitors") or {}
+    registry: dict = {}
+    if isinstance(competitors, dict):
+        items = competitors.items()
+    elif isinstance(competitors, list):
+        # list-of-maps form: [{slug: ..., tier: ...}, ...]
+        items = ((it.get("slug"), it) for it in competitors if isinstance(it, dict) and it.get("slug"))
+    else:
+        items = []
+    for slug, block in items:
+        block = block or {}
+        tier = block.get("tier", "T1")
+        tier_defaults = defaults.get(tier, TIER_DEFAULTS["T1"])
+        registry[slug] = {
+            "tier": tier,
+            "pricing_decay_days": int(block.get("pricing_decay_days", tier_defaults["pricing_decay_days"])),
+            "features_decay_days": int(block.get("features_decay_days", tier_defaults["features_decay_days"])),
+            "display_name": block.get("display_name") or _humanize_slug(slug),
+            "aliases": block.get("aliases") or [slug],
+            "url": block.get("url"),
+        }
+    return registry
+
+
+def _humanize_slug(slug: str) -> str:
+    return " ".join(p.capitalize() for p in slug.split("-"))
+
+
+def parse_last_verified(path: Path) -> datetime | None:
+    """Extract 'Last verified:' date from data bank file frontmatter or body."""
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8")
+    m = re.search(r"last[_-]verified[:\s]+(\d{4}-\d{2}-\d{2})", text, re.IGNORECASE)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    m = re.search(r"\*\*Last verified:\*\*\s+(\d{4}-\d{2}-\d{2})", text)
+    if m:
+        try:
+            return datetime.strptime(m.group(1), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def find_data_bank_file(slug: str, data_bank: Path) -> Path | None:
+    """Find the most recent data bank file for a competitor slug."""
+    if not data_bank.exists():
+        return None
+    matches = sorted(data_bank.glob(f"{slug}-*.md"), reverse=True)
+    return matches[0] if matches else None
+
+
+def is_stale(slug: str, pricing_decay: int, data_bank: Path, force: bool = False) -> tuple[bool, str]:
+    if force:
+        return True, "forced"
+    db_file = find_data_bank_file(slug, data_bank)
+    if not db_file:
+        return True, "no data bank file"
+    last_verified = parse_last_verified(db_file)
+    if not last_verified:
+        return True, "last_verified date missing"
+    age_days = (datetime.now(timezone.utc) - last_verified).days
+    if age_days >= pricing_decay:
+        return True, f"pricing decay ({age_days}d >= {pricing_decay}d threshold)"
+    return False, f"fresh ({age_days}d old, threshold {pricing_decay}d)"
+
+
+def make_signal_id(client: str, slug: str, date: str) -> str:
+    h = hashlib.sha256(f"{client}-{slug}-{date}".encode()).hexdigest()[:8]
+    return f"{client}-competitive-{date}-{h}"
+
+
+def read_brand_from_brief(client: str) -> str:
+    """Best-effort: pull the operator's brand name from BRIEF.md.
+
+    Falls back to the client slug if BRIEF.md is missing or doesn't expose a
+    `brand:` frontmatter field.
+    """
+    brief_path = SUBSTRATE_ROOT / "clients" / client / "BRIEF.md"
+    if not brief_path.is_file():
+        return client
+    text = brief_path.read_text(encoding="utf-8")
+    m = re.search(r"^brand:\s*(.+)$", text, re.MULTILINE)
+    if m:
+        return m.group(1).strip().strip("'\"")
+    return client
+
+
+def run_exa_scout(slug: str, display_name: str, brand: str, dry_run: bool) -> list[dict]:
+    """Run Exa searches for a competitor via headless claude -p call.
+
+    Returns list of finding dicts. The prompt names the operator's brand from
+    BRIEF.md; no skill-level brand hardcoding.
+    """
+    year = datetime.now(timezone.utc).year
+    searches = [t.format(name=display_name, brand=brand, year=year) for t in SEARCH_TEMPLATES]
+    prompt = f"""You are running a competitive scout for {display_name} (a competitor of {brand}, slug: {slug}).
+Run the following Exa web searches and return a JSON array of findings.
+
+Searches to run:
+{chr(10).join(f"  - {s}" for s in searches)}
+
+For each search, capture:
+- query: the search query used
+- url: the most relevant URL found
+- title: page title
+- snippet: key excerpt (max 200 chars)
+- finding_type: one of: pricing_change | new_feature | new_comparison_page | g2_shift | rebrand | other
+- significance: high | medium | low
+- retrieval_date: today's date (YYYY-MM-DD)
+
+Focus on findings from the last 90 days only. If a search returns nothing useful, omit it from results.
+
+Return ONLY a valid JSON array. No prose. Example:
+[{{"query": "{display_name} pricing {year}", "url": "https://...", "title": "...", "snippet": "...", "finding_type": "pricing_change", "significance": "high", "retrieval_date": "{datetime.now(timezone.utc).date()}"}}]
+
+If no significant findings, return an empty array: []"""
+
+    if dry_run:
+        print(f"  [dry-run] Would search Exa for: {display_name}")
+        return [{
+            "query": searches[0],
+            "url": "DRY_RUN",
+            "title": "dry-run",
+            "snippet": "dry-run",
+            "finding_type": "other",
+            "significance": "low",
+            "retrieval_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        }]
+
+    try:
+        result = subprocess.run(
+            ["claude", "--print", "--output-format", "text"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={
+                **os.environ,
+                "SUBSTRATE_ROOT": str(SUBSTRATE_ROOT),
+                "FLYWHEEL_ROOT": str(SUBSTRATE_ROOT),
+            },
+        )
+        if result.returncode != 0:
+            print(f"  [warn] claude returned {result.returncode} for {slug}: {result.stderr[:200]}", file=sys.stderr)
+            return []
+        output = result.stdout.strip()
+        m = re.search(r"\[.*\]", output, re.DOTALL)
+        if not m:
+            return []
+        return json.loads(m.group(0))
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+        print(f"  [error] Exa scout failed for {slug}: {e}", file=sys.stderr)
+        return []
+
+
+def write_signal(
+    client: str,
+    slug: str,
+    display_name: str,
+    findings: list[dict],
+    signals_inbox: Path,
+    dry_run: bool,
+) -> list[str]:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    written: list[str] = []
+
+    significant = [f for f in findings if f.get("significance") in ("high", "medium")]
+    if not significant:
+        return []
+
+    signals_inbox.mkdir(parents=True, exist_ok=True)
+
+    for finding in significant:
+        signal_id = make_signal_id(client, slug, today)
+        finding_type = finding.get("finding_type", "other")
+        target_layer = {
+            "pricing_change": "competitive.md (pricing section)",
+            "new_feature": "competitive.md + product-knowledge",
+            "new_comparison_page": "competitive.md (displacement pages section)",
+            "g2_shift": "competitive.md + voc",
+            "rebrand": "competitive.md (all competitor name references)",
+        }.get(finding_type, "competitive.md")
+
+        signal_yaml = f"""---
+signal_id: {signal_id}
+type: competitive
+client: {client}
+competitor: {slug}
+competitor_display: {display_name}
+source: {finding.get('url', 'unknown')}
+ingested_at: {today}
+scout_run: competitive-scout
+---
+
+signal_type: {finding_type}
+significance: {finding.get('significance', 'medium')}
+target_layer: {target_layer}
+
+query: "{finding.get('query', '')}"
+url: {finding.get('url', '')}
+title: "{finding.get('title', '')}"
+retrieval_date: {finding.get('retrieval_date', today)}
+
+raw_content: |
+  {finding.get('snippet', '').replace(chr(10), chr(10) + '  ')}
+
+operator_options:
+  approve: apply as patch proposal via signal-analyst
+  reject: discard this signal
+  defer: wait for corroboration (expires in 14 days)
+"""
+        out_path = signals_inbox / f"{today}-{slug}-{finding_type}.yaml"
+        if dry_run:
+            print(f"  [dry-run] Would write: {out_path.name}")
+            print(f"    {finding_type} | {finding.get('significance')} | {finding.get('url', '')[:60]}")
+        else:
+            out_path.write_text(signal_yaml, encoding="utf-8")
+            written.append(str(out_path))
+            print(f"  wrote: {out_path.name}")
+
+    return written
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="competitive-scout — weekly intel refresh")
+    parser.add_argument(
+        "--client",
+        default=os.environ.get("SUBSTRATE_CLIENT") or os.environ.get("CLIENT"),
+        help="Client slug (default: $SUBSTRATE_CLIENT or $CLIENT)",
+    )
+    parser.add_argument("--tier", default="T1")
+    parser.add_argument("--competitor", help="single competitor slug to scout")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true", help="ignore decay dates, run all")
+    args = parser.parse_args()
+
+    if not args.client:
+        return refuse(
+            "competitive-scout requires --client <slug>",
+            "set SUBSTRATE_CLIENT or pass --client; the registry is per-client.",
+        )
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        return refuse(
+            f"client root missing: clients/{args.client}/",
+            f"run: bin/substrate-bootstrap-prospect {args.client}",
+        )
+
+    try:
+        registry = load_competitor_registry(args.client)
+    except FileNotFoundError as e:
+        return refuse(
+            f"competitors.yaml missing for client '{args.client}'",
+            f"create {e} from templates/competitors-example.yaml.\n"
+            "  see: templates/competitors-example.yaml for the schema.",
+        )
+
+    if not registry:
+        return refuse(
+            f"competitors.yaml has no competitors block for client '{args.client}'",
+            "add at least one competitor entry; see templates/competitors-example.yaml.",
+        )
+
+    data_bank = client_root / "substrate" / "competitive-data-bank"
+    signals_inbox = client_root / "signals" / "inbox"
+    intel_dir = SUBSTRATE_ROOT / "knowledge" / "intel"
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    print(f"[competitive-scout] {today} | client={args.client} | tier={args.tier} | dry_run={args.dry_run}")
+
+    # Build target list
+    if args.competitor:
+        if args.competitor not in registry:
+            return refuse(
+                f"competitor '{args.competitor}' not in clients/{args.client}/competitors.yaml",
+                f"known: {', '.join(sorted(registry))}",
+            )
+        targets = {args.competitor: registry[args.competitor]}
+    elif args.tier == "all":
+        targets = registry
+    else:
+        targets = {s: v for s, v in registry.items() if v["tier"] == args.tier}
+
+    if not targets:
+        print(f"[competitive-scout] no competitors at tier {args.tier} (registry has tiers: "
+              f"{sorted(set(v['tier'] for v in registry.values()))})")
+        return 1
+
+    stale_targets: dict[str, dict] = {}
+    for slug, info in targets.items():
+        stale, reason = is_stale(slug, info["pricing_decay_days"], data_bank, force=args.force)
+        if stale:
+            stale_targets[slug] = {**info, "reason": reason}
+            print(f"  stale: {slug} ({reason})")
+        else:
+            print(f"  fresh: {slug} ({reason})")
+
+    if not stale_targets:
+        print("[competitive-scout] no stale competitors. nothing to do.")
+        return 1
+
+    brand = read_brand_from_brief(args.client)
+    all_signals_written: list[str] = []
+    summary_rows: list[dict] = []
+
+    for slug, info in stale_targets.items():
+        display_name = info["display_name"]
+        print(f"\nscouting: {slug} ({info['tier']}) — {info['reason']}")
+        findings = run_exa_scout(slug, display_name, brand, args.dry_run)
+        written = write_signal(args.client, slug, display_name, findings, signals_inbox, args.dry_run)
+        all_signals_written.extend(written)
+        summary_rows.append({
+            "slug": slug,
+            "tier": info["tier"],
+            "findings_total": len(findings),
+            "signals_written": len(written),
+            "reason": info["reason"],
+        })
+
+    summary_lines = [
+        f"# Competitive Scout Run — {today}",
+        "",
+        f"**Client:** {args.client}  ",
+        f"**Tier scope:** {args.tier}  ",
+        f"**Stale competitors:** {len(stale_targets)}  ",
+        f"**Signals written:** {len(all_signals_written)}  ",
+        "",
+        "## Results",
+        "",
+        "| Competitor | Tier | Findings | Signals | Reason |",
+        "|---|---|---|---|---|",
+    ]
+    for row in summary_rows:
+        summary_lines.append(
+            f"| {row['slug']} | {row['tier']} | {row['findings_total']} | {row['signals_written']} | {row['reason']} |"
+        )
+
+    summary_lines += ["", "## Signal inbox", ""]
+    for sig in all_signals_written:
+        summary_lines.append(f"- `{Path(sig).name}`")
+
+    summary_lines += [
+        "",
+        "## Next steps",
+        "",
+        f"Run `substrate signal-analyst --client {args.client}` to generate patch proposals.",
+        f"Review proposals in `clients/{args.client}/signals/proposals/`.",
+        "Approve, reject, or defer each via `substrate-status`.",
+    ]
+
+    summary_path = intel_dir / f"competitive-scout-{args.client}-{today}.md"
+    if not args.dry_run:
+        intel_dir.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+        print(f"\n[competitive-scout] summary: {summary_path}")
+
+        # Best-effort git commit. Substrate is itself the repo, so cwd=SUBSTRATE_ROOT.
+        try:
+            subprocess.run(
+                ["git", "add", str(signals_inbox), str(summary_path)],
+                cwd=SUBSTRATE_ROOT,
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m",
+                 f"competitive-scout: {len(stale_targets)} competitors, {len(all_signals_written)} signals — {args.client} {today}"],
+                cwd=SUBSTRATE_ROOT,
+                check=True, capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"  [warn] git commit failed: {e}", file=sys.stderr)
+
+    print(f"\n[competitive-scout] done — {len(all_signals_written)} signals written")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

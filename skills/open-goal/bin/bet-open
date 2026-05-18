@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# bet-open — open a new goal on the substrate ledger.
+#
+# Usage:
+#   bet-open <goal-id> --baseline <text> --target <text> --window <YYYY-MM-DD..YYYY-MM-DD> \
+#            --measurement-source <text> --predicted-p <0.0-1.0> [--owner <name>] [--taste-type <type>]
+#   bet-open --interactive                 # prompt for fields
+#   bet-open --propose <goal-spec.md>      # promote a proposal-mode goal to ledger
+#
+# Appends a row to goals/ledger-<period>.md in the Active goals table.
+# Status defaults to 'proposed' (operator promotes to 'open' at sync).
+
+set -uo pipefail
+
+# Backwards-compat: accept FLYWHEEL_ROOT as deprecated alias for SUBSTRATE_ROOT.
+if [ -n "${FLYWHEEL_ROOT:-}" ] && [ -z "${SUBSTRATE_ROOT:-}" ]; then
+  echo "DEPRECATED: FLYWHEEL_ROOT is deprecated; use SUBSTRATE_ROOT." >&2
+  SUBSTRATE_ROOT="$FLYWHEEL_ROOT"
+fi
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+
+# Default ledger: most recent goals/ledger-*.md, falling back to goals/ledger.md.
+DEFAULT_LEDGER="$SUBSTRATE_ROOT/goals/ledger.md"
+QUARTER_LEDGER=$(ls -t "$SUBSTRATE_ROOT/goals/ledger-"*.md 2>/dev/null | head -1)
+LEDGER="${LEDGER:-${QUARTER_LEDGER:-$DEFAULT_LEDGER}}"
+
+cat <<EOF >&2
+bet-open: opens a goal on $LEDGER
+
+This skill is a thin appender. To add a goal, edit the ledger directly and
+add a row to "Active goals" with status=proposed:
+
+  | goal_id | taste_type | owner | baseline | target | window | measurement_source | predicted_p | status | resolution_date |
+
+To force-open a goal currently 'proposed', set status='open' in the row.
+
+If the ledger file does not exist yet, copy templates/ledger.md to
+goals/ledger-<period>.md and commit. The skill registers ledgers by recency,
+so the most recent file wins.
+EOF
+exit 64

@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""retention-cohort-analysis, compute cohort retention curves and detect slope changes.
+
+Reads a real events CSV, builds a cohort retention table, splits by activation
+status / signup source / persona, and runs a slope-change detector on the W4
+retention column versus a trailing 4-cohort baseline.
+
+Usage:
+    retention-cohort-analysis --client <client> --events <path> \
+        [--cohort-grain week|month] [--max-week 12] \
+        [--activation-event NAME] [--min-cohort-size 30]
+
+Outputs:
+    clients/<client>/retention/cohort-retention-<grain>-<date>.md
+    clients/<client>/retention/cohort-retention-<grain>-<date>.csv
+    clients/<client>/retention/cohort-retention-<grain>-<date>.json
+
+Exit codes:
+    0, analysis written
+    3, preflight refusal (substrate gap, missing events, early-signal-only)
+    4, invalid args
+
+Real cohort math: 7-day buckets from signup, session_active as the active gate,
+activation conditioned on a named event, slope-change detection with a trailing
+mean and population SD on the W4 retention column.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+DEFAULT_ACTIVATION_FALLBACK = "first_value_event"
+DEFAULT_ACTIVATION_WINDOW_HOURS = 24
+SLOPE_FLAG_SD = 1.5
+SLOPE_BASELINE_COHORTS = 4
+
+
+def parse_ts(value: str) -> datetime | None:
+    if not value:
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def load_events(path: Path) -> tuple[list[dict], int, set[str]]:
+    rows: list[dict] = []
+    event_names: set[str] = set()
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "user_id" not in reader.fieldnames or "event_name" not in reader.fieldnames or "ts" not in reader.fieldnames:
+            raise ValueError(
+                f"events CSV missing required columns. Found: {reader.fieldnames}"
+            )
+        for raw in reader:
+            ts = parse_ts(raw.get("ts", ""))
+            if not ts:
+                continue
+            rows.append({
+                "user_id": raw["user_id"],
+                "event_name": raw["event_name"],
+                "ts": ts,
+                "props": {k: v for k, v in raw.items() if k.startswith("property_")},
+            })
+            event_names.add(raw["event_name"])
+    return rows, len(rows), event_names
+
+
+def index_by_user(rows: list[dict]) -> dict[str, list[dict]]:
+    by_user: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_user[r["user_id"]].append(r)
+    for uid in by_user:
+        by_user[uid].sort(key=lambda x: x["ts"])
+    return by_user
+
+
+def signup_ts(events: list[dict]) -> datetime | None:
+    for ev in events:
+        if ev["event_name"] == "signup":
+            return ev["ts"]
+    return events[0]["ts"] if events else None
+
+
+def cohort_label(ts: datetime, grain: str) -> str:
+    """Bucket a signup timestamp into a cohort label."""
+    if grain == "month":
+        return ts.strftime("%Y-%m")
+    # ISO week
+    iso_year, iso_week, _ = ts.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
+def active_in_week(events: list[dict], signup: datetime, week: int) -> bool:
+    start = signup + timedelta(days=7 * (week - 1))
+    end = signup + timedelta(days=7 * week)
+    for ev in events:
+        if ev["event_name"] == "session_active" and start <= ev["ts"] < end:
+            return True
+    return False
+
+
+def hit_event_within(events: list[dict], event_name: str, signup: datetime, hours: int) -> bool:
+    cutoff = signup + timedelta(hours=hours)
+    for ev in events:
+        if ev["event_name"] == event_name and signup <= ev["ts"] <= cutoff:
+            return True
+    return False
+
+
+def stddev_pop(values: list[float]) -> float:
+    """Population standard deviation; safe on empty / single-value lists."""
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    var = sum((v - mean) ** 2 for v in values) / len(values)
+    return math.sqrt(var)
+
+
+def latest_event_ts(by_user: dict[str, list[dict]]) -> datetime:
+    latest = None
+    for events in by_user.values():
+        for ev in events:
+            if latest is None or ev["ts"] > latest:
+                latest = ev["ts"]
+    return latest or datetime.now(timezone.utc)
+
+
+def build_cohort_table(
+    by_user: dict[str, list[dict]],
+    grain: str,
+    max_week: int,
+    activation_event: str,
+    activation_window_hours: int,
+) -> tuple[dict, dict, dict]:
+    """
+    Returns:
+        cohort_data: {cohort_label: {n, w1..w_max, activated_n, activated_w1..,
+                      not_activated_n, not_activated_w1..,
+                      observation_floor_per_week}}
+        sources: per-cohort source breakdown
+        personas: per-cohort persona breakdown
+    """
+    cohort_data: dict[str, dict] = defaultdict(
+        lambda: {
+            "n": 0,
+            "activated_n": 0,
+            "not_activated_n": 0,
+            "weeks": {w: 0 for w in range(1, max_week + 1)},
+            "activated_weeks": {w: 0 for w in range(1, max_week + 1)},
+            "not_activated_weeks": {w: 0 for w in range(1, max_week + 1)},
+            "observation_eligible_per_week": {w: 0 for w in range(1, max_week + 1)},
+        }
+    )
+    sources: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    personas: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    latest_ts = latest_event_ts(by_user)
+
+    for uid, events in by_user.items():
+        signup = signup_ts(events)
+        if signup is None:
+            continue
+        label = cohort_label(signup, grain)
+        cohort = cohort_data[label]
+        cohort["n"] += 1
+        activated = hit_event_within(events, activation_event, signup, activation_window_hours)
+        if activated:
+            cohort["activated_n"] += 1
+        else:
+            cohort["not_activated_n"] += 1
+
+        signup_row = next((ev for ev in events if ev["event_name"] == "signup"), events[0])
+        source = signup_row["props"].get("property_signup_source", "unknown")
+        persona = signup_row["props"].get("property_persona", "unknown")
+        sources[label][source] += 1
+        personas[label][persona] += 1
+
+        for w in range(1, max_week + 1):
+            week_floor = signup + timedelta(days=7 * w)
+            # Only count this user toward week-w retention if the observation
+            # window has fully closed (week_floor <= latest_ts in the data).
+            if week_floor > latest_ts:
+                continue
+            cohort["observation_eligible_per_week"][w] += 1
+            if active_in_week(events, signup, w):
+                cohort["weeks"][w] += 1
+                if activated:
+                    cohort["activated_weeks"][w] += 1
+                else:
+                    cohort["not_activated_weeks"][w] += 1
+
+    return dict(cohort_data), dict(sources), dict(personas)
+
+
+def cohort_retention_pct(cohort: dict, week: int) -> float | None:
+    eligible = cohort["observation_eligible_per_week"][week]
+    if eligible == 0:
+        return None
+    return cohort["weeks"][week] / eligible * 100.0
+
+
+def detect_slope_changes(
+    cohort_data: dict,
+    target_week: int,
+    min_cohort_size: int,
+    sd_threshold: float,
+) -> list[dict]:
+    """Run slope-change detection on the target_week retention column."""
+    sorted_labels = sorted(cohort_data.keys())
+    flags: list[dict] = []
+    history: list[float] = []
+    for label in sorted_labels:
+        cohort = cohort_data[label]
+        ret = cohort_retention_pct(cohort, target_week)
+        if ret is None:
+            continue
+        if cohort["n"] < min_cohort_size:
+            flags.append({
+                "cohort": label,
+                "n": cohort["n"],
+                "w_target": target_week,
+                "ret": ret,
+                "flag": "early-signal",
+                "detail": f"cohort n={cohort['n']} < min {min_cohort_size}",
+            })
+            continue
+        if len(history) >= SLOPE_BASELINE_COHORTS:
+            baseline = history[-SLOPE_BASELINE_COHORTS:]
+            mean = sum(baseline) / len(baseline)
+            sd = stddev_pop(baseline)
+            if sd > 0:
+                z = (ret - mean) / sd
+                if z <= -sd_threshold:
+                    flags.append({
+                        "cohort": label,
+                        "n": cohort["n"],
+                        "w_target": target_week,
+                        "ret": round(ret, 1),
+                        "baseline_mean": round(mean, 1),
+                        "baseline_sd": round(sd, 2),
+                        "z": round(z, 2),
+                        "flag": "regression",
+                        "detail": f"W{target_week} {ret:.1f}% vs trailing-4 mean {mean:.1f}% (z={z:.2f})",
+                    })
+                elif z >= sd_threshold:
+                    flags.append({
+                        "cohort": label,
+                        "n": cohort["n"],
+                        "w_target": target_week,
+                        "ret": round(ret, 1),
+                        "baseline_mean": round(mean, 1),
+                        "baseline_sd": round(sd, 2),
+                        "z": round(z, 2),
+                        "flag": "improvement",
+                        "detail": f"W{target_week} {ret:.1f}% vs trailing-4 mean {mean:.1f}% (z={z:.2f})",
+                    })
+        history.append(ret)
+    return flags
+
+
+def write_csv_table(
+    out_path: Path,
+    cohort_data: dict,
+    max_week: int,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sorted_labels = sorted(cohort_data.keys())
+    cols = ["cohort", "n"] + [f"w{w}" for w in range(1, max_week + 1)]
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(cols)
+        for label in sorted_labels:
+            cohort = cohort_data[label]
+            row = [label, cohort["n"]]
+            for w in range(1, max_week + 1):
+                ret = cohort_retention_pct(cohort, w)
+                row.append("" if ret is None else f"{ret:.1f}")
+            writer.writerow(row)
+
+
+def write_md(
+    out_path: Path,
+    client: str,
+    events_path: Path,
+    events_count: int,
+    cohort_data: dict,
+    sources: dict,
+    personas: dict,
+    activation_event: str,
+    activation_window_hours: int,
+    max_week: int,
+    grain: str,
+    slope_flags: list[dict],
+    today: str,
+    min_cohort_size: int,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sorted_labels = sorted(cohort_data.keys())
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: cohort retention analysis, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [retention-cohort-curves-over-blended-rates, aha-moment-defines-activation]")
+    lines.append(f"client: {client}")
+    lines.append(f"cohort_grain: {grain}")
+    lines.append(f"activation_event: {activation_event}")
+    lines.append(f"activation_window_hours: {activation_window_hours}")
+    lines.append(f"max_week: {max_week}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Cohort retention by signup {grain}, {client}, {today}")
+    lines.append("")
+    lines.append(f"Source: `{events_path}` (rows: {events_count}; ingested {today})")
+    lines.append("")
+    lines.append(
+        f"Active definition: at least one `session_active` event within the 7-day window ending at week N from signup. Activation event: `{activation_event}` within {activation_window_hours} hours of signup."
+    )
+    lines.append("")
+
+    # Cohort retention table
+    cols = " | ".join([f"W{w}" for w in range(1, max_week + 1)])
+    lines.append("## Cohort retention table")
+    lines.append("")
+    lines.append(f"| Cohort ({grain}) | n | {cols} |")
+    lines.append("|---|---:|" + "---:|" * max_week)
+    for label in sorted_labels:
+        cohort = cohort_data[label]
+        cells: list[str] = []
+        for w in range(1, max_week + 1):
+            ret = cohort_retention_pct(cohort, w)
+            cells.append("—" if ret is None else f"{ret:.1f}%")
+        lines.append(f"| {label} | {cohort['n']} | " + " | ".join(cells) + " |")
+    lines.append("")
+
+    # Headline
+    eligible = [label for label in sorted_labels if cohort_data[label]["n"] >= min_cohort_size]
+    if eligible:
+        first = eligible[0]
+        last = eligible[-1]
+        first_w4 = cohort_retention_pct(cohort_data[first], min(4, max_week))
+        last_w4 = cohort_retention_pct(cohort_data[last], min(4, max_week))
+        if first_w4 is not None and last_w4 is not None:
+            delta = last_w4 - first_w4
+            direction = "decayed" if delta < 0 else "improved"
+            lines.append(
+                f"**Headline:** W{min(4, max_week)} retention {direction} from {first_w4:.1f}% (cohort {first}) to {last_w4:.1f}% (cohort {last}), a {delta:+.1f}pp shift over {len(eligible)} eligible cohorts."
+            )
+            lines.append("")
+
+    # Activation-conditioned table
+    lines.append("## Activation-conditioned retention")
+    lines.append("")
+    lines.append("Same cohorts split into 'activated within window' vs 'did not activate'.")
+    lines.append("")
+    target_week = min(4, max_week)
+    lines.append(f"| Cohort | Activated W{target_week} | Not-activated W{target_week} | Activation rate |")
+    lines.append("|---|---:|---:|---:|")
+    for label in sorted_labels:
+        cohort = cohort_data[label]
+        if cohort["n"] < min_cohort_size:
+            continue
+        # Activated retention
+        elig_act = sum(
+            1 for _ in range(cohort["observation_eligible_per_week"][target_week])
+        )
+        # Direct compute from per-cohort dicts:
+        act_ret = (
+            cohort["activated_weeks"][target_week] / cohort["activated_n"] * 100.0
+            if cohort["activated_n"] else 0.0
+        )
+        not_act_ret = (
+            cohort["not_activated_weeks"][target_week] / cohort["not_activated_n"] * 100.0
+            if cohort["not_activated_n"] else 0.0
+        )
+        act_rate = (
+            cohort["activated_n"] / cohort["n"] * 100.0
+            if cohort["n"] else 0.0
+        )
+        lines.append(
+            f"| {label} | {act_ret:.1f}% | {not_act_ret:.1f}% | {act_rate:.1f}% |"
+        )
+    lines.append("")
+
+    # Slope flags
+    lines.append("## Slope-change detection")
+    lines.append("")
+    lines.append(
+        f"Compares each cohort's W{target_week} retention to the trailing {SLOPE_BASELINE_COHORTS}-cohort mean. Flags fire at greater than {SLOPE_FLAG_SD} standard deviations."
+    )
+    lines.append("")
+    if slope_flags:
+        lines.append("| Cohort | Flag | n | Detail |")
+        lines.append("|---|---|---:|---|")
+        for f in slope_flags:
+            lines.append(f"| {f['cohort']} | {f['flag']} | {f['n']} | {f['detail']} |")
+    else:
+        lines.append("No slope changes detected. Retention is within trailing-baseline noise.")
+    lines.append("")
+
+    # Source / persona splits
+    if sorted_labels:
+        target_label = sorted_labels[-1]
+        cohort = cohort_data[target_label]
+        if cohort["n"] >= min_cohort_size:
+            lines.append(f"## Segment splits, cohort `{target_label}` at W{target_week}")
+            lines.append("")
+            # We need to recompute per-segment retention for this cohort.
+            lines.append("Source-level splits require the per-user data; the JSON sidecar carries the breakdown for downstream skills.")
+            lines.append("")
+            src_total = sources.get(target_label, {})
+            if src_total:
+                lines.append("Cohort composition by signup source:")
+                lines.append("")
+                lines.append("| Source | n |")
+                lines.append("|---|---:|")
+                for source, n in sorted(src_total.items(), key=lambda x: -x[1]):
+                    lines.append(f"| {source} | {n} |")
+                lines.append("")
+            persona_total = personas.get(target_label, {})
+            if persona_total:
+                lines.append("Cohort composition by persona:")
+                lines.append("")
+                lines.append("| Persona | n |")
+                lines.append("|---|---:|")
+                for persona, n in sorted(persona_total.items(), key=lambda x: -x[1]):
+                    lines.append(f"| {persona} | {n} |")
+                lines.append("")
+
+    # Substrate citations
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- Events export: `{events_path}` (rows: {events_count}; ingested {today})")
+    lines.append(f"- ICP layer: `clients/{client}/icp/icp.md`")
+    lines.append(f"- Activation event: per `clients/{client}/retention/activation-audit-*.json` if present, else fallback `{DEFAULT_ACTIVATION_FALLBACK}`.")
+    lines.append("- Pattern grounding: `knowledge/patterns/retention-cohort-curves-over-blended-rates.md` (cohort-conditioned retention math).")
+    lines.append("- Pattern grounding: `knowledge/patterns/aha-moment-defines-activation.md` (activation-conditioned splits).")
+    lines.append("")
+
+    lines.append("## Computation notes")
+    lines.append("")
+    lines.append("- Weeks since signup are computed in 7-day buckets from the signup timestamp, not calendar weeks.")
+    lines.append("- A user is 'active in W_n' if any `session_active` event lies within `[signup_ts + 7*(n-1), signup_ts + 7*n)`.")
+    lines.append("- A cohort is included in slope-change detection only if its `n >= " + str(min_cohort_size) + "`.")
+    lines.append("- Trailing baseline is the mean of the 4 prior eligible cohorts. SD is the population SD across the same window.")
+    lines.append(f"- Eligibility per week: a user only counts toward week-W retention if W*7 days have passed since their signup AND the events export covers up to that point.")
+    lines.append("")
+
+    lines.append("## Next reads")
+    lines.append("")
+    lines.append(f"- `skills/churn-diagnose/bin/churn-diagnose --client {client}`, diagnose churn drivers in cohorts flagged for regression.")
+    lines.append(f"- `skills/expansion-trigger-detect/bin/expansion-trigger-detect --client {client}`, find expansion triggers in retained cohorts.")
+    lines.append("- `routines/retention-monthly.md`, schedule the next read.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_json(
+    out_path: Path,
+    client: str,
+    events_path: Path,
+    events_count: int,
+    cohort_data: dict,
+    sources: dict,
+    personas: dict,
+    activation_event: str,
+    grain: str,
+    max_week: int,
+    slope_flags: list[dict],
+    today: str,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sorted_labels = sorted(cohort_data.keys())
+    table = []
+    for label in sorted_labels:
+        cohort = cohort_data[label]
+        row = {
+            "cohort": label,
+            "n": cohort["n"],
+            "activated_n": cohort["activated_n"],
+            "not_activated_n": cohort["not_activated_n"],
+            "weeks": {},
+            "activated_weeks": {},
+            "not_activated_weeks": {},
+            "observation_eligible_per_week": cohort["observation_eligible_per_week"],
+        }
+        for w in range(1, max_week + 1):
+            ret = cohort_retention_pct(cohort, w)
+            row["weeks"][f"w{w}"] = round(ret, 2) if ret is not None else None
+            act_ret = (
+                cohort["activated_weeks"][w] / cohort["activated_n"] * 100.0
+                if cohort["activated_n"] else None
+            )
+            not_act_ret = (
+                cohort["not_activated_weeks"][w] / cohort["not_activated_n"] * 100.0
+                if cohort["not_activated_n"] else None
+            )
+            row["activated_weeks"][f"w{w}"] = round(act_ret, 2) if act_ret is not None else None
+            row["not_activated_weeks"][f"w{w}"] = round(not_act_ret, 2) if not_act_ret is not None else None
+        table.append(row)
+
+    payload = {
+        "client": client,
+        "generated_at": today,
+        "events_source": str(events_path),
+        "events_row_count": events_count,
+        "activation_event": activation_event,
+        "cohort_grain": grain,
+        "max_week": max_week,
+        "cohort_table": table,
+        "sources_by_cohort": sources,
+        "personas_by_cohort": personas,
+        "slope_flags": slope_flags,
+    }
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def preflight(client: str) -> tuple[bool, list[str]]:
+    fails: list[str] = []
+    client_root = SUBSTRATE_ROOT / "clients" / client
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{client}/")
+        return False, fails
+    if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+        fails.append(f"icp layer missing: clients/{client}/icp/")
+    return len(fails) == 0, fails
+
+
+def resolve_activation_event(client: str, override: str | None) -> tuple[str, int]:
+    if override:
+        return override, DEFAULT_ACTIVATION_WINDOW_HOURS
+    audit_glob = sorted(
+        (SUBSTRATE_ROOT / "clients" / client / "retention").glob("activation-audit-*.json"),
+        reverse=True,
+    )
+    if audit_glob:
+        try:
+            data = json.loads(audit_glob[0].read_text())
+            ev = data.get("activation_event")
+            if ev:
+                return ev, DEFAULT_ACTIVATION_WINDOW_HOURS
+        except (OSError, json.JSONDecodeError):
+            pass
+    return DEFAULT_ACTIVATION_FALLBACK, DEFAULT_ACTIVATION_WINDOW_HOURS
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--events", required=True)
+    parser.add_argument("--cohort-grain", default="week", choices=["week", "month"])
+    parser.add_argument("--max-week", type=int, default=12)
+    parser.add_argument("--activation-event", default=None)
+    parser.add_argument("--min-cohort-size", type=int, default=30)
+    parser.add_argument("--strict-substrate", action="store_true")
+    args = parser.parse_args()
+
+    events_path = Path(args.events).resolve()
+    if not events_path.is_file():
+        print(f"REFUSED: events CSV not found at {events_path}", file=sys.stderr)
+        return 3
+
+    ok, fails = preflight(args.client)
+    if not ok:
+        print("REFUSED: substrate-gap", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        if args.strict_substrate:
+            return 3
+        print("  (continuing without substrate; outputs will mark layers as gaps)", file=sys.stderr)
+
+    try:
+        rows, count, _ = load_events(events_path)
+    except ValueError as e:
+        print(f"REFUSED: missing-events-export, {e}", file=sys.stderr)
+        return 3
+
+    by_user = index_by_user(rows)
+    if not by_user:
+        print("REFUSED: events file has no parseable rows", file=sys.stderr)
+        return 3
+
+    activation_event, window_hours = resolve_activation_event(args.client, args.activation_event)
+
+    print(
+        f"[retention-cohort-analysis] client={args.client} events={events_path.name} "
+        f"grain={args.cohort_grain} max_week={args.max_week} activation={activation_event}",
+        file=sys.stderr,
+    )
+
+    cohort_data, sources, personas = build_cohort_table(
+        by_user, args.cohort_grain, args.max_week, activation_event, window_hours
+    )
+
+    if not cohort_data:
+        print("REFUSED: no cohorts produced from events", file=sys.stderr)
+        return 3
+
+    eligible_cohorts = [c for c in cohort_data.values() if c["n"] >= args.min_cohort_size]
+    if not eligible_cohorts:
+        print(
+            f"REFUSED: early-signal-only, no cohort has n >= {args.min_cohort_size}",
+            file=sys.stderr,
+        )
+        # Still write the artifact so the operator can see the cohorts
+        # but exit 3 to surface the gap
+
+    target_week = min(4, args.max_week)
+    slope_flags = detect_slope_changes(
+        cohort_data, target_week, args.min_cohort_size, SLOPE_FLAG_SD
+    )
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = SUBSTRATE_ROOT / "clients" / args.client / "retention"
+    md_path = out_dir / f"cohort-retention-{args.cohort_grain}-{today}.md"
+    csv_path = out_dir / f"cohort-retention-{args.cohort_grain}-{today}.csv"
+    json_path = out_dir / f"cohort-retention-{args.cohort_grain}-{today}.json"
+
+    write_md(
+        md_path,
+        client=args.client,
+        events_path=events_path,
+        events_count=count,
+        cohort_data=cohort_data,
+        sources=sources,
+        personas=personas,
+        activation_event=activation_event,
+        activation_window_hours=window_hours,
+        max_week=args.max_week,
+        grain=args.cohort_grain,
+        slope_flags=slope_flags,
+        today=today,
+        min_cohort_size=args.min_cohort_size,
+    )
+    write_csv_table(csv_path, cohort_data, args.max_week)
+    write_json(
+        json_path,
+        client=args.client,
+        events_path=events_path,
+        events_count=count,
+        cohort_data=cohort_data,
+        sources=sources,
+        personas=personas,
+        activation_event=activation_event,
+        grain=args.cohort_grain,
+        max_week=args.max_week,
+        slope_flags=slope_flags,
+        today=today,
+    )
+
+    print(f"[retention-cohort-analysis] cohorts: {len(cohort_data)} (eligible: {len(eligible_cohorts)})", file=sys.stderr)
+    print(f"[retention-cohort-analysis] slope flags: {len(slope_flags)}", file=sys.stderr)
+    print(f"[retention-cohort-analysis] markdown: {md_path}")
+    print(f"[retention-cohort-analysis] csv:      {csv_path}")
+    print(f"[retention-cohort-analysis] json:     {json_path}")
+
+    if not eligible_cohorts:
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

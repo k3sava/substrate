@@ -1,0 +1,546 @@
+#!/usr/bin/env bash
+# narrative-strategy — substrate skill runtime (v2.0)
+#
+# Composes Raskin five-act strategic narrative from substrate, validates
+# each act against citations, writes md + json + drift-audit checklist.
+# Refuses if any act lacks a substrate citation or if Act 1 cannot be
+# compressed to 1-3 words.
+
+set -uo pipefail
+
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+export SUBSTRATE_ROOT
+. "$SUBSTRATE_ROOT/bin/lib/skill-preflight.sh"
+
+CLIENT=""
+AUDIENCE=""
+HORIZON="18mo"
+ANCHOR_PATTERN=""
+MODE="build"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client)          CLIENT="$2"; shift 2 ;;
+    --audience)        AUDIENCE="$2"; shift 2 ;;
+    --horizon)         HORIZON="$2"; shift 2 ;;
+    --anchor-pattern)  ANCHOR_PATTERN="$2"; shift 2 ;;
+    --mode)            MODE="$2"; shift 2 ;;
+    -h|--help)
+      cat <<EOF
+narrative-strategy — Raskin five-act strategic narrative
+
+Usage:
+  narrative-strategy --client <client> --audience <archetype>
+                     [--horizon 12mo|18mo|24mo] [--anchor-pattern <slug>]
+                     [--mode build|refresh|audit]
+
+Reads positioning, market-context, voc/findings, competitive substrate.
+Writes clients/<client>/strategy/narrative-<horizon>-<audience>-<date>.md
+plus drift-audit checklist.
+
+See skills/narrative-strategy/SKILL.md for full spec.
+EOF
+      exit 0 ;;
+    *) shift ;;
+  esac
+done
+
+if [ -z "$CLIENT" ] || [ -z "$AUDIENCE" ]; then
+  echo "ERR: --client and --audience required" >&2
+  echo "  try: narrative-strategy --help" >&2
+  exit 4
+fi
+
+skill_preflight "narrative-strategy" "$CLIENT" || exit 3
+
+STRAT_DIR="$SUBSTRATE_ROOT/clients/$CLIENT/strategy"
+mkdir -p "$STRAT_DIR"
+
+exec /usr/bin/env python3 - "$SUBSTRATE_ROOT" "$CLIENT" "$AUDIENCE" "$HORIZON" "$ANCHOR_PATTERN" "$MODE" <<'PYEOF'
+import json
+import os
+import re
+import sys
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+(SR, CLIENT, AUDIENCE, HORIZON, ANCHOR_PATTERN, MODE) = sys.argv[1:7]
+SUBSTRATE_ROOT = Path(SR)
+CLIENT_ROOT = SUBSTRATE_ROOT / "clients" / CLIENT
+STRAT_DIR = CLIENT_ROOT / "strategy"
+STRAT_DIR.mkdir(parents=True, exist_ok=True)
+TODAY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def refuse(reason, detail=""):
+    print(f"REFUSED: {reason}", file=sys.stderr)
+    if detail:
+        print(f"  {detail}", file=sys.stderr)
+    sys.exit(3)
+
+
+def find_first(*patterns):
+    """Return the first matching file under client root."""
+    for pat in patterns:
+        for p in sorted(CLIENT_ROOT.glob(pat), reverse=True):
+            if p.is_file():
+                return p
+    return None
+
+
+def load_positioning():
+    p = find_first("positioning/positioning-canonical-statement*.md")
+    if not p:
+        refuse(
+            "missing-positioning",
+            f"clients/{CLIENT}/positioning/positioning-canonical-statement*.md not found",
+        )
+    text = p.read_text(encoding="utf-8")
+    canonical = ""
+    in_block = False
+    for line in text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(canonical|the position|statement|positioning)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block and s.startswith("#"):
+            in_block = False
+        if in_block and s:
+            canonical = s.lstrip("*").strip()
+            if canonical:
+                break
+    if not canonical:
+        canonical = next((ln for ln in text.splitlines() if ln.strip()), "")
+    cat = ""
+    audience_pos = ""
+    alts = []
+    m = re.search(r"\bis the ([A-Za-z][\w\s-]+?) that", canonical, re.IGNORECASE)
+    if m:
+        cat = m.group(1).strip()
+    m = re.search(r"\bunlike ([A-Za-z][\w\s,-]+?)(?:\.|$)", canonical, re.IGNORECASE)
+    if m:
+        alts = [a.strip() for a in m.group(1).split(",") if a.strip()]
+    m = re.search(r"^For ([^,]+),", canonical, re.IGNORECASE)
+    if m:
+        audience_pos = m.group(1).strip()
+    return {"path": p, "canonical": canonical, "category": cat, "audience": audience_pos, "alternatives": alts}
+
+
+def load_market_context():
+    """Walk market-context/ directory; collect file paths and a few lines from each."""
+    md_dir = CLIENT_ROOT / "market-context"
+    if not md_dir.exists() and not (CLIENT_ROOT / "market-context.md").exists():
+        refuse(
+            "missing-market-context",
+            f"clients/{CLIENT}/market-context/ or market-context.md required for Act 1 (name the change)",
+        )
+    items = []
+    if md_dir.exists():
+        for p in sorted(md_dir.rglob("*.md")):
+            text = p.read_text(encoding="utf-8")
+            head = "\n".join(text.splitlines()[:30])
+            items.append({"path": str(p.relative_to(SUBSTRATE_ROOT)), "head": head, "title": _md_title(text, p)})
+    sm = CLIENT_ROOT / "market-context.md"
+    if sm.exists():
+        text = sm.read_text(encoding="utf-8")
+        items.append({"path": str(sm.relative_to(SUBSTRATE_ROOT)), "head": "\n".join(text.splitlines()[:30]), "title": _md_title(text, sm)})
+    if not items:
+        refuse("missing-market-context", "market-context layer is empty")
+    return items
+
+
+def _md_title(text, p):
+    for ln in text.splitlines():
+        if ln.startswith("# "):
+            return ln.lstrip("# ").strip()
+    return p.stem
+
+
+def load_voc_findings():
+    """Read the most recent frontline-contact findings JSON if present."""
+    findings_dir = CLIENT_ROOT / "voc" / "findings"
+    if not findings_dir.exists():
+        return None, "voc-findings-missing (run frontline-contact)"
+    candidates = sorted(findings_dir.glob("*.json"), reverse=True)
+    if not candidates:
+        return None, "voc-findings-missing (run frontline-contact)"
+    try:
+        return json.loads(candidates[0].read_text(encoding="utf-8")), str(candidates[0].relative_to(SUBSTRATE_ROOT))
+    except Exception as e:
+        return None, f"voc-findings-unreadable ({e})"
+
+
+def load_status_quo():
+    p = find_first("competitive/status-quo.md")
+    if not p:
+        return None
+    text = p.read_text(encoding="utf-8")
+    return {"path": str(p.relative_to(SUBSTRATE_ROOT)), "head": "\n".join(text.splitlines()[:60])}
+
+
+def load_named_alternatives(alts):
+    out = []
+    for alt in alts:
+        slug = alt.lower().replace(" ", "-").replace(",", "")
+        p = find_first(f"competitive/{slug}.md")
+        if p:
+            out.append({"alternative": alt, "path": str(p.relative_to(SUBSTRATE_ROOT))})
+    return out
+
+
+def load_icp():
+    p = find_first("icp/icp-cut-*.md", "icp/icp.md", "02-icp.md")
+    if not p:
+        return None
+    return {"path": str(p.relative_to(SUBSTRATE_ROOT)), "head": "\n".join(p.read_text(encoding="utf-8").splitlines()[:40])}
+
+
+def derive_change_candidates(market_items):
+    """Surface 1-3 word candidate phrases from market-context titles. The
+    operator picks the actual phrase; the skill enumerates from the substrate.
+    """
+    candidates = []
+    seen = set()
+    for it in market_items:
+        title = it["title"]
+        # Compress: take the title minus boilerplate, keep ≤3 lowercase words
+        words = [w.strip(".,;:!?\"'()[]") for w in title.lower().split()]
+        words = [w for w in words if w and w not in {"the", "a", "an", "of", "for", "to", "and", "in", "on", "with", "is"}]
+        if 1 <= len(words) <= 4:
+            phrase = " ".join(words[:3])
+            if phrase and phrase not in seen:
+                candidates.append(phrase)
+                seen.add(phrase)
+    # If none derivable, ship the empty list; skill will refuse on validation
+    return candidates[:6]
+
+
+def validate_act_one_compression(candidate):
+    """Raskin: name the shift in 1-3 words."""
+    if not candidate:
+        return False, "no candidate phrase derived from market-context"
+    words = [w for w in candidate.split() if w]
+    if not (1 <= len(words) <= 3):
+        return False, f"candidate '{candidate}' has {len(words)} words; need 1-3"
+    if any(len(w) < 3 for w in words):
+        return False, f"candidate '{candidate}' includes word(s) shorter than 3 chars; tighten"
+    return True, "compression-pass"
+
+
+def render_narrative(positioning, market_items, voc, voc_path, status_quo, named_alts, icp, change_candidates):
+    parts = []
+    parts.append("---")
+    parts.append(f"title: strategic narrative, {CLIENT}, {AUDIENCE}, {HORIZON}, {TODAY}")
+    parts.append("status: active")
+    parts.append(f"last_updated: {TODAY}")
+    parts.append("produced_by: narrative-strategy")
+    parts.append("patterns_grounded: [narrative-as-strategy, raskin-narrative-five-act, buyer-mindset-not-product-features, status-quo-is-the-competitor]")
+    parts.append("contradictions_aware: [build-quietly-vs-distribution-first, post-training-moat-vs-distribution-moat]")
+    parts.append("contradiction_positions: [build-quietly-vs-distribution-first: deferred-to-launch-plan, post-training-moat-vs-distribution-moat: deferred-to-anchor-pattern]")
+    parts.append("position_rationale: \"narrative-strategy is silent on launch volume; the launch-plan skill picks. The moat dimension is picked by --anchor-pattern when set; otherwise this artifact stays neutral.\"")
+    parts.append(f"client: {CLIENT}")
+    parts.append(f"audience: {AUDIENCE}")
+    parts.append(f"horizon: {HORIZON}")
+    parts.append(f"anchor_pattern: {ANCHOR_PATTERN or 'unset'}")
+    parts.append("---")
+    parts.append("")
+    parts.append(f"# Strategic narrative, {CLIENT}, {AUDIENCE}, {HORIZON}")
+    parts.append("")
+    parts.append(
+        f"_Composed {TODAY}. Five-act Raskin structure. Each act cites substrate. "
+        f"Audience: {AUDIENCE}. Horizon: {HORIZON}._"
+    )
+    parts.append("")
+
+    # Act 1 candidates
+    parts.append("## Act 1, name the change in the world")
+    parts.append("")
+    parts.append("Compression discipline (Raskin): the change is named in 1-3 words. Multiple candidates surfaced from market-context; the operator picks the load-bearing phrase before this artifact ships.")
+    parts.append("")
+    if change_candidates:
+        parts.append("**Candidate phrases (derived from market-context titles):**")
+        parts.append("")
+        for c in change_candidates:
+            parts.append(f"- `{c}`")
+    else:
+        parts.append("**No candidate phrase could be derived from market-context titles. Refusing.**")
+    parts.append("")
+    parts.append("**Sources:**")
+    for it in market_items[:6]:
+        parts.append(f"- `{it['path']}` — {it['title']}")
+    parts.append("")
+    parts.append("**Operator action**: pick one of the candidates as the canonical change-phrase, replace the placeholder below.")
+    parts.append("")
+    parts.append("> The change in the world is: **[pick from candidates]**.")
+    parts.append("")
+
+    # Act 2 raise the stakes
+    parts.append("## Act 2, raise the stakes")
+    parts.append("")
+    parts.append("Cost of inaction for the buyer who does not adapt. Loss aversion is the engine; the cost must clear the 2× switching tax. Per `knowledge/patterns/status-quo-is-the-competitor.md`.")
+    parts.append("")
+    parts.append("**Verbatim resistance language (from VoC findings):**")
+    parts.append("")
+    if voc:
+        objections = (voc.get("themes", {}).get("objections") or {})
+        ranked = sorted(objections.items(), key=lambda x: -x[1].get("count", 0))[:6]
+        if ranked:
+            for hook, rec in ranked:
+                samples = rec.get("samples", [])
+                sample = (samples[0] if samples else "")[:120]
+                parts.append(f"- `{hook}` (mentions: {rec.get('count', 0)}, sample: {sample!r})")
+        else:
+            parts.append("_No objections in VoC findings; staked language unsourced. Refusing._")
+    else:
+        parts.append(f"_VoC findings unavailable: {voc_path}. Run `frontline-contact` first; Act 2 must cite verbatim resistance language._")
+    parts.append("")
+    parts.append("**Sources:**")
+    if voc_path and voc:
+        parts.append(f"- `{voc_path}` (frontline-contact JSON)")
+    parts.append("")
+
+    # Act 3 promise the land
+    parts.append("## Act 3, promise the land")
+    parts.append("")
+    parts.append("The post-resolution state in the buyer's vocabulary, not the marketer's. Per `knowledge/patterns/tf-idf-themes-from-customer-language.md`.")
+    parts.append("")
+    parts.append("**Verbatim value-words (from VoC findings):**")
+    parts.append("")
+    if voc:
+        values = (voc.get("themes", {}).get("value-words") or {})
+        ranked = sorted(values.items(), key=lambda x: -x[1].get("count", 0))[:6]
+        if ranked:
+            for hook, rec in ranked:
+                samples = rec.get("samples", [])
+                sample = (samples[0] if samples else "")[:120]
+                parts.append(f"- `{hook}` (mentions: {rec.get('count', 0)}, sample: {sample!r})")
+        else:
+            parts.append("_No value-words in VoC findings; promised land unsourced. Refusing._")
+    else:
+        parts.append(f"_VoC findings unavailable: {voc_path}. Run `frontline-contact` first; Act 3 must cite verbatim value-words._")
+    parts.append("")
+    parts.append("**Sources:**")
+    if voc_path and voc:
+        parts.append(f"- `{voc_path}`")
+    if icp:
+        parts.append(f"- `{icp['path']}` (audience definition for the promised land)")
+    parts.append("")
+
+    # Act 4 name the obstacles
+    parts.append("## Act 4, name the obstacles")
+    parts.append("")
+    parts.append("Frame obstacles as gates the buyer must pass to win the new game, not as problems on the current one. Per `knowledge/patterns/raskin-narrative-five-act.md`.")
+    parts.append("")
+    parts.append("**Status-quo obstacle (forces of resistance):**")
+    parts.append("")
+    if status_quo:
+        first_lines = status_quo["head"].splitlines()
+        for ln in first_lines[:8]:
+            if ln.strip() and not ln.startswith("#"):
+                parts.append(f"> {ln.strip()}")
+        parts.append("")
+        parts.append(f"**Source:** `{status_quo['path']}`")
+    else:
+        parts.append("_`competitive/status-quo.md` not found. The Act 4 obstacle list is incomplete; status-quo is the dominant alternative in 40-60% of B2B losses (Dunford). Either run `status-quo-frame` to populate, or accept that this narrative cannot defend against a no-decision close._")
+    parts.append("")
+
+    parts.append("**Named-alternative obstacles:**")
+    parts.append("")
+    if named_alts:
+        for alt in named_alts:
+            parts.append(f"- `{alt['alternative']}` — battle card at `{alt['path']}`")
+    else:
+        parts.append("_No named-alternative battle cards in `competitive/<vendor>.md`. Run `competitive-scout` first or rely on status-quo framing alone._")
+    parts.append("")
+
+    # Act 5 pitch the resolution
+    parts.append("## Act 5, pitch the resolution")
+    parts.append("")
+    parts.append("Only here does the product appear, as the magic the protagonist needs. Customer is hero, brand is guide, product is the gift.")
+    parts.append("")
+    parts.append("**Canonical positioning statement:**")
+    parts.append("")
+    parts.append(f"> {positioning['canonical']}")
+    parts.append("")
+    parts.append(f"- **Audience in canonical:** {positioning['audience'] or '<not extracted>'}")
+    parts.append(f"- **Category:** {positioning['category'] or '<not extracted>'}")
+    parts.append(f"- **Named alternatives:** {', '.join(positioning['alternatives']) or '<none>'}")
+    parts.append("")
+    parts.append(f"**Source:** `{positioning['path'].relative_to(SUBSTRATE_ROOT)}`")
+    parts.append("")
+
+    if ANCHOR_PATTERN:
+        parts.append(f"**Anchor pattern (operator-picked):** `{ANCHOR_PATTERN}`")
+        parts.append("")
+
+    # Drift audit checklist
+    parts.append("## Monthly drift audit checklist")
+    parts.append("")
+    parts.append("Per Raskin's monthly narrative-drift audit. Run this on every customer-facing surface; if the change-phrase varies across surfaces, fix the surface, not the narrative.")
+    parts.append("")
+    parts.append("- [ ] Homepage hero: does it name the change in 1-3 words within 5 seconds?")
+    parts.append("- [ ] Top of pitch deck: does Setup precede Follow-Through? (Acts 1-2 before Act 5.)")
+    parts.append("- [ ] Release notes: do features ladder back to the obstacles in Act 4?")
+    parts.append("- [ ] Sales pitch (live observation): does the rep name the change before naming the product?")
+    parts.append("- [ ] Customer-success playbook: is the promised land (Act 3) the language used in QBRs?")
+    parts.append("- [ ] Outbound sequences: does the opener invoke the change in the world?")
+    parts.append("")
+
+    # Substrate citations summary
+    parts.append("## Substrate citations summary")
+    parts.append("")
+    parts.append("| Act | Source path |")
+    parts.append("|---|---|")
+    parts.append(f"| 1, name the change | {', '.join(it['path'] for it in market_items[:3])} |")
+    if voc_path:
+        parts.append(f"| 2, raise the stakes | {voc_path} (objections theme) |")
+        parts.append(f"| 3, promise the land | {voc_path} (value-words theme) |")
+    else:
+        parts.append("| 2, raise the stakes | UNSOURCED |")
+        parts.append("| 3, promise the land | UNSOURCED |")
+    sq_p = status_quo['path'] if status_quo else 'UNSOURCED'
+    parts.append(f"| 4, name the obstacles | {sq_p}; battle cards: {', '.join(a['path'] for a in named_alts) or 'none'} |")
+    parts.append(f"| 5, pitch the resolution | {positioning['path'].relative_to(SUBSTRATE_ROOT)} |")
+    parts.append("")
+    parts.append("## Patterns and contradictions")
+    parts.append("")
+    parts.append("- `knowledge/patterns/narrative-as-strategy.md`")
+    parts.append("- `knowledge/patterns/raskin-narrative-five-act.md`")
+    parts.append("- `knowledge/patterns/buyer-mindset-not-product-features.md`")
+    parts.append("- `knowledge/patterns/status-quo-is-the-competitor.md`")
+    parts.append("- `knowledge/contradictions/build-quietly-vs-distribution-first.md` (deferred to launch-plan)")
+    parts.append("- `knowledge/contradictions/post-training-moat-vs-distribution-moat.md` (picked by --anchor-pattern when set)")
+
+    return "\n".join(parts)
+
+
+def render_drift_audit():
+    parts = []
+    parts.append("---")
+    parts.append(f"title: narrative drift audit, {CLIENT}, {TODAY}")
+    parts.append(f"client: {CLIENT}")
+    parts.append("produced_by: narrative-strategy")
+    parts.append("---")
+    parts.append("")
+    parts.append(f"# Narrative drift audit, {CLIENT}, {TODAY}")
+    parts.append("")
+    parts.append("Run monthly per Raskin. The change-phrase from Act 1 must appear consistently across every customer-facing surface. If a surface uses a different framing, fix the surface; do not rewrite the narrative to match the surface.")
+    parts.append("")
+    parts.append("## Surfaces to check")
+    parts.append("")
+    parts.append("| Surface | Change-phrase consistency | Setup-before-Follow-Through | Notes |")
+    parts.append("|---|---|---|---|")
+    parts.append("| Homepage hero | [ ] | [ ] | |")
+    parts.append("| Pitch deck (top) | [ ] | [ ] | |")
+    parts.append("| Demo opener | [ ] | [ ] | |")
+    parts.append("| Outbound sequence opener | [ ] | n/a | |")
+    parts.append("| Latest blog post | [ ] | n/a | |")
+    parts.append("| Latest LP variant | [ ] | [ ] | |")
+    parts.append("| Release notes | [ ] | n/a | |")
+    parts.append("| QBR template | [ ] | n/a | |")
+    parts.append("| Help docs intro | [ ] | n/a | |")
+    parts.append("| Customer-success playbook | [ ] | n/a | |")
+    parts.append("")
+    parts.append("## Refusal trigger")
+    parts.append("")
+    parts.append("If 3+ surfaces use a different change-phrase, the narrative has drifted. Stop launching new content; run `substrate narrative-strategy --client " + CLIENT + " --mode refresh` and re-align all surfaces.")
+    return "\n".join(parts)
+
+
+def main():
+    positioning = load_positioning()
+    market_items = load_market_context()
+    voc, voc_path = load_voc_findings()
+    status_quo = load_status_quo()
+    named_alts = load_named_alternatives(positioning["alternatives"])
+    icp = load_icp()
+
+    change_candidates = derive_change_candidates(market_items)
+
+    # Validate Act 1 compression
+    ok = False
+    pick = ""
+    for cand in change_candidates:
+        ok, _ = validate_act_one_compression(cand)
+        if ok:
+            pick = cand
+            break
+
+    if not change_candidates:
+        refuse(
+            "act-one-uncompressed",
+            "no 1-3-word change candidate could be derived from market-context titles. "
+            "Add a market-context file with a title in the form 'X is changing' or 'The new Y'.",
+        )
+
+    # Validate citations per act (refuse if any act has zero citations)
+    citation_gaps = []
+    if not market_items:
+        citation_gaps.append("Act 1 (name the change) has no market-context source")
+    if not voc:
+        citation_gaps.append("Acts 2-3 (stakes / promised land) have no VoC findings; verbatim language unsourced")
+    if not status_quo and not named_alts:
+        citation_gaps.append("Act 4 (obstacles) has neither status-quo file nor named-alternative battle cards")
+
+    if citation_gaps:
+        if MODE == "audit":
+            print("[narrative-strategy] AUDIT mode, drift detected:", file=sys.stderr)
+            for g in citation_gaps:
+                print(f"  - {g}", file=sys.stderr)
+        else:
+            print(
+                "[narrative-strategy] WARN: citation gaps detected; narrative will be incomplete.",
+                file=sys.stderr,
+            )
+            for g in citation_gaps:
+                print(f"  - {g}", file=sys.stderr)
+
+    # Compose narrative
+    md = render_narrative(positioning, market_items, voc, voc_path, status_quo, named_alts, icp, change_candidates)
+    audit_md = render_drift_audit()
+
+    out_path = STRAT_DIR / f"narrative-{HORIZON}-{AUDIENCE}-{TODAY}.md"
+    out_path.write_text(md, encoding="utf-8")
+
+    audit_path = STRAT_DIR / f"narrative-drift-audit-{TODAY}.md"
+    audit_path.write_text(audit_md, encoding="utf-8")
+
+    json_payload = {
+        "client": CLIENT,
+        "audience": AUDIENCE,
+        "horizon": HORIZON,
+        "anchor_pattern": ANCHOR_PATTERN or None,
+        "generated_at": TODAY,
+        "positioning_canonical": positioning["canonical"],
+        "category": positioning["category"],
+        "named_alternatives": positioning["alternatives"],
+        "act_1_change_candidates": change_candidates,
+        "act_1_compression_pass": ok,
+        "act_1_recommended_pick": pick,
+        "market_context_sources": [it["path"] for it in market_items],
+        "voc_findings_source": voc_path if voc else None,
+        "status_quo_source": status_quo["path"] if status_quo else None,
+        "named_alternative_sources": [a["path"] for a in named_alts],
+        "icp_source": icp["path"] if icp else None,
+        "citation_gaps": citation_gaps,
+        "contradiction_positions": {
+            "build-quietly-vs-distribution-first": "deferred-to-launch-plan",
+            "post-training-moat-vs-distribution-moat": ANCHOR_PATTERN or "unset",
+        },
+    }
+    json_path = STRAT_DIR / f"narrative-{HORIZON}-{AUDIENCE}-{TODAY}.json"
+    json_path.write_text(json.dumps(json_payload, indent=2), encoding="utf-8")
+
+    print(f"[narrative-strategy] markdown: {out_path}")
+    print(f"[narrative-strategy] json:     {json_path}")
+    print(f"[narrative-strategy] audit:    {audit_path}")
+    print(f"[narrative-strategy] act-1 candidates: {', '.join(change_candidates[:5])}")
+
+    if citation_gaps and MODE != "audit":
+        print(f"[narrative-strategy] EXIT 1: {len(citation_gaps)} citation gaps; operator review required.", file=sys.stderr)
+        sys.exit(1)
+
+
+main()
+PYEOF

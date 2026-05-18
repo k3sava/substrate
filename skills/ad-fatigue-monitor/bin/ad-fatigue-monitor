@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""ad-fatigue-monitor — weekly scan of recent ad-diagnose outputs. Compares
+fatigue flags week-over-week, surfaces new / persistent / recovered creatives,
+and (optionally) primes a refresh-brief queue that ad-creative-design can
+consume.
+
+Refuses without recent diagnostic history. Refuses without canonical
+positioning (the brief queue cannot be primed).
+
+Usage:
+    ad-fatigue-monitor --client <client>
+                       [--diagnostics <dir>] [--lookback-weeks <int>]
+                       [--out <dir>] [--enqueue-briefs]
+
+Exit codes:
+    0 — flags written; no persistent fatigue
+    1 — flags written; persistent fatigue or production-cadence gap
+    3 — refused (substrate gap, no diagnostic history)
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+
+
+# Expected new-variant cadence per channel (per creative-fatigue-window pattern).
+EXPECTED_CADENCE_PER_WEEK = {
+    "meta-paid-social": 2,
+    "tiktok": 2,
+    "x": 2,
+    "reddit": 1,
+    "linkedin-sponsored": 1,
+    "google-pmax": 1,
+    "google-display": 1,
+    "google-search": 0,  # search creative does not fatigue on the same curve
+}
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def read_diagnostic_flags(path: Path) -> tuple[str, datetime, list[dict]]:
+    """Return (channel, date, flag_list) parsed from a diagnostic file."""
+    text = path.read_text(encoding="utf-8")
+    m = re.match(r"^(.+)-(\d{4}-\d{2}-\d{2})\.md$", path.name)
+    if not m:
+        return "", datetime.min, []
+    channel = m.group(1)
+    try:
+        date = datetime.strptime(m.group(2), "%Y-%m-%d")
+    except ValueError:
+        return channel, datetime.min, []
+
+    flags: list[dict] = []
+    in_section = False
+    cur_flag: dict | None = None
+    for line in text.splitlines():
+        s = line.rstrip()
+        if s.startswith("## Fatigue candidates"):
+            in_section = True
+            continue
+        if in_section and s.startswith("## "):
+            break
+        if not in_section:
+            continue
+        m2 = re.match(r"^- `([^`]+)`(?:\s+\(campaign\s+`([^`]+)`\))?", s)
+        if m2:
+            if cur_flag:
+                flags.append(cur_flag)
+            cur_flag = {
+                "creative_key": m2.group(1),
+                "campaign": m2.group(2) or "",
+                "reasons": [],
+            }
+            continue
+        if cur_flag and s.strip().startswith("- "):
+            reason = s.strip().lstrip("- ").strip()
+            if "peak_ctr" not in reason:  # skip the metrics summary line
+                cur_flag["reasons"].append(reason)
+    if cur_flag:
+        flags.append(cur_flag)
+    return channel, date, flags
+
+
+def load_history(diag_dir: Path, lookback_weeks: int) -> dict[str, list[tuple[datetime, list[dict]]]]:
+    """Returns {channel: [(date, flag_list), ...]} sorted by date desc."""
+    cutoff = datetime.utcnow() - timedelta(weeks=lookback_weeks + 1)
+    by_channel: dict[str, list[tuple[datetime, list[dict]]]] = defaultdict(list)
+    if not diag_dir.is_dir():
+        return {}
+    for f in sorted(diag_dir.glob("*.md")):
+        ch, date, flags = read_diagnostic_flags(f)
+        if not ch or date == datetime.min:
+            continue
+        if date < cutoff:
+            continue
+        by_channel[ch].append((date, flags))
+    for ch in by_channel:
+        by_channel[ch].sort(key=lambda t: t[0], reverse=True)
+    return dict(by_channel)
+
+
+def diff_flags(history: list[tuple[datetime, list[dict]]]) -> dict[str, list[dict]]:
+    """Compute new / persistent / recovered against the most recent history."""
+    if not history:
+        return {"new": [], "persistent": [], "recovered": []}
+    if len(history) == 1:
+        # First diagnostic; everything is "new"
+        return {"new": history[0][1], "persistent": [], "recovered": []}
+    latest_flags = history[0][1]
+    prior_flags = history[1][1]
+    latest_keys = {f["creative_key"] for f in latest_flags}
+    prior_keys = {f["creative_key"] for f in prior_flags}
+
+    new = [f for f in latest_flags if f["creative_key"] not in prior_keys]
+    persistent = [f for f in latest_flags if f["creative_key"] in prior_keys]
+    recovered = [f for f in prior_flags if f["creative_key"] not in latest_keys]
+
+    # For persistent, count consecutive weeks (walk back through history)
+    for f in persistent:
+        weeks = 1
+        for date, flags in history[1:]:
+            if any(g["creative_key"] == f["creative_key"] for g in flags):
+                weeks += 1
+            else:
+                break
+        f["consecutive_weeks"] = weeks
+
+    return {"new": new, "persistent": persistent, "recovered": recovered}
+
+
+def cadence_gap(briefs_dir: Path, channel: str, lookback_weeks: int) -> tuple[int, int, int]:
+    """Returns (briefs_filed_in_window, expected_in_window, gap)."""
+    expected_per_week = EXPECTED_CADENCE_PER_WEEK.get(channel, 1)
+    expected_in_window = expected_per_week * lookback_weeks
+    if not briefs_dir.is_dir():
+        return 0, expected_in_window, expected_in_window
+    cutoff = datetime.utcnow() - timedelta(weeks=lookback_weeks)
+    count = 0
+    for f in briefs_dir.glob(f"{channel}-*.md"):
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", f.name)
+        if m:
+            try:
+                d = datetime.strptime(m.group(1), "%Y-%m-%d")
+                if d >= cutoff:
+                    count += 1
+            except ValueError:
+                pass
+    return count, expected_in_window, max(0, expected_in_window - count)
+
+
+def render_flags_md(*,
+                    client: str,
+                    today: str,
+                    lookback_weeks: int,
+                    by_channel: dict[str, dict[str, list[dict]]],
+                    cadence_per_channel: dict[str, tuple[int, int, int]],
+                    diagnostics_read: list[Path],
+                    queued_briefs: list[Path]) -> str:
+    new_total = sum(len(v["new"]) for v in by_channel.values())
+    persistent_total = sum(len(v["persistent"]) for v in by_channel.values())
+    recovered_total = sum(len(v["recovered"]) for v in by_channel.values())
+
+    lines = []
+    lines.append("---")
+    lines.append(f"flags_id: {client}-fatigue-{today}")
+    lines.append(f"lookback_weeks: {lookback_weeks}")
+    lines.append("diagnostics_read:")
+    for p in diagnostics_read[:10]:
+        lines.append(f"  - {p.relative_to(SUBSTRATE_ROOT) if str(p).startswith(str(SUBSTRATE_ROOT)) else p}")
+    lines.append("substrate_layers_read: [icp, positioning]")
+    lines.append("patterns_applied: [creative-fatigue-window, intent-vs-interest-targeting]")
+    lines.append("flag_summary:")
+    lines.append(f"  new_count: {new_total}")
+    lines.append(f"  persistent_count: {persistent_total}")
+    lines.append(f"  recovered_count: {recovered_total}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# ad-fatigue-monitor: {client} | {today}")
+    lines.append("")
+    lines.append(f"Lookback: {lookback_weeks} weeks. Channels scanned: {len(by_channel)}.")
+    lines.append("")
+    lines.append(f"Pattern grounding: `knowledge/patterns/creative-fatigue-window.md`. "
+                 f"Refresh cadence is the lever; this monitor enforces visibility on the cadence gap.")
+    lines.append("")
+
+    lines.append("## New flags")
+    lines.append("")
+    if new_total == 0:
+        lines.append("None this week.")
+    else:
+        for channel, diff in sorted(by_channel.items()):
+            if not diff["new"]:
+                continue
+            lines.append(f"### `{channel}`")
+            lines.append("")
+            for f in diff["new"]:
+                lines.append(f"- `{f['creative_key']}` (campaign `{f['campaign']}`)")
+                for r in f["reasons"][:3]:
+                    lines.append(f"  - {r}")
+            lines.append("")
+
+    lines.append("## Persistent flags (refresh OVERDUE)")
+    lines.append("")
+    if persistent_total == 0:
+        lines.append("None.")
+    else:
+        for channel, diff in sorted(by_channel.items()):
+            if not diff["persistent"]:
+                continue
+            lines.append(f"### `{channel}`")
+            lines.append("")
+            for f in diff["persistent"]:
+                weeks = f.get("consecutive_weeks", 2)
+                lines.append(f"- **REFRESH OVERDUE: {weeks} weeks** `{f['creative_key']}` "
+                             f"(campaign `{f['campaign']}`)")
+                for r in f["reasons"][:3]:
+                    lines.append(f"  - {r}")
+                lines.append(f"  - Source: clients/{client}/ads/diagnostics/{channel}-*.md (most recent {weeks} files)")
+            lines.append("")
+
+    lines.append("## Recovered creatives")
+    lines.append("")
+    if recovered_total == 0:
+        lines.append("None.")
+    else:
+        for channel, diff in sorted(by_channel.items()):
+            if not diff["recovered"]:
+                continue
+            lines.append(f"### `{channel}`")
+            for f in diff["recovered"]:
+                lines.append(f"- `{f['creative_key']}` recovered (no longer flagged this week)")
+            lines.append("")
+
+    lines.append("## Cadence note")
+    lines.append("")
+    lines.append("Per `pat_creative-fatigue-window`, expected new-variant cadence per channel:")
+    lines.append("")
+    lines.append("| Channel | Briefs filed (last " + str(lookback_weeks) + "w) | Expected | Gap |")
+    lines.append("|---|---:|---:|---:|")
+    for channel in sorted(cadence_per_channel.keys()):
+        filed, expected, gap = cadence_per_channel[channel]
+        gap_marker = " **PRODUCTION GAP**" if gap > 0 else ""
+        lines.append(f"| `{channel}` | {filed} | {expected} | {gap}{gap_marker} |")
+    lines.append("")
+    if any(g > 0 for _, _, g in cadence_per_channel.values()):
+        lines.append("Production gap is the leading indicator of next-cycle CAC drift. Cite: "
+                     "`knowledge/patterns/creative-fatigue-window.md` §implication.")
+    else:
+        lines.append("No production gap this window.")
+    lines.append("")
+
+    lines.append("## Brief queue")
+    lines.append("")
+    if not queued_briefs:
+        lines.append("No briefs queued. Run with `--enqueue-briefs` to prime the queue from the flags above.")
+    else:
+        lines.append("Stub briefs written for `ad-creative-design` to open:")
+        lines.append("")
+        for b in queued_briefs:
+            rel = b.relative_to(SUBSTRATE_ROOT) if str(b).startswith(str(SUBSTRATE_ROOT)) else b
+            lines.append(f"- `{rel}`")
+        lines.append("")
+        lines.append("Open each via:")
+        lines.append("```")
+        lines.append(f"bin/substrate ad-creative-design --client {client} --channel <channel> \\")
+        lines.append("  --cohort <buyer-state-slug> --frame <status-quo|named-competitor> [--competitor <slug>]")
+        lines.append("```")
+    lines.append("")
+
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `ad-diagnose` — produces the per-week flags this monitor reads.")
+    lines.append("- `ad-creative-design` — consumes the brief queue this monitor primes.")
+    lines.append("- `routines/ad-fatigue-routine.md` — the cron / cadence wrapper.")
+    return "\n".join(lines)
+
+
+def write_brief_stub(*, client: str, channel: str, creative_key: str,
+                      reason: str, queue_dir: Path) -> Path:
+    """Write a brief stub that ad-creative-design can read as a TODO."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    safe_key = re.sub(r"[^a-z0-9]+", "-", creative_key.lower()).strip("-")
+    out_path = queue_dir / f"{channel}-refresh-{safe_key}-{today}.md"
+    content = (
+        f"---\n"
+        f"queue_id: {client}-{channel}-refresh-{safe_key}-{today}\n"
+        f"client: {client}\n"
+        f"channel: {channel}\n"
+        f"originating_creative: {creative_key}\n"
+        f"reason: |\n"
+        f"  {reason}\n"
+        f"queued_at: {today}\n"
+        f"status: pending-cohort-and-frame\n"
+        f"---\n"
+        f"\n# Refresh brief stub: {creative_key}\n\n"
+        f"This stub was queued by `ad-fatigue-monitor` because `{creative_key}` "
+        f"crossed a fatigue threshold:\n\n"
+        f"> {reason}\n\n"
+        f"## Operator decision required\n\n"
+        f"Before `ad-creative-design` can open this brief, decide:\n\n"
+        f"1. **Cohort**: which buyer-state cohort is this refresh targeting? "
+        f"`unaware`, `problem-aware`, `solution-aware`, `most-aware`, or a named persona.\n"
+        f"2. **Frame**: `status-quo` (no-decision is the real competitor) or "
+        f"`named-competitor`. If the latter, pick the competitor.\n"
+        f"3. **Variants**: how many briefs to generate (default 4).\n\n"
+        f"## Open the brief\n\n"
+        f"```\n"
+        f"bin/substrate ad-creative-design --client {client} --channel {channel} \\\n"
+        f"  --cohort <cohort> --frame <frame> [--competitor <slug>] [--variants 4]\n"
+        f"```\n\n"
+        f"## See also\n\n"
+        f"- `clients/{client}/ads/diagnostics/{channel}-*.md` — the diagnostic that flagged this creative.\n"
+        f"- `clients/{client}/ads/fatigue-flags/{today}.md` — this week's monitor output.\n"
+    )
+    out_path.write_text(content, encoding="utf-8")
+    return out_path
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="ad-fatigue-monitor")
+    p.add_argument("--client", required=True)
+    p.add_argument("--diagnostics", default=None)
+    p.add_argument("--lookback-weeks", type=int, default=4)
+    p.add_argument("--out", default=None)
+    p.add_argument("--enqueue-briefs", action="store_true")
+    args = p.parse_args()
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    pos_path = SUBSTRATE_ROOT / "clients" / args.client / "01-position.md"
+    if not pos_path.is_file():
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/01-position.md not found.")
+
+    diag_dir = Path(args.diagnostics) if args.diagnostics else (
+        SUBSTRATE_ROOT / "clients" / args.client / "ads" / "diagnostics"
+    )
+    history = load_history(diag_dir, args.lookback_weeks)
+    if not history:
+        return refuse("missing-diagnostic-history",
+                      f"no diagnostic files in last {args.lookback_weeks + 1} weeks at {diag_dir}. "
+                      f"Run `ad-diagnose` on a recent export first.")
+
+    diagnostics_read: list[Path] = []
+    by_channel: dict[str, dict[str, list[dict]]] = {}
+    for channel, hist in history.items():
+        diff = diff_flags(hist)
+        by_channel[channel] = diff
+        for date, _ in hist:
+            diagnostics_read.append(diag_dir / f"{channel}-{date.strftime('%Y-%m-%d')}.md")
+
+    # Cadence gap per channel
+    briefs_dir = SUBSTRATE_ROOT / "clients" / args.client / "ads" / "briefs"
+    cadence_per_channel: dict[str, tuple[int, int, int]] = {}
+    for channel in by_channel.keys():
+        cadence_per_channel[channel] = cadence_gap(briefs_dir, channel, args.lookback_weeks)
+
+    # Optional: prime the brief queue
+    queued: list[Path] = []
+    if args.enqueue_briefs:
+        queue_dir = briefs_dir / "_queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        for channel, diff in by_channel.items():
+            for f in diff["persistent"] + diff["new"]:
+                reason = f["reasons"][0] if f["reasons"] else "fatigue-threshold-crossed"
+                stub = write_brief_stub(
+                    client=args.client,
+                    channel=channel,
+                    creative_key=f["creative_key"],
+                    reason=reason,
+                    queue_dir=queue_dir,
+                )
+                queued.append(stub)
+
+    # Render and write
+    out_dir = Path(args.out) if args.out else (SUBSTRATE_ROOT / "clients" / args.client / "ads" / "fatigue-flags")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{today}.md"
+
+    md = render_flags_md(
+        client=args.client,
+        today=today,
+        lookback_weeks=args.lookback_weeks,
+        by_channel=by_channel,
+        cadence_per_channel=cadence_per_channel,
+        diagnostics_read=diagnostics_read,
+        queued_briefs=queued,
+    )
+    out_path.write_text(md, encoding="utf-8")
+
+    persistent_total = sum(len(v["persistent"]) for v in by_channel.values())
+    new_total = sum(len(v["new"]) for v in by_channel.values())
+    has_gap = any(g > 0 for _, _, g in cadence_per_channel.values())
+
+    sys.stderr.write(f"\n[ad-fatigue-monitor] wrote {out_path}\n")
+    sys.stderr.write(f"  channels: {len(by_channel)}  new: {new_total}  "
+                     f"persistent: {persistent_total}  briefs queued: {len(queued)}\n")
+    print(str(out_path))
+
+    if persistent_total > 0 or has_gap:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

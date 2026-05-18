@@ -1,0 +1,799 @@
+#!/usr/bin/env python3
+"""churn-signal-from-support, extract churn leading indicators from a tickets export.
+
+Reads a support tickets CSV (canonical shape: templates/support-tickets-example.csv).
+Optionally reads an accounts CSV with ARR / plan / signup metadata. Produces a per-
+account "support churn score" with severity bands plus a flagged-account list ranked
+by composite × ARR. Output feeds churn-diagnose, win-back-sequence, and the CS
+proactive-outreach queue.
+
+Usage:
+    churn-signal-from-support --client <client> --tickets <path> \
+        [--accounts <accounts.csv>] \
+        [--current-window-days 30] [--baseline-window-days 90] \
+        [--min-tickets-for-account 2] [--out-dir <path>]
+
+Outputs:
+    clients/<client>/support/churn-signal-from-support-<date>.md
+    clients/<client>/support/churn-signal-from-support-<date>.json
+    clients/<client>/support/churn-signal-from-support-flagged-<date>.csv
+
+Exit codes:
+    0, signal report written
+    3, preflight refusal (substrate-gap, missing-tickets, missing-icp,
+       schema-mismatch, account-id-missing, window-too-short)
+    4, invalid args
+
+Per the support-as-churn-leading-indicator pattern, support volume and sentiment
+lead churn by 30 to 90 days; this skill operationalises the pattern as a structured
+weekly read with five concrete features. Per churn-prediction-vs-churn-diagnosis,
+the read produces a triage queue, not predictions; operator review is required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from statistics import median
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+# Five leading-indicator features.
+# Operator-tunable thresholds defined here. Calibration matters per the pattern
+# note on sensitivity; the defaults below are the conservative starting point.
+VOLUME_SPIKE_RATIO = 2.0          # current rate >= 2x baseline rate fires
+RESPONSE_TIME_RISE_PCT = 50.0     # median rise >= 50% fires
+SENTIMENT_PROXY_DENSITY = 0.20    # >20% of account's tickets contain a keyword fires
+UNRESOLVED_ESCALATION_FLOOR = 1   # >=1 unresolved escalation in current window fires
+SILENCE_PRIOR_TICKETS = 3         # account had >=3 tickets in baseline AND 0 in current
+
+# Sentiment-proxy keyword list. Read against subject + body. The keyword set is
+# the load-bearing list; expanding it without recalibrating produces noisy false
+# positives. Conservative by default. Per the pattern, the calibration matters.
+SENTIMENT_PROXY_KEYWORDS = [
+    "refund", "cancel", "cancelling", "cancellation", "considering switching",
+    "considering cancelling", "moving back", "switched to", "moved to",
+    "disappointed", "regret", "frustrating", "unacceptable", "very annoying",
+    "ridiculous", "terrible", "horrible", "broken", "switching to your competitor",
+    "very disappointed", "this is unacceptable", "moving back to", "i am cancelling",
+    "i want to cancel", "process the refund", "partial refund", "partial refund",
+    "downgrade", "considering moving",
+]
+
+# Composite weights. Sum to 1.0 at full firing.
+WEIGHT_VOLUME = 0.25
+WEIGHT_RESPONSE = 0.20
+WEIGHT_SENTIMENT = 0.30
+WEIGHT_UNRESOLVED = 0.15
+WEIGHT_SILENCE = 0.10
+
+
+def parse_ts(value: str) -> datetime | None:
+    if not value:
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def to_float(val) -> float | None:
+    try:
+        if val is None or val == "":
+            return None
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def to_int(val) -> int | None:
+    try:
+        if val is None or val == "":
+            return None
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
+def to_bool(val) -> bool:
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    return s in ("true", "1", "yes", "y", "t")
+
+
+def load_tickets(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("tickets CSV has no header")
+        required = {"ticket_id", "account_id", "opened_at", "category", "subject", "body"}
+        missing = required - set(reader.fieldnames)
+        if missing:
+            raise ValueError(
+                f"tickets CSV missing required columns: {sorted(missing)}"
+            )
+        for raw in reader:
+            rows.append(dict(raw))
+    return rows
+
+
+def load_accounts(path: Path) -> dict[str, dict]:
+    """Index accounts CSV by account_id."""
+    by_id: dict[str, dict] = {}
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("accounts CSV has no header")
+        if "account_id" not in reader.fieldnames:
+            raise ValueError("accounts CSV missing required column: account_id")
+        for raw in reader:
+            aid = (raw.get("account_id") or "").strip()
+            if not aid:
+                continue
+            by_id[aid] = dict(raw)
+    return by_id
+
+
+def split_windows(
+    tickets: list[dict],
+    current_days: int,
+    baseline_days: int,
+) -> tuple[list[dict], list[dict], datetime, datetime, datetime, datetime]:
+    """Split tickets into current and baseline windows. Returns
+    (current_rows, baseline_rows, current_start, current_end, baseline_start, baseline_end).
+
+    Window anchor: latest ticket timestamp in the corpus. The current window covers
+    [latest - current_days, latest]; the baseline covers [latest - current_days -
+    baseline_days, latest - current_days].
+    """
+    parsed: list[tuple[datetime, dict]] = []
+    for r in tickets:
+        ts = parse_ts(r.get("opened_at", ""))
+        if ts is None:
+            continue
+        parsed.append((ts, r))
+    if not parsed:
+        raise ValueError("no parseable opened_at timestamps in tickets corpus")
+    parsed.sort(key=lambda x: x[0])
+    latest = parsed[-1][0]
+    current_end = latest
+    current_start = latest - timedelta(days=current_days)
+    baseline_end = current_start
+    baseline_start = baseline_end - timedelta(days=baseline_days)
+    current_rows: list[dict] = []
+    baseline_rows: list[dict] = []
+    for ts, r in parsed:
+        if current_start <= ts <= current_end:
+            r["_ts"] = ts.isoformat()
+            current_rows.append(r)
+        elif baseline_start <= ts < current_end - timedelta(days=current_days):
+            r["_ts"] = ts.isoformat()
+            baseline_rows.append(r)
+    return current_rows, baseline_rows, current_start, current_end, baseline_start, baseline_end
+
+
+def has_sentiment_keyword(text: str) -> tuple[bool, str | None]:
+    """Return (matched, keyword). Lowercase text scan. Returns the longest
+    matching keyword for transparency in the report."""
+    lower = (text or "").lower()
+    matched: str | None = None
+    for kw in SENTIMENT_PROXY_KEYWORDS:
+        pattern = r"(?:^|[^a-z])" + re.escape(kw) + r"(?:[^a-z]|$)"
+        if re.search(pattern, lower):
+            if matched is None or len(kw) > len(matched):
+                matched = kw
+    return (matched is not None, matched)
+
+
+def per_account_features(
+    current: list[dict],
+    baseline: list[dict],
+    current_days: int,
+    baseline_days: int,
+    min_tickets: int,
+) -> dict[str, dict]:
+    """Compute per-account leading-indicator features.
+
+    Returns dict keyed by account_id with the five feature scores plus the raw
+    aggregates that fed them. Accounts with fewer than min_tickets in either
+    window are still scored on what they have, with the non-fireable features
+    flagged in the output.
+    """
+    by_account_current: dict[str, list[dict]] = defaultdict(list)
+    by_account_baseline: dict[str, list[dict]] = defaultdict(list)
+    for r in current:
+        by_account_current[r.get("account_id", "")].append(r)
+    for r in baseline:
+        by_account_baseline[r.get("account_id", "")].append(r)
+
+    all_account_ids = set(by_account_current.keys()) | set(by_account_baseline.keys())
+    all_account_ids.discard("")
+
+    features: dict[str, dict] = {}
+    for aid in all_account_ids:
+        cur_rows = by_account_current.get(aid, [])
+        base_rows = by_account_baseline.get(aid, [])
+        cur_n = len(cur_rows)
+        base_n = len(base_rows)
+
+        # Volume spike (per-day rate)
+        cur_rate = cur_n / max(1, current_days)
+        base_rate = base_n / max(1, baseline_days)
+        if base_rate > 0:
+            volume_ratio = cur_rate / base_rate
+        else:
+            volume_ratio = float("inf") if cur_rate > 0 else 0.0
+        volume_fires = (
+            (cur_n + base_n >= min_tickets)
+            and (volume_ratio >= VOLUME_SPIKE_RATIO)
+        )
+        # Cap volume_score for composite math; a 5x ratio scores 1.0
+        volume_score = min(1.0, max(0.0, (volume_ratio - 1.0) / 4.0)) if cur_n + base_n >= min_tickets else 0.0
+
+        # Response-time elevation
+        cur_rt = [to_float(r.get("resolution_time_hours")) for r in cur_rows]
+        cur_rt = [v for v in cur_rt if v is not None]
+        base_rt = [to_float(r.get("resolution_time_hours")) for r in base_rows]
+        base_rt = [v for v in base_rt if v is not None]
+        cur_rt_med = median(cur_rt) if cur_rt else None
+        base_rt_med = median(base_rt) if base_rt else None
+        rt_rise_pct = None
+        rt_fires = False
+        if cur_rt_med is not None and base_rt_med is not None and base_rt_med > 0:
+            rt_rise_pct = ((cur_rt_med - base_rt_med) / base_rt_med) * 100.0
+            rt_fires = rt_rise_pct >= RESPONSE_TIME_RISE_PCT
+        rt_score = min(1.0, max(0.0, (rt_rise_pct or 0.0) / 100.0))
+
+        # Sentiment-proxy density (current + baseline combined)
+        all_rows = cur_rows + base_rows
+        sent_hits = 0
+        sample_keywords: Counter = Counter()
+        for r in all_rows:
+            text = f"{r.get('subject','')} {r.get('body','')}"
+            hit, kw = has_sentiment_keyword(text)
+            if hit:
+                sent_hits += 1
+                if kw:
+                    sample_keywords[kw] += 1
+        sent_density = sent_hits / max(1, len(all_rows)) if all_rows else 0.0
+        sent_fires = sent_density >= SENTIMENT_PROXY_DENSITY
+        sent_score = min(1.0, sent_density / 0.50)  # 50% density = full score
+
+        # Unresolved escalations in current window
+        unresolved_esc = sum(
+            1 for r in cur_rows
+            if to_bool(r.get("escalated")) and not to_bool(r.get("resolved"))
+        )
+        unresolved_fires = unresolved_esc >= UNRESOLVED_ESCALATION_FLOOR
+        unresolved_score = min(1.0, unresolved_esc / 3.0)
+
+        # Silence-after-engagement
+        silence_fires = (base_n >= SILENCE_PRIOR_TICKETS) and (cur_n == 0)
+        silence_score = 1.0 if silence_fires else 0.0
+
+        # Composite
+        composite = (
+            WEIGHT_VOLUME * volume_score
+            + WEIGHT_RESPONSE * rt_score
+            + WEIGHT_SENTIMENT * sent_score
+            + WEIGHT_UNRESOLVED * unresolved_score
+            + WEIGHT_SILENCE * silence_score
+        )
+        composite = round(composite, 3)
+
+        # Severity band
+        n_fires = sum([volume_fires, rt_fires, sent_fires, unresolved_fires, silence_fires])
+        if n_fires >= 3 or composite >= 0.70:
+            band = "burning"
+        elif n_fires >= 2 or composite >= 0.50:
+            band = "hot"
+        elif n_fires >= 1 or composite >= 0.30:
+            band = "warm"
+        else:
+            band = "cool"
+
+        # Sample ticket excerpts: prefer sentiment-fired tickets, then escalated.
+        excerpts: list[dict] = []
+        for r in all_rows:
+            text = f"{r.get('subject','')} {r.get('body','')}"
+            hit, kw = has_sentiment_keyword(text)
+            score = 0
+            if hit:
+                score += 5
+            if to_bool(r.get("escalated")):
+                score += 3
+            if to_int(r.get("csat")) is not None and (to_int(r.get("csat")) or 5) <= 2:
+                score += 2
+            if score:
+                excerpts.append({"score": score, "row": r, "matched_keyword": kw})
+        excerpts.sort(key=lambda x: -x["score"])
+        sample_excerpts = []
+        for e in excerpts[:3]:
+            r = e["row"]
+            body = (r.get("body", "") or "")
+            if len(body) > 220:
+                body = body[:217] + "..."
+            sample_excerpts.append({
+                "ticket_id": r.get("ticket_id", ""),
+                "subject": r.get("subject", ""),
+                "body_excerpt": body,
+                "csat": r.get("csat", ""),
+                "escalated": to_bool(r.get("escalated")),
+                "resolved": to_bool(r.get("resolved")),
+                "matched_keyword": e.get("matched_keyword"),
+            })
+
+        features[aid] = {
+            "account_id": aid,
+            "current_window_n": cur_n,
+            "baseline_window_n": base_n,
+            "tickets_total": cur_n + base_n,
+            "volume": {
+                "current_rate_per_day": round(cur_rate, 3),
+                "baseline_rate_per_day": round(base_rate, 3),
+                "ratio": round(volume_ratio, 3) if volume_ratio != float("inf") else "inf",
+                "fires": volume_fires,
+                "score": round(volume_score, 3),
+            },
+            "response_time": {
+                "current_median_hours": round(cur_rt_med, 2) if cur_rt_med is not None else None,
+                "baseline_median_hours": round(base_rt_med, 2) if base_rt_med is not None else None,
+                "rise_pct": round(rt_rise_pct, 1) if rt_rise_pct is not None else None,
+                "fires": rt_fires,
+                "score": round(rt_score, 3),
+            },
+            "sentiment_proxy": {
+                "density": round(sent_density, 3),
+                "hits": sent_hits,
+                "sample_keywords": dict(sample_keywords.most_common(5)),
+                "fires": sent_fires,
+                "score": round(sent_score, 3),
+            },
+            "unresolved_escalations": {
+                "count": unresolved_esc,
+                "fires": unresolved_fires,
+                "score": round(unresolved_score, 3),
+            },
+            "silence_after_engagement": {
+                "baseline_engaged": base_n >= SILENCE_PRIOR_TICKETS,
+                "current_silent": cur_n == 0,
+                "fires": silence_fires,
+                "score": round(silence_score, 3),
+            },
+            "n_fires": n_fires,
+            "composite_score": composite,
+            "severity_band": band,
+            "sample_excerpts": sample_excerpts,
+        }
+    return features
+
+
+def merge_account_metadata(
+    features: dict[str, dict],
+    accounts: dict[str, dict] | None,
+) -> dict[str, dict]:
+    """Merge ARR / plan / fit-score metadata when accounts CSV is present."""
+    if not accounts:
+        return features
+    for aid, f in features.items():
+        meta = accounts.get(aid) or {}
+        f["arr"] = to_float(meta.get("arr"))
+        f["plan"] = meta.get("plan", "")
+        f["icp_fit_score"] = to_float(meta.get("icp_fit_score"))
+        f["tenure_days"] = to_int(meta.get("tenure_days"))
+        f["last_login_date"] = meta.get("last_login_date", "")
+        f["signup_date"] = meta.get("signup_date", "")
+    return features
+
+
+def write_md(
+    out_path: Path,
+    client: str,
+    today: str,
+    tickets_path: Path,
+    accounts_path: Path | None,
+    current_window: tuple[datetime, datetime],
+    baseline_window: tuple[datetime, datetime],
+    features: dict[str, dict],
+    band_counts: Counter,
+    feature_fire_counts: dict[str, int],
+    flagged_accounts: list[dict],
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n_accounts = len(features)
+    cur_start, cur_end = current_window
+    base_start, base_end = baseline_window
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: support churn signal, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [support-as-churn-leading-indicator, churn-prediction-vs-churn-diagnosis]")
+    lines.append("contradictions_aware: []")
+    lines.append(f"client: {client}")
+    lines.append(f"tickets_source: {tickets_path}")
+    lines.append(f"accounts_source: {accounts_path or '(none)'}")
+    lines.append(f"current_window: {cur_start.date().isoformat()} → {cur_end.date().isoformat()}")
+    lines.append(f"baseline_window: {base_start.date().isoformat()} → {base_end.date().isoformat()}")
+    lines.append(f"accounts_n: {n_accounts}")
+    lines.append(f"burning: {band_counts.get('burning', 0)}")
+    lines.append(f"hot: {band_counts.get('hot', 0)}")
+    lines.append(f"warm: {band_counts.get('warm', 0)}")
+    lines.append(f"cool: {band_counts.get('cool', 0)}")
+    lines.append("produced_by: churn-signal-from-support")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Support churn signal, {client}, {today}")
+    lines.append("")
+    lines.append(
+        f"Per `support-as-churn-leading-indicator`, support volume and sentiment lead churn by 30 to 90 days. This read scans the support corpus from `{tickets_path}` for the five concrete leading-indicator features (volume spike, response-time rise, sentiment-proxy density, unresolved escalations, silence-after-engagement) and bands accounts by composite score plus per-feature firings. Per `churn-prediction-vs-churn-diagnosis`, the output is a triage queue, not predictions; operator review is required, not optional."
+    )
+    lines.append("")
+
+    # Window summary
+    lines.append("## 1. Window summary")
+    lines.append("")
+    lines.append(f"- Current window: {cur_start.date().isoformat()} to {cur_end.date().isoformat()} ({(cur_end - cur_start).days} days)")
+    lines.append(f"- Baseline window: {base_start.date().isoformat()} to {base_end.date().isoformat()} ({(base_end - base_start).days} days)")
+    lines.append(f"- Accounts observed in either window: {n_accounts}")
+    lines.append(f"- Burning: {band_counts.get('burning', 0)} | Hot: {band_counts.get('hot', 0)} | Warm: {band_counts.get('warm', 0)} | Cool: {band_counts.get('cool', 0)}")
+    lines.append("")
+
+    # Per-feature firing counts
+    lines.append("## 2. Per-feature firing counts")
+    lines.append("")
+    lines.append("| Feature | Accounts firing | Share |")
+    lines.append("|---|---:|---:|")
+    for label, key in [
+        ("Volume spike (>=2x baseline rate)", "volume"),
+        ("Response-time rise (>=50%)", "response_time"),
+        ("Sentiment-proxy density (>=0.20)", "sentiment_proxy"),
+        ("Unresolved escalations (>=1)", "unresolved_escalations"),
+        ("Silence-after-engagement", "silence_after_engagement"),
+    ]:
+        count = feature_fire_counts.get(key, 0)
+        share = (count / n_accounts * 100) if n_accounts else 0
+        lines.append(f"| {label} | {count} | {share:.1f}% |")
+    lines.append("")
+
+    # Top flagged accounts
+    lines.append("## 3. Top 20 flagged accounts (burning + hot, ranked by composite × ARR)")
+    lines.append("")
+    if not flagged_accounts:
+        lines.append("_No burning or hot accounts in this read._")
+        lines.append("")
+    else:
+        lines.append("| Account | ARR | ICP fit | Band | Fires | Composite | Triggered features |")
+        lines.append("|---|---:|---:|---|---:|---:|---|")
+        for f in flagged_accounts[:20]:
+            arr = f.get("arr")
+            arr_text = f"${int(arr):,}" if arr is not None else "n/a"
+            fit = f.get("icp_fit_score")
+            fit_text = f"{fit:.2f}" if fit is not None else "n/a"
+            triggered = []
+            for k in ("volume", "response_time", "sentiment_proxy", "unresolved_escalations", "silence_after_engagement"):
+                if f[k]["fires"]:
+                    triggered.append(k.replace("_", "-"))
+            triggered_text = ", ".join(triggered) if triggered else "(composite only)"
+            lines.append(
+                f"| `{f['account_id']}` | {arr_text} | {fit_text} | **{f['severity_band']}** | {f['n_fires']} | {f['composite_score']} | {triggered_text} |"
+            )
+        lines.append("")
+
+    # Per-account detail
+    if flagged_accounts:
+        lines.append("## 4. Per-account detail (top 10 by composite × ARR)")
+        lines.append("")
+        for f in flagged_accounts[:10]:
+            aid = f["account_id"]
+            band = f["severity_band"]
+            comp = f["composite_score"]
+            lines.append(f"### `{aid}` — band: **{band}**, composite: {comp}, fires: {f['n_fires']}/5")
+            lines.append("")
+            arr = f.get("arr")
+            if arr is not None:
+                lines.append(f"- ARR: ${int(arr):,}")
+            fit = f.get("icp_fit_score")
+            if fit is not None:
+                lines.append(f"- ICP fit score: {fit:.2f}")
+            tenure = f.get("tenure_days")
+            if tenure is not None:
+                lines.append(f"- Tenure: {tenure} days")
+            lines.append(f"- Tickets in window: current={f['current_window_n']}, baseline={f['baseline_window_n']}")
+            lines.append("")
+            lines.append("Feature breakdown:")
+            lines.append("")
+            v = f["volume"]
+            lines.append(f"- Volume spike — current rate {v['current_rate_per_day']}/day vs baseline {v['baseline_rate_per_day']}/day; ratio {v['ratio']}; fires={v['fires']}")
+            rt = f["response_time"]
+            cur_med = rt["current_median_hours"]
+            base_med = rt["baseline_median_hours"]
+            rise = rt["rise_pct"]
+            lines.append(f"- Response-time rise — current median {cur_med if cur_med is not None else 'n/a'}h vs baseline {base_med if base_med is not None else 'n/a'}h; rise {rise if rise is not None else 'n/a'}%; fires={rt['fires']}")
+            sp = f["sentiment_proxy"]
+            kw_text = ", ".join(f"`{k}`×{n}" for k, n in sp["sample_keywords"].items())
+            lines.append(f"- Sentiment proxy — density {sp['density']:.2f} ({sp['hits']} hits); fires={sp['fires']}{(' · keywords: ' + kw_text) if kw_text else ''}")
+            ue = f["unresolved_escalations"]
+            lines.append(f"- Unresolved escalations — count {ue['count']}; fires={ue['fires']}")
+            sil = f["silence_after_engagement"]
+            lines.append(f"- Silence-after-engagement — baseline-engaged={sil['baseline_engaged']}, current-silent={sil['current_silent']}; fires={sil['fires']}")
+            lines.append("")
+            samples = f.get("sample_excerpts") or []
+            if samples:
+                lines.append("Sample excerpts (verbatim):")
+                lines.append("")
+                for s in samples:
+                    csat = s.get("csat", "")
+                    kw = s.get("matched_keyword")
+                    kw_marker = f" · keyword: `{kw}`" if kw else ""
+                    lines.append(f"- `{s['ticket_id']}` (CSAT: {csat or 'n/a'}{kw_marker}) — \"{s['subject']}\" — {s['body_excerpt']}")
+                lines.append("")
+
+    # Anti-pattern note
+    lines.append("## 5. Anti-pattern note")
+    lines.append("")
+    lines.append(
+        "The leading-indicator features are noisy at the individual-account level. The signal leads churn by 30 to 90 days with non-trivial false-positive rates. The output is a *triage queue*, not an alert system. Required practice: an operator reviews the top 10 burning and hot accounts before any save outreach fires; the operator confirms (or rejects) each. The skill does not auto-trigger any customer-facing action. Per `churn-prediction-vs-churn-diagnosis`, prediction is downstream of diagnosis, and diagnosis-and-signal-extraction precedes prediction."
+    )
+    lines.append("")
+    lines.append(
+        "A second anti-pattern: a sudden volume spike correlated across many accounts is usually a product issue (a single bug producing tickets), not an aggregation of independent at-risk accounts. The operator must investigate whether the cluster is product-cause or account-cause before treating the signal as account-level churn risk."
+    )
+    lines.append("")
+
+    # Substrate citations
+    lines.append("## 6. Substrate citations")
+    lines.append("")
+    lines.append(f"- Tickets export: `{tickets_path}`")
+    if accounts_path:
+        lines.append(f"- Accounts export: `{accounts_path}`")
+    lines.append(f"- ICP layer: `clients/{client}/icp/icp.md` (drives ARR weighting + fit conditioning)")
+    lines.append(f"- VoC layer: `clients/{client}/voc/voc.md` (validates sentiment-proxy keywords match documented language)")
+    lines.append("- Pattern grounding: `knowledge/patterns/support-as-churn-leading-indicator.md` (support volume and sentiment lead churn by 30 to 90 days; conservative thresholding plus operator review).")
+    lines.append("- Pattern grounding: `knowledge/patterns/churn-prediction-vs-churn-diagnosis.md` (this read is diagnosis-side, not prediction; output feeds churn-diagnose).")
+    lines.append("")
+
+    # Next reads
+    lines.append("## 7. Next reads")
+    lines.append("")
+    lines.append(f"- `skills/churn-diagnose/bin/churn-diagnose --client {client} --churned <churned-accounts.csv> --support-tickets {tickets_path}` to score cohort drivers with the burning-band weighting in mind.")
+    lines.append(f"- `skills/win-back-sequence/bin/win-back-sequence --client {client} --diagnosis <diagnosis.json>` to design save sequences for the high-fit burning band.")
+    lines.append(f"- `skills/csat-loop-design/bin/csat-loop-design --client {client}` to suppress the relational survey for burning-band accounts and avoid contamination.")
+    lines.append(f"- `routines/support-churn-watcher.md` schedules the next read.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_outputs(
+    json_path: Path,
+    csv_path: Path,
+    client: str,
+    today: str,
+    tickets_path: Path,
+    accounts_path: Path | None,
+    current_window: tuple[datetime, datetime],
+    baseline_window: tuple[datetime, datetime],
+    features: dict[str, dict],
+    flagged_accounts: list[dict],
+) -> None:
+    cur_start, cur_end = current_window
+    base_start, base_end = baseline_window
+    payload = {
+        "client": client,
+        "generated_at": today,
+        "tickets_source": str(tickets_path),
+        "accounts_source": str(accounts_path) if accounts_path else None,
+        "current_window": [cur_start.isoformat(), cur_end.isoformat()],
+        "baseline_window": [base_start.isoformat(), base_end.isoformat()],
+        "thresholds": {
+            "volume_spike_ratio": VOLUME_SPIKE_RATIO,
+            "response_time_rise_pct": RESPONSE_TIME_RISE_PCT,
+            "sentiment_proxy_density": SENTIMENT_PROXY_DENSITY,
+            "unresolved_escalation_floor": UNRESOLVED_ESCALATION_FLOOR,
+            "silence_prior_tickets": SILENCE_PRIOR_TICKETS,
+        },
+        "weights": {
+            "volume": WEIGHT_VOLUME,
+            "response": WEIGHT_RESPONSE,
+            "sentiment": WEIGHT_SENTIMENT,
+            "unresolved": WEIGHT_UNRESOLVED,
+            "silence": WEIGHT_SILENCE,
+        },
+        "accounts": features,
+    }
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "account_id", "severity_band", "composite_score", "n_fires",
+            "current_window_n", "baseline_window_n",
+            "volume_fires", "response_fires", "sentiment_fires",
+            "unresolved_fires", "silence_fires",
+            "arr", "icp_fit_score", "tenure_days",
+        ])
+        writer.writeheader()
+        for fa in flagged_accounts:
+            writer.writerow({
+                "account_id": fa["account_id"],
+                "severity_band": fa["severity_band"],
+                "composite_score": fa["composite_score"],
+                "n_fires": fa["n_fires"],
+                "current_window_n": fa["current_window_n"],
+                "baseline_window_n": fa["baseline_window_n"],
+                "volume_fires": fa["volume"]["fires"],
+                "response_fires": fa["response_time"]["fires"],
+                "sentiment_fires": fa["sentiment_proxy"]["fires"],
+                "unresolved_fires": fa["unresolved_escalations"]["fires"],
+                "silence_fires": fa["silence_after_engagement"]["fires"],
+                "arr": fa.get("arr") if fa.get("arr") is not None else "",
+                "icp_fit_score": fa.get("icp_fit_score") if fa.get("icp_fit_score") is not None else "",
+                "tenure_days": fa.get("tenure_days") if fa.get("tenure_days") is not None else "",
+            })
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--tickets", required=True)
+    parser.add_argument("--accounts", default=None)
+    parser.add_argument("--current-window-days", type=int, default=30)
+    parser.add_argument("--baseline-window-days", type=int, default=90)
+    parser.add_argument("--min-tickets-for-account", type=int, default=2)
+    parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--strict-substrate", action="store_true")
+    args = parser.parse_args()
+
+    tickets_path = Path(args.tickets).resolve()
+    if not tickets_path.is_file():
+        print(f"REFUSED: missing-tickets, {tickets_path} not found", file=sys.stderr)
+        return 3
+    accounts_path: Path | None = None
+    if args.accounts:
+        accounts_path = Path(args.accounts).resolve()
+        if not accounts_path.is_file():
+            print(f"REFUSED: missing-accounts, {accounts_path} not found", file=sys.stderr)
+            return 3
+
+    # Substrate preflight: ICP required
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    fails: list[str] = []
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{args.client}/")
+    else:
+        if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+            fails.append(f"icp layer missing: clients/{args.client}/icp/")
+        if not (client_root / "voc").is_dir() and not (client_root / "voc.md").is_file():
+            fails.append(f"voc layer missing: clients/{args.client}/voc/")
+    if fails:
+        print("REFUSED: substrate-gap (icp + voc required for ARR weighting and sentiment validation)", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        if args.strict_substrate:
+            return 3
+        print("  (continuing without substrate; outputs will mark layers as gaps)", file=sys.stderr)
+
+    try:
+        tickets = load_tickets(tickets_path)
+    except ValueError as e:
+        print(f"REFUSED: schema-mismatch, {e}", file=sys.stderr)
+        return 3
+
+    if not tickets:
+        print("REFUSED: empty-corpus, tickets CSV had no data rows", file=sys.stderr)
+        return 3
+
+    accounts: dict[str, dict] | None = None
+    if accounts_path:
+        try:
+            accounts = load_accounts(accounts_path)
+        except ValueError as e:
+            print(f"REFUSED: schema-mismatch, accounts CSV: {e}", file=sys.stderr)
+            return 3
+
+    print(f"[churn-signal-from-support] client={args.client} tickets_n={len(tickets)} accounts_meta={'yes' if accounts else 'no'}", file=sys.stderr)
+
+    # Window split
+    try:
+        current, baseline, cur_start, cur_end, base_start, base_end = split_windows(
+            tickets, args.current_window_days, args.baseline_window_days,
+        )
+    except ValueError as e:
+        print(f"REFUSED: window-too-short, {e}", file=sys.stderr)
+        return 3
+
+    span_days = (cur_end - base_start).days
+    required_span = args.current_window_days + args.baseline_window_days
+    if span_days < required_span:
+        print(
+            f"REFUSED: window-too-short, corpus spans {span_days} days but "
+            f"current+baseline windows require {required_span}.",
+            file=sys.stderr,
+        )
+        return 3
+
+    # Per-account features
+    features = per_account_features(
+        current, baseline,
+        args.current_window_days, args.baseline_window_days,
+        args.min_tickets_for_account,
+    )
+    features = merge_account_metadata(features, accounts)
+
+    if not features:
+        print("REFUSED: empty-corpus, no accounts found across windows", file=sys.stderr)
+        return 3
+
+    # Counts
+    band_counts: Counter = Counter(f["severity_band"] for f in features.values())
+    feature_fire_counts = {
+        "volume": sum(1 for f in features.values() if f["volume"]["fires"]),
+        "response_time": sum(1 for f in features.values() if f["response_time"]["fires"]),
+        "sentiment_proxy": sum(1 for f in features.values() if f["sentiment_proxy"]["fires"]),
+        "unresolved_escalations": sum(1 for f in features.values() if f["unresolved_escalations"]["fires"]),
+        "silence_after_engagement": sum(1 for f in features.values() if f["silence_after_engagement"]["fires"]),
+    }
+
+    # Flagged: burning + hot, ranked by composite × ARR
+    def rank_key(f: dict) -> float:
+        comp = float(f.get("composite_score", 0))
+        arr = float(f.get("arr") or 0.0)
+        # Prevent zero-ARR collapsing: floor at 1.0
+        weight = max(1.0, arr)
+        return -(comp * (weight ** 0.5))  # sqrt to dampen the ARR effect
+
+    flagged = sorted(
+        [f for f in features.values() if f["severity_band"] in ("burning", "hot")],
+        key=rank_key,
+    )
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else SUBSTRATE_ROOT / "clients" / args.client / "support"
+    md_path = out_dir / f"churn-signal-from-support-{today}.md"
+    json_path = out_dir / f"churn-signal-from-support-{today}.json"
+    csv_path = out_dir / f"churn-signal-from-support-flagged-{today}.csv"
+
+    write_md(
+        md_path, args.client, today,
+        tickets_path, accounts_path,
+        (cur_start, cur_end), (base_start, base_end),
+        features, band_counts, feature_fire_counts, flagged,
+    )
+    write_outputs(
+        json_path, csv_path, args.client, today,
+        tickets_path, accounts_path,
+        (cur_start, cur_end), (base_start, base_end),
+        features, flagged,
+    )
+
+    print(f"[churn-signal-from-support] accounts: {len(features)} (burning: {band_counts.get('burning',0)}, hot: {band_counts.get('hot',0)}, warm: {band_counts.get('warm',0)}, cool: {band_counts.get('cool',0)})", file=sys.stderr)
+    print(f"[churn-signal-from-support] markdown: {md_path}")
+    print(f"[churn-signal-from-support] json:     {json_path}")
+    print(f"[churn-signal-from-support] flagged:  {csv_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

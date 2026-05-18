@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+"""support-quality-score, score the support team on the four dimensions that compound on retention.
+
+Reads a support tickets CSV (canonical shape: templates/support-tickets-example.csv).
+Computes:
+    - Response time (median first-response and median resolution-time vs targets)
+    - First-contact resolution rate
+    - CSAT correlations (CSAT vs resolution-time, escalation, priority)
+    - Agent consistency (per-agent variance, top/bottom quartile, coaching list)
+
+Per the deflection-is-not-the-goal pattern, the scorecard does not reward deflection;
+right-routing accuracy and CSAT-correlated outcomes are the load-bearing measures.
+Per the tickets-are-product-feedback-channel pattern, low-CSAT excerpts pulled here
+feed back into the next cluster run.
+
+Usage:
+    support-quality-score --client <client> --tickets <path> \
+        [--target-first-response-min 30] [--target-resolution-hours 4] \
+        [--target-fcr-rate 0.70] [--target-csat-mean 4.2] \
+        [--out-dir <path>]
+
+Outputs:
+    clients/<client>/support/support-quality-score-<date>.md
+    clients/<client>/support/support-quality-score-<date>.json
+    clients/<client>/support/support-quality-score-agents-<date>.csv
+
+Exit codes:
+    0, scorecard written
+    3, preflight refusal (substrate-gap, missing-tickets, schema-mismatch,
+       missing-csat-coverage, too-few-tickets)
+    4, invalid args
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import os
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import mean, median, pstdev
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+MIN_TICKETS_TEAM = 50
+MIN_TICKETS_AGENT = 10
+CSAT_COVERAGE_FLOOR = 0.50
+
+# Composite weighting across the four dimensions.
+WEIGHT_RESPONSE = 0.25
+WEIGHT_FCR = 0.25
+WEIGHT_CSAT = 0.30
+WEIGHT_CONSISTENCY = 0.20
+
+
+def to_float(val) -> float | None:
+    try:
+        if val is None or val == "":
+            return None
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def to_int(val) -> int | None:
+    try:
+        if val is None or val == "":
+            return None
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
+def to_bool(val) -> bool:
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    return s in ("true", "1", "yes", "y", "t")
+
+
+def load_tickets(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError("tickets CSV has no header")
+        required = {"ticket_id", "opened_at", "category", "subject", "body"}
+        missing = required - set(reader.fieldnames)
+        if missing:
+            raise ValueError(f"tickets CSV missing required columns: {sorted(missing)}")
+        for raw in reader:
+            rows.append(dict(raw))
+    return rows
+
+
+def gap_to_grade(actual: float, target: float, higher_is_better: bool = True, fudge: float = 0.0) -> str:
+    """Map gap-to-target to a letter grade. fudge is the tolerance band per dimension."""
+    if higher_is_better:
+        ratio = actual / target if target else 1.0
+    else:
+        # lower is better: invert ratio. ratio < 1 means we beat target.
+        ratio = target / actual if actual else 1.0
+    if ratio >= 1.10:
+        return "A"
+    if ratio >= 1.00 - fudge:
+        return "B"
+    if ratio >= 0.90:
+        return "C"
+    if ratio >= 0.75:
+        return "D"
+    return "F"
+
+
+def grade_to_score(grade: str) -> float:
+    """Map letter grade to a 0-1 score for the composite."""
+    return {"A": 1.0, "B": 0.85, "C": 0.70, "D": 0.55, "F": 0.30}.get(grade, 0.50)
+
+
+def safe_corr(xs: list[float], ys: list[float]) -> float | None:
+    """Pearson correlation. Returns None on zero-variance / empty input."""
+    if len(xs) != len(ys) or len(xs) < 3:
+        return None
+    mx = mean(xs)
+    my = mean(ys)
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+    sy = math.sqrt(sum((y - my) ** 2 for y in ys))
+    if sx == 0 or sy == 0:
+        return None
+    return num / (sx * sy)
+
+
+def priority_to_int(val: str) -> int | None:
+    s = (val or "").strip().lower()
+    return {"low": 1, "medium": 2, "high": 3, "urgent": 4}.get(s)
+
+
+def compute_team_dimensions(rows: list[dict], targets: dict) -> dict:
+    """Compute the four-dimension team scorecard."""
+    n = len(rows)
+
+    # Response-time dimension
+    fr_minutes = [to_float(r.get("first_response_minutes")) for r in rows]
+    fr_minutes = [v for v in fr_minutes if v is not None]
+    rt_hours = [to_float(r.get("resolution_time_hours")) for r in rows]
+    rt_hours = [v for v in rt_hours if v is not None]
+    fr_med = median(fr_minutes) if fr_minutes else None
+    rt_med = median(rt_hours) if rt_hours else None
+    fr_grade = gap_to_grade(fr_med or 999, targets["target_first_response_min"], higher_is_better=False) if fr_med is not None else "F"
+    rt_grade = gap_to_grade(rt_med or 999, targets["target_resolution_hours"], higher_is_better=False) if rt_med is not None else "F"
+    response_grade = grade_average([fr_grade, rt_grade])
+
+    # FCR dimension
+    fcr_rows = [r for r in rows if to_bool(r.get("resolved"))]
+    fcr_no_esc = [r for r in fcr_rows if not to_bool(r.get("escalated"))]
+    fcr_rate = (len(fcr_no_esc) / len(fcr_rows)) if fcr_rows else 0.0
+    fcr_grade = gap_to_grade(fcr_rate, targets["target_fcr_rate"], higher_is_better=True)
+
+    # CSAT dimension
+    csat_scores = [to_int(r.get("csat")) for r in rows]
+    csat_scores = [v for v in csat_scores if v is not None]
+    csat_n = len(csat_scores)
+    csat_coverage = csat_n / n if n else 0.0
+    csat_mean = mean(csat_scores) if csat_scores else 0.0
+    csat_median = median(csat_scores) if csat_scores else 0.0
+    promoters_pct = sum(1 for s in csat_scores if s >= 5) / csat_n * 100 if csat_n else 0.0
+    detractors_pct = sum(1 for s in csat_scores if s <= 2) / csat_n * 100 if csat_n else 0.0
+    csat_grade = gap_to_grade(csat_mean, targets["target_csat_mean"], higher_is_better=True)
+
+    # Correlations
+    csat_corrs = compute_csat_correlations(rows)
+
+    return {
+        "n": n,
+        "csat_coverage": round(csat_coverage, 3),
+        "response_time": {
+            "median_first_response_minutes": round(fr_med, 2) if fr_med is not None else None,
+            "median_resolution_hours": round(rt_med, 2) if rt_med is not None else None,
+            "target_first_response_min": targets["target_first_response_min"],
+            "target_resolution_hours": targets["target_resolution_hours"],
+            "grade": response_grade,
+            "score": grade_to_score(response_grade),
+        },
+        "fcr": {
+            "rate": round(fcr_rate, 3),
+            "tickets_resolved": len(fcr_rows),
+            "tickets_resolved_no_escalation": len(fcr_no_esc),
+            "target_rate": targets["target_fcr_rate"],
+            "grade": fcr_grade,
+            "score": grade_to_score(fcr_grade),
+        },
+        "csat": {
+            "mean": round(csat_mean, 2),
+            "median": csat_median,
+            "n": csat_n,
+            "coverage_pct": round(csat_coverage * 100, 1),
+            "promoters_pct": round(promoters_pct, 1),
+            "detractors_pct": round(detractors_pct, 1),
+            "target_mean": targets["target_csat_mean"],
+            "grade": csat_grade,
+            "score": grade_to_score(csat_grade),
+            "correlations": csat_corrs,
+        },
+    }
+
+
+def grade_average(grades: list[str]) -> str:
+    """Average a list of letter grades by their numeric scores; map back."""
+    if not grades:
+        return "F"
+    avg = sum(grade_to_score(g) for g in grades) / len(grades)
+    if avg >= 0.93:
+        return "A"
+    if avg >= 0.78:
+        return "B"
+    if avg >= 0.62:
+        return "C"
+    if avg >= 0.45:
+        return "D"
+    return "F"
+
+
+def compute_csat_correlations(rows: list[dict]) -> dict:
+    """Pearson correlations between CSAT and (resolution_time, escalation flag,
+    priority level)."""
+    csat_xs: list[float] = []
+    rt_xs: list[float] = []
+    esc_xs: list[float] = []
+    pri_xs: list[float] = []
+    for r in rows:
+        c = to_int(r.get("csat"))
+        if c is None:
+            continue
+        csat_xs.append(float(c))
+        rt = to_float(r.get("resolution_time_hours"))
+        rt_xs.append(rt if rt is not None else 0.0)
+        esc_xs.append(1.0 if to_bool(r.get("escalated")) else 0.0)
+        p = priority_to_int(r.get("priority", ""))
+        pri_xs.append(float(p) if p is not None else 2.0)
+
+    return {
+        "csat_vs_resolution_time": _round_or_none(safe_corr(csat_xs, rt_xs)),
+        "csat_vs_escalation": _round_or_none(safe_corr(csat_xs, esc_xs)),
+        "csat_vs_priority": _round_or_none(safe_corr(csat_xs, pri_xs)),
+    }
+
+
+def _round_or_none(v: float | None) -> float | None:
+    return round(v, 3) if v is not None else None
+
+
+def compute_per_agent(rows: list[dict], targets: dict) -> tuple[list[dict], dict]:
+    """Compute the per-agent scorecard. Returns (agents, summary).
+
+    summary contains the inter-agent quartile reads and the consistency dimension.
+    """
+    by_agent: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        aid = (r.get("agent_id") or "").strip()
+        if not aid:
+            continue
+        by_agent[aid].append(r)
+    if not by_agent:
+        return [], {
+            "agents_observed": 0,
+            "consistency_grade": "F",
+            "consistency_score": grade_to_score("F"),
+            "consistency_note": "no agent_id column or no agent data",
+        }
+
+    agents: list[dict] = []
+    for aid, agent_rows in by_agent.items():
+        n = len(agent_rows)
+        if n < MIN_TICKETS_AGENT:
+            agents.append({
+                "agent_id": aid,
+                "n": n,
+                "under_powered": True,
+                "composite_score": None,
+                "csat_mean": None,
+                "fcr_rate": None,
+                "median_resolution_hours": None,
+                "grade": "n/a",
+            })
+            continue
+        agent_dim = compute_team_dimensions(agent_rows, targets)
+        composite = (
+            WEIGHT_RESPONSE * agent_dim["response_time"]["score"]
+            + WEIGHT_FCR * agent_dim["fcr"]["score"]
+            + WEIGHT_CSAT * agent_dim["csat"]["score"]
+        )
+        # Re-normalise for the absent consistency dim at agent-level
+        composite = composite / (WEIGHT_RESPONSE + WEIGHT_FCR + WEIGHT_CSAT)
+        agents.append({
+            "agent_id": aid,
+            "n": n,
+            "under_powered": False,
+            "composite_score": round(composite, 3),
+            "csat_mean": agent_dim["csat"]["mean"],
+            "fcr_rate": agent_dim["fcr"]["rate"],
+            "median_resolution_hours": agent_dim["response_time"]["median_resolution_hours"],
+            "median_first_response_minutes": agent_dim["response_time"]["median_first_response_minutes"],
+            "promoters_pct": agent_dim["csat"]["promoters_pct"],
+            "detractors_pct": agent_dim["csat"]["detractors_pct"],
+        })
+
+    powered = [a for a in agents if not a["under_powered"]]
+    if len(powered) < 2:
+        return agents, {
+            "agents_observed": len(agents),
+            "powered_agents": len(powered),
+            "consistency_grade": "F",
+            "consistency_score": grade_to_score("F"),
+            "consistency_note": "fewer than 2 agents with sufficient ticket count to compute variance",
+        }
+
+    composites = [a["composite_score"] for a in powered]
+    composites_sd = pstdev(composites) if len(composites) > 1 else 0.0
+    composites_mean = mean(composites)
+    sorted_powered = sorted(powered, key=lambda a: -a["composite_score"])
+    q = max(1, len(sorted_powered) // 4)
+    top_quartile = sorted_powered[:q]
+    bottom_quartile = sorted_powered[-q:]
+    coaching_list = [a for a in powered if a["composite_score"] < composites_mean - composites_sd]
+
+    # Consistency grade: lower SD is better. SD of 0.05 = A; 0.10 = B; 0.15 = C; 0.20 = D; > 0.20 = F.
+    if composites_sd <= 0.05:
+        consistency_grade = "A"
+    elif composites_sd <= 0.10:
+        consistency_grade = "B"
+    elif composites_sd <= 0.15:
+        consistency_grade = "C"
+    elif composites_sd <= 0.20:
+        consistency_grade = "D"
+    else:
+        consistency_grade = "F"
+
+    summary = {
+        "agents_observed": len(agents),
+        "powered_agents": len(powered),
+        "agents_under_powered": len(agents) - len(powered),
+        "composite_mean": round(composites_mean, 3),
+        "composite_sd": round(composites_sd, 3),
+        "top_quartile_ids": [a["agent_id"] for a in top_quartile],
+        "bottom_quartile_ids": [a["agent_id"] for a in bottom_quartile],
+        "coaching_list_ids": [a["agent_id"] for a in coaching_list],
+        "consistency_grade": consistency_grade,
+        "consistency_score": grade_to_score(consistency_grade),
+    }
+    return agents, summary
+
+
+def bottom_quartile_excerpts(rows: list[dict], n: int = 5) -> list[dict]:
+    """Surface verbatim excerpts from the lowest-CSAT bin."""
+    csat_rows = [r for r in rows if to_int(r.get("csat")) is not None]
+    csat_rows.sort(key=lambda r: (to_int(r.get("csat")) or 5, -to_float(r.get("resolution_time_hours")) or 0))
+    excerpts: list[dict] = []
+    for r in csat_rows[:n]:
+        body = (r.get("body", "") or "")
+        if len(body) > 220:
+            body = body[:217] + "..."
+        excerpts.append({
+            "ticket_id": r.get("ticket_id", ""),
+            "csat": r.get("csat", ""),
+            "subject": r.get("subject", ""),
+            "body_excerpt": body,
+            "agent_id": r.get("agent_id", ""),
+            "resolution_time_hours": r.get("resolution_time_hours", ""),
+            "escalated": to_bool(r.get("escalated")),
+        })
+    return excerpts
+
+
+def write_md(
+    out_path: Path,
+    client: str,
+    today: str,
+    tickets_path: Path,
+    targets: dict,
+    team: dict,
+    agents: list[dict],
+    agent_summary: dict,
+    excerpts: list[dict],
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    composite = (
+        WEIGHT_RESPONSE * team["response_time"]["score"]
+        + WEIGHT_FCR * team["fcr"]["score"]
+        + WEIGHT_CSAT * team["csat"]["score"]
+        + WEIGHT_CONSISTENCY * agent_summary["consistency_score"]
+    )
+    composite = round(composite, 3)
+    if composite >= 0.93:
+        composite_grade = "A"
+    elif composite >= 0.78:
+        composite_grade = "B"
+    elif composite >= 0.62:
+        composite_grade = "C"
+    elif composite >= 0.45:
+        composite_grade = "D"
+    else:
+        composite_grade = "F"
+
+    lines: list[str] = []
+    lines.append("---")
+    lines.append(f"title: support quality scorecard, {client}, {today}")
+    lines.append("status: active")
+    lines.append(f"last_updated: {today}")
+    lines.append("patterns_grounded: [tickets-are-product-feedback-channel, support-as-churn-leading-indicator, deflection-is-not-the-goal]")
+    lines.append("contradictions_aware: []")
+    lines.append(f"client: {client}")
+    lines.append(f"tickets_source: {tickets_path}")
+    lines.append(f"composite_grade: {composite_grade}")
+    lines.append(f"composite_score: {composite}")
+    lines.append("produced_by: support-quality-score")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Support quality scorecard, {client}, {today}")
+    lines.append("")
+    lines.append(
+        f"Per `tickets-are-product-feedback-channel`, this scorecard reads against the same corpus that feeds `ticket-cluster-analysis`; the verbatim excerpts in section 5 flow back into the next cluster run as product feedback substrate. Per `deflection-is-not-the-goal`, the scorecard does not reward deflection metrics; right-routing accuracy and CSAT-correlated outcomes are the load-bearing measures. Per `support-as-churn-leading-indicator`, the response-time and unresolved-escalation findings cross-reference the per-account spike read in `churn-signal-from-support`."
+    )
+    lines.append("")
+
+    # 1. Composite
+    lines.append("## 1. Team composite")
+    lines.append("")
+    lines.append(f"- **Composite grade: {composite_grade}** (score: {composite})")
+    lines.append(f"- Tickets in corpus: {team['n']}")
+    lines.append(f"- CSAT coverage: {team['csat_coverage']*100:.1f}% ({team['csat']['n']} tickets carry CSAT)")
+    lines.append("")
+    lines.append("Targets used:")
+    lines.append("")
+    lines.append(f"- First-response median target: {targets['target_first_response_min']} minutes")
+    lines.append(f"- Resolution-time median target: {targets['target_resolution_hours']} hours")
+    lines.append(f"- First-contact resolution target: {targets['target_fcr_rate']*100:.0f}%")
+    lines.append(f"- CSAT mean target: {targets['target_csat_mean']}")
+    lines.append("")
+
+    # 2. Per-dimension table
+    lines.append("## 2. Per-dimension breakdown")
+    lines.append("")
+    lines.append("| Dimension | Actual | Target | Grade | Composite weight |")
+    lines.append("|---|---|---|---|---:|")
+    lines.append(
+        f"| Response time (FR median / RT median) | {team['response_time']['median_first_response_minutes']} min / {team['response_time']['median_resolution_hours']} h | {targets['target_first_response_min']} min / {targets['target_resolution_hours']} h | {team['response_time']['grade']} | {WEIGHT_RESPONSE*100:.0f}% |"
+    )
+    lines.append(
+        f"| First-contact resolution rate | {team['fcr']['rate']*100:.1f}% | {targets['target_fcr_rate']*100:.0f}% | {team['fcr']['grade']} | {WEIGHT_FCR*100:.0f}% |"
+    )
+    lines.append(
+        f"| CSAT mean | {team['csat']['mean']} | {targets['target_csat_mean']} | {team['csat']['grade']} | {WEIGHT_CSAT*100:.0f}% |"
+    )
+    lines.append(
+        f"| Agent consistency (composite SD) | {agent_summary.get('composite_sd','n/a')} | n/a | {agent_summary['consistency_grade']} | {WEIGHT_CONSISTENCY*100:.0f}% |"
+    )
+    lines.append("")
+    lines.append(
+        f"CSAT distribution: promoters {team['csat']['promoters_pct']}%, detractors {team['csat']['detractors_pct']}%. The detractor share, not the average, is the right-routing-failure signal; per `deflection-is-not-the-goal`, a mean above target with a detractor share above 15% is a measurement instrument problem, not a customer-experience win."
+    )
+    lines.append("")
+
+    # 3. CSAT correlations
+    lines.append("## 3. CSAT correlations (Pearson)")
+    lines.append("")
+    cor = team["csat"]["correlations"]
+    lines.append("| Pair | r | Read |")
+    lines.append("|---|---:|---|")
+
+    def read_corr(r: float | None, expected: str) -> str:
+        if r is None:
+            return "(insufficient data)"
+        if expected == "negative":
+            if r <= -0.30:
+                return "expected negative correlation present"
+            if r <= -0.10:
+                return "weak negative correlation"
+            if r >= 0.10:
+                return "WARN: positive (unexpected)"
+            return "near-zero (no signal)"
+        if expected == "neutral":
+            if abs(r) <= 0.10:
+                return "near-zero (expected)"
+            return "WARN: non-trivial correlation; check routing or expectations"
+        return ""
+
+    lines.append(f"| CSAT vs resolution time | {cor['csat_vs_resolution_time']} | {read_corr(cor['csat_vs_resolution_time'],'negative')} |")
+    lines.append(f"| CSAT vs escalation flag | {cor['csat_vs_escalation']} | {read_corr(cor['csat_vs_escalation'],'negative')} |")
+    lines.append(f"| CSAT vs priority level | {cor['csat_vs_priority']} | {read_corr(cor['csat_vs_priority'],'neutral')} |")
+    lines.append("")
+    lines.append(
+        "Per Reichheld's loyalty math, a CSAT score that does not correlate with the things customers actually experience (response time, escalation, priority handling) is a measurement-instrument problem. Treat near-zero correlations as a survey-design or routing-system finding, not as evidence the team is unaffected by these factors."
+    )
+    lines.append("")
+
+    # 4. Per-agent breakdown
+    lines.append("## 4. Per-agent breakdown")
+    lines.append("")
+    if agent_summary["agents_observed"] == 0:
+        lines.append("_No `agent_id` column in the export; the per-agent breakdown is unavailable. Add `agent_id` to the export and re-run for the consistency read._")
+        lines.append("")
+    else:
+        lines.append(
+            f"Agents observed: {agent_summary['agents_observed']} ({agent_summary.get('powered_agents','?')} with at least {MIN_TICKETS_AGENT} tickets; {agent_summary.get('agents_under_powered',0)} under-powered)."
+        )
+        if agent_summary.get("powered_agents", 0) >= 2:
+            lines.append("")
+            lines.append(
+                f"Composite score across powered agents: mean {agent_summary['composite_mean']}, SD {agent_summary['composite_sd']}. Per Campbell's retention research, the most actionable team-improvement lever is reducing the inter-agent SD (not raising the mean); a low-SD team carries less downstream variance into account-level retention."
+            )
+        lines.append("")
+        powered = sorted([a for a in agents if not a["under_powered"]], key=lambda a: -a["composite_score"])
+        if powered:
+            lines.append("| Agent | n | Composite | CSAT mean | FCR rate | Median resolution (h) | Median first response (min) |")
+            lines.append("|---|---:|---:|---:|---:|---:|---:|")
+            for a in powered:
+                lines.append(
+                    f"| `{a['agent_id']}` | {a['n']} | {a['composite_score']} | {a['csat_mean']} | {a['fcr_rate']*100:.1f}% | {a['median_resolution_hours']} | {a['median_first_response_minutes']} |"
+                )
+            lines.append("")
+            lines.append("Top quartile (by composite):")
+            lines.append("")
+            for aid in agent_summary.get("top_quartile_ids", []):
+                lines.append(f"- `{aid}`")
+            lines.append("")
+            lines.append("Bottom quartile (by composite):")
+            lines.append("")
+            for aid in agent_summary.get("bottom_quartile_ids", []):
+                lines.append(f"- `{aid}`")
+            lines.append("")
+            coaching = agent_summary.get("coaching_list_ids", [])
+            if coaching:
+                lines.append(
+                    "**Targeted-coaching list** (agents whose composite falls more than 1 SD below the team mean):"
+                )
+                lines.append("")
+                for aid in coaching:
+                    lines.append(f"- `{aid}`")
+                lines.append("")
+                lines.append(
+                    "_The coaching list is the *input* to coaching, not the coaching plan itself. Per Tzuo's renewal-moment frame, the most leveraged team improvement is reducing the variance, not the mean; the coaching list points at the variance source._"
+                )
+                lines.append("")
+        under = [a for a in agents if a["under_powered"]]
+        if under:
+            lines.append(
+                f"Agents below the {MIN_TICKETS_AGENT}-ticket power floor (excluded from the variance read): {', '.join('`' + a['agent_id'] + '`' for a in under)}."
+            )
+            lines.append("")
+
+    # 5. Bottom-quartile excerpts
+    lines.append("## 5. Bottom-quartile sample excerpts")
+    lines.append("")
+    if not excerpts:
+        lines.append("_No CSAT-tagged tickets to surface bottom-quartile excerpts._")
+    else:
+        lines.append(
+            "Verbatim excerpts from the lowest-CSAT tickets in the corpus. Per `tickets-are-product-feedback-channel`, these are product-feedback substrate; route the cluster themes here back into the next `ticket-cluster-analysis` run and into `help-content-gap-detect`."
+        )
+        lines.append("")
+        for e in excerpts:
+            esc = "(escalated)" if e["escalated"] else ""
+            agent_marker = f" · agent: `{e['agent_id']}`" if e["agent_id"] else ""
+            lines.append(
+                f"- `{e['ticket_id']}` (CSAT: {e['csat'] or 'n/a'}{agent_marker} · resolution: {e['resolution_time_hours'] or 'n/a'}h {esc}) — \"{e['subject']}\" — {e['body_excerpt']}"
+            )
+        lines.append("")
+
+    # 6. Recommendations
+    lines.append("## 6. Recommendations")
+    lines.append("")
+    recs: list[str] = []
+    if team["response_time"]["grade"] in ("D", "F"):
+        recs.append(
+            f"Response-time dimension graded {team['response_time']['grade']}: median first-response is {team['response_time']['median_first_response_minutes']} min vs target {targets['target_first_response_min']} min. Pull the high-priority bucket and audit routing latency before staffing."
+        )
+    if team["fcr"]["grade"] in ("D", "F"):
+        recs.append(
+            f"FCR dimension graded {team['fcr']['grade']}: rate is {team['fcr']['rate']*100:.1f}% vs target {targets['target_fcr_rate']*100:.0f}%. Run `ticket-cluster-analysis` and `help-content-gap-detect` to find the recurring escalation themes; a structural FCR shortfall is usually a content gap, not an agent-skill gap."
+        )
+    if team["csat"]["grade"] in ("D", "F"):
+        recs.append(
+            f"CSAT dimension graded {team['csat']['grade']}: mean {team['csat']['mean']} vs target {targets['target_csat_mean']}. Detractor share {team['csat']['detractors_pct']}%; if above 15%, design `csat-loop-design` first to set the closed-loop response routing, then re-score in 30 days."
+        )
+    if agent_summary.get("consistency_grade") in ("D", "F"):
+        recs.append(
+            f"Consistency graded {agent_summary['consistency_grade']}: composite SD {agent_summary.get('composite_sd','n/a')} across powered agents. The targeted-coaching list above names the agents driving the variance. Per Campbell, focus on lifting the bottom quartile, not the mean."
+        )
+    if cor["csat_vs_resolution_time"] is not None and cor["csat_vs_resolution_time"] > -0.10:
+        recs.append(
+            "CSAT does not correlate with resolution time; either the survey is mis-timed (firing before resolution lands) or the customers' satisfaction signal is decoupled from the operating metric. Investigate before acting on the response-time dimension."
+        )
+    if not recs:
+        recs.append("All four dimensions grade C or better with expected correlations. Maintain the loop; re-score next month per `routines/support-cluster-monthly.md`.")
+    for r in recs:
+        lines.append(f"- {r}")
+    lines.append("")
+
+    # 7. Substrate citations
+    lines.append("## 7. Substrate citations")
+    lines.append("")
+    lines.append(f"- Tickets export: `{tickets_path}` (rows: {team['n']}; ingested {today})")
+    lines.append(f"- ICP layer: `clients/{client}/icp/icp.md` (drives ICP-fit-banded reads)")
+    lines.append(f"- VoC layer: `clients/{client}/voc/voc.md` (validates language patterns in low-CSAT excerpts)")
+    lines.append("- Pattern grounding: `knowledge/patterns/tickets-are-product-feedback-channel.md` (low-CSAT excerpts feed back into the cluster run).")
+    lines.append("- Pattern grounding: `knowledge/patterns/support-as-churn-leading-indicator.md` (response-time elevation cross-references the per-account spike read).")
+    lines.append("- Pattern grounding: `knowledge/patterns/deflection-is-not-the-goal.md` (right-routing accuracy and CSAT-correlated outcomes are the load-bearing measures).")
+    lines.append("")
+
+    # 8. Next reads
+    lines.append("## 8. Next reads")
+    lines.append("")
+    lines.append(f"- `skills/ticket-cluster-analysis/bin/ticket-cluster-analysis --client {client} --tickets {tickets_path}` to feed the bottom-quartile excerpts into the cluster run.")
+    lines.append(f"- `skills/csat-loop-design/bin/csat-loop-design --client {client}` to wire the CSAT-correlation findings into the closed-loop response design.")
+    lines.append(f"- `skills/churn-signal-from-support/bin/churn-signal-from-support --client {client} --tickets {tickets_path}` to cross-reference response-time elevation with per-account spike risk.")
+    lines.append(f"- `skills/help-content-gap-detect/bin/help-content-gap-detect --client {client}` to convert recurring escalation themes into help-content gaps.")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_outputs(
+    json_path: Path,
+    csv_path: Path,
+    client: str,
+    today: str,
+    tickets_path: Path,
+    targets: dict,
+    team: dict,
+    agents: list[dict],
+    agent_summary: dict,
+    excerpts: list[dict],
+    composite: float,
+    composite_grade: str,
+) -> None:
+    payload = {
+        "client": client,
+        "generated_at": today,
+        "tickets_source": str(tickets_path),
+        "targets": targets,
+        "team": team,
+        "agents": agents,
+        "agent_summary": agent_summary,
+        "bottom_quartile_excerpts": excerpts,
+        "composite_score": composite,
+        "composite_grade": composite_grade,
+        "weights": {
+            "response_time": WEIGHT_RESPONSE,
+            "fcr": WEIGHT_FCR,
+            "csat": WEIGHT_CSAT,
+            "consistency": WEIGHT_CONSISTENCY,
+        },
+        "patterns_grounded": [
+            "tickets-are-product-feedback-channel",
+            "support-as-churn-leading-indicator",
+            "deflection-is-not-the-goal",
+        ],
+    }
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "agent_id", "n", "under_powered", "composite_score",
+            "csat_mean", "fcr_rate",
+            "median_resolution_hours", "median_first_response_minutes",
+            "promoters_pct", "detractors_pct",
+        ])
+        writer.writeheader()
+        for a in agents:
+            writer.writerow({
+                "agent_id": a["agent_id"],
+                "n": a["n"],
+                "under_powered": a["under_powered"],
+                "composite_score": a["composite_score"] if a["composite_score"] is not None else "",
+                "csat_mean": a.get("csat_mean", "") if a.get("csat_mean") is not None else "",
+                "fcr_rate": a.get("fcr_rate", "") if a.get("fcr_rate") is not None else "",
+                "median_resolution_hours": a.get("median_resolution_hours", "") if a.get("median_resolution_hours") is not None else "",
+                "median_first_response_minutes": a.get("median_first_response_minutes", "") if a.get("median_first_response_minutes") is not None else "",
+                "promoters_pct": a.get("promoters_pct", "") if a.get("promoters_pct") is not None else "",
+                "detractors_pct": a.get("detractors_pct", "") if a.get("detractors_pct") is not None else "",
+            })
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--client", required=True)
+    parser.add_argument("--tickets", required=True)
+    parser.add_argument("--target-first-response-min", type=int, default=30)
+    parser.add_argument("--target-resolution-hours", type=int, default=4)
+    parser.add_argument("--target-fcr-rate", type=float, default=0.70)
+    parser.add_argument("--target-csat-mean", type=float, default=4.2)
+    parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--strict-substrate", action="store_true")
+    args = parser.parse_args()
+
+    tickets_path = Path(args.tickets).resolve()
+    if not tickets_path.is_file():
+        print(f"REFUSED: missing-tickets, {tickets_path} not found", file=sys.stderr)
+        return 3
+
+    # Substrate preflight
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    fails: list[str] = []
+    if not client_root.exists():
+        fails.append(f"client root missing: clients/{args.client}/")
+    else:
+        if not (client_root / "icp").is_dir() and not (client_root / "icp.md").is_file():
+            fails.append(f"icp layer missing: clients/{args.client}/icp/")
+        if not (client_root / "voc").is_dir() and not (client_root / "voc.md").is_file():
+            fails.append(f"voc layer missing: clients/{args.client}/voc/")
+    if fails:
+        print("REFUSED: substrate-gap (icp + voc required)", file=sys.stderr)
+        for f in fails:
+            print(f"  - {f}", file=sys.stderr)
+        if args.strict_substrate:
+            return 3
+        print("  (continuing without substrate; outputs will mark layers as gaps)", file=sys.stderr)
+
+    try:
+        rows = load_tickets(tickets_path)
+    except ValueError as e:
+        print(f"REFUSED: schema-mismatch, {e}", file=sys.stderr)
+        return 3
+
+    if not rows:
+        print("REFUSED: empty-corpus, tickets CSV had no data rows", file=sys.stderr)
+        return 3
+    if len(rows) < MIN_TICKETS_TEAM:
+        print(
+            f"REFUSED: too-few-tickets, corpus has {len(rows)} tickets (minimum {MIN_TICKETS_TEAM}). "
+            f"The team-level read produces noise below this floor.",
+            file=sys.stderr,
+        )
+        return 3
+
+    csat_count = sum(1 for r in rows if to_int(r.get("csat")) is not None)
+    coverage = csat_count / len(rows)
+    if coverage < CSAT_COVERAGE_FLOOR:
+        print(
+            f"REFUSED: missing-csat-coverage, CSAT present on {coverage*100:.1f}% of rows (floor {CSAT_COVERAGE_FLOOR*100:.0f}%). "
+            f"The CSAT-correlation dimension cannot run against thin signal.",
+            file=sys.stderr,
+        )
+        return 3
+
+    print(f"[support-quality-score] client={args.client} tickets_n={len(rows)} csat_coverage={coverage*100:.1f}%", file=sys.stderr)
+
+    targets = {
+        "target_first_response_min": args.target_first_response_min,
+        "target_resolution_hours": args.target_resolution_hours,
+        "target_fcr_rate": args.target_fcr_rate,
+        "target_csat_mean": args.target_csat_mean,
+    }
+
+    team = compute_team_dimensions(rows, targets)
+    agents, agent_summary = compute_per_agent(rows, targets)
+    excerpts = bottom_quartile_excerpts(rows, n=5)
+
+    composite = (
+        WEIGHT_RESPONSE * team["response_time"]["score"]
+        + WEIGHT_FCR * team["fcr"]["score"]
+        + WEIGHT_CSAT * team["csat"]["score"]
+        + WEIGHT_CONSISTENCY * agent_summary["consistency_score"]
+    )
+    composite = round(composite, 3)
+    if composite >= 0.93:
+        composite_grade = "A"
+    elif composite >= 0.78:
+        composite_grade = "B"
+    elif composite >= 0.62:
+        composite_grade = "C"
+    elif composite >= 0.45:
+        composite_grade = "D"
+    else:
+        composite_grade = "F"
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else SUBSTRATE_ROOT / "clients" / args.client / "support"
+    md_path = out_dir / f"support-quality-score-{today}.md"
+    json_path = out_dir / f"support-quality-score-{today}.json"
+    csv_path = out_dir / f"support-quality-score-agents-{today}.csv"
+
+    write_md(
+        md_path, args.client, today, tickets_path,
+        targets, team, agents, agent_summary, excerpts,
+    )
+    write_outputs(
+        json_path, csv_path, args.client, today, tickets_path,
+        targets, team, agents, agent_summary, excerpts,
+        composite, composite_grade,
+    )
+
+    print(f"[support-quality-score] composite: {composite_grade} ({composite})", file=sys.stderr)
+    print(f"[support-quality-score] dimensions: response={team['response_time']['grade']} fcr={team['fcr']['grade']} csat={team['csat']['grade']} consistency={agent_summary['consistency_grade']}", file=sys.stderr)
+    print(f"[support-quality-score] markdown: {md_path}")
+    print(f"[support-quality-score] json:     {json_path}")
+    print(f"[support-quality-score] agents:   {csv_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

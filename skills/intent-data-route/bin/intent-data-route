@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""intent-data-route — route intent signals to ICP cohort + recommended action.
+
+Reads a generic intent feed (G2 / Bombora / 6sense / Demandbase shaped CSV),
+the most-recent account ranking from abm-account-prioritize, and the most-
+recent triggers file from sales-trigger-event-watch. Produces a routed CSV
+with action assignment per account.
+
+Usage:
+    intent-data-route --client <client> [--feed <csv>] [--rankings <csv>]
+                      [--threshold-high 75] [--threshold-mid 40] [--threshold-low 15]
+                      [--output <path>]
+
+Exit codes:
+    0 — routing complete
+    1 — preflight refused (substrate gap)
+    2 — input invalid
+    3 — refused (e.g., >50% fast-track without --force)
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SUBSTRATE_ROOT = Path(
+    os.environ.get("SUBSTRATE_ROOT")
+    or os.environ.get("FLYWHEEL_ROOT")
+    or Path(__file__).resolve().parents[3]
+)
+
+
+# ---- Routing matrix ----
+
+def route_decision(score: int, tier: str, has_trigger: bool,
+                   threshold_high: int, threshold_mid: int,
+                   threshold_low: int) -> tuple[str, str, str]:
+    """Return (action, owner, rationale)."""
+    if score < threshold_low:
+        return ("disqualify-this-cycle", "—",
+                f"score<{threshold_low} (intent below floor); revisit in 90d")
+
+    if score >= threshold_high:
+        if tier in ("1A", "1B"):
+            sla = "48h" if has_trigger else "5d"
+            return ("fast-track",
+                    "AE",
+                    f"score≥{threshold_high} + tier={tier} → AE meeting in {sla}")
+        # tier 2 with high intent → SDR sprint
+        return ("outbound-now",
+                "SDR",
+                f"score≥{threshold_high} + tier={tier} → SDR sprint cadence")
+
+    if score >= threshold_mid:
+        if tier in ("1A", "1B"):
+            return ("outbound-now",
+                    "SDR-AE",
+                    f"score in [{threshold_mid}, {threshold_high}) + tier={tier} → hybrid cadence")
+        return ("nurture",
+                "SDR pool",
+                f"score in [{threshold_mid}, {threshold_high}) + tier={tier} → scaled cadence, monthly")
+
+    # score in [threshold_low, threshold_mid)
+    if tier in ("1A", "1B") and has_trigger:
+        return ("nurture-with-trigger-anchor",
+                "SDR",
+                f"score in [{threshold_low}, {threshold_mid}) + tier={tier} + trigger → light outbound, trigger-anchored")
+
+    return ("nurture",
+            "marketing",
+            f"score in [{threshold_low}, {threshold_mid}) + no high-priority signals → content-only, quarterly")
+
+
+# ---- Loaders ----
+
+def load_anti_icp_industries(client: str) -> set[str]:
+    icp_dir = SUBSTRATE_ROOT / "clients" / client / "icp"
+    out: set[str] = set()
+    if not icp_dir.is_dir():
+        return out
+    for f in icp_dir.glob("*.md"):
+        text = f.read_text(encoding="utf-8")
+        m = re.search(r"^anti[_-]?industries?\s*:\s*(.*)$", text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            for token in re.split(r"[,;\[\]]", m.group(1)):
+                token = re.sub(r"^[\"'\s]+|[\"'\s]+$", "", token).lower()
+                if token:
+                    out.add(token)
+    return out
+
+
+def load_rankings(client: str, override_path: str | None) -> dict[str, str]:
+    """Build company-name → tier map from most recent rankings CSV."""
+    by_company: dict[str, str] = {}
+    if override_path:
+        path = Path(override_path)
+    else:
+        rank_dir = SUBSTRATE_ROOT / "clients" / client / "sales" / "account-rankings"
+        if not rank_dir.is_dir():
+            return by_company
+        candidates = sorted(rank_dir.glob("*-ranked.csv"), reverse=True)
+        if not candidates:
+            return by_company
+        path = candidates[0]
+    if not path.is_file():
+        return by_company
+
+    with path.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            row = {k.lower(): v for k, v in row.items()}
+            company = (row.get("company") or "").strip().lower()
+            tier = (row.get("tier") or "").strip()
+            if company and tier:
+                by_company[company] = tier
+    return by_company
+
+
+def load_recent_triggers(client: str) -> dict[str, str]:
+    """Map company-lower → most-recent trigger event-type from latest triggers file."""
+    trig_dir = SUBSTRATE_ROOT / "clients" / client / "sales" / "triggers"
+    out: dict[str, str] = {}
+    if not trig_dir.is_dir():
+        return out
+    candidates = sorted([f for f in trig_dir.glob("*.md") if f.stem != "INDEX"], reverse=True)
+    if not candidates:
+        return out
+    text = candidates[0].read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if "|" not in line:
+            continue
+        m_acc = re.search(r"account:\s*([^|]+?)(?=\s*\|)", line)
+        m_evt = re.search(r"event:\s*([^|]+?)(?=\s*\|)", line)
+        if m_acc and m_evt:
+            out[m_acc.group(1).strip().lower()] = m_evt.group(1).strip()
+    return out
+
+
+def load_intent_feed(path: Path) -> tuple[list[dict], list[str]]:
+    rows: list[dict] = []
+    columns: list[str] = []
+    with path.open(encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            return rows, columns
+        columns = list(reader.fieldnames)
+        # Lowercase keys but preserve original column order
+        for row in reader:
+            rows.append({k.lower(): v for k, v in row.items()})
+    return rows, columns
+
+
+# ---- Main ----
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--client", required=True)
+    p.add_argument("--feed", default=None)
+    p.add_argument("--rankings", default=None)
+    p.add_argument("--threshold-high", type=int, default=75)
+    p.add_argument("--threshold-mid", type=int, default=40)
+    p.add_argument("--threshold-low", type=int, default=15)
+    p.add_argument("--output", default=None)
+    p.add_argument("--force", action="store_true")
+    args = p.parse_args()
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    if not client_root.is_dir():
+        print(f"REFUSED: client root missing — {client_root}", file=sys.stderr)
+        return 1
+
+    icp_dir = client_root / "icp"
+    if not icp_dir.is_dir() and not (client_root / "icp.md").is_file():
+        print(f"REFUSED: ICP layer missing at clients/{args.client}/icp/", file=sys.stderr)
+        return 1
+
+    feed_path = Path(args.feed) if args.feed else (client_root / "sales" / "intent-feed" / "latest.csv")
+    if not feed_path.is_file():
+        print(f"REFUSED: intent feed missing — {feed_path}", file=sys.stderr)
+        return 1
+
+    rows, columns = load_intent_feed(feed_path)
+    if not rows:
+        print(f"REFUSED: intent feed has no rows", file=sys.stderr)
+        return 2
+
+    # Validate score column present
+    score_keys = {"total_score", "score", "intent_score"}
+    has_score = any(k in (col.lower() for col in columns) for k in score_keys)
+    if not has_score:
+        print(f"REFUSED: intent feed has no score column (need one of {sorted(score_keys)})", file=sys.stderr)
+        return 2
+
+    # Threshold sanity
+    if not (args.threshold_low < args.threshold_mid < args.threshold_high):
+        print(f"REFUSED: thresholds not strictly increasing: low={args.threshold_low}, "
+              f"mid={args.threshold_mid}, high={args.threshold_high}", file=sys.stderr)
+        return 2
+
+    anti_icp = load_anti_icp_industries(args.client)
+    tier_map = load_rankings(args.client, args.rankings)
+    triggers_by_company = load_recent_triggers(args.client)
+
+    print(f"[intent-data-route] client={args.client}, feed={feed_path.name}", file=sys.stderr)
+    print(f"  rows: {len(rows)}", file=sys.stderr)
+    print(f"  anti-ICP industries: {len(anti_icp)}", file=sys.stderr)
+    print(f"  ranked accounts (tier known): {len(tier_map)}", file=sys.stderr)
+    print(f"  triggered accounts (last cycle): {len(triggers_by_company)}", file=sys.stderr)
+    print(f"  thresholds: low={args.threshold_low}, mid={args.threshold_mid}, high={args.threshold_high}", file=sys.stderr)
+
+    # ---- Route ----
+    routed = []
+    action_counts: dict[str, int] = {}
+    dropped_anti_icp = 0
+
+    for row in rows:
+        company = (row.get("company") or row.get("account") or "").strip()
+        if not company:
+            continue
+
+        industry = (row.get("industry") or "").strip().lower()
+        if industry and industry in anti_icp:
+            dropped_anti_icp += 1
+            continue
+
+        # Score
+        score_str = (row.get("total_score") or row.get("score") or row.get("intent_score") or "0")
+        try:
+            score = int(float(str(score_str).strip()))
+        except (ValueError, TypeError):
+            score = 0
+
+        tier = tier_map.get(company.lower(), "1B")  # default 1B if unranked
+        trigger_event = triggers_by_company.get(company.lower(), "")
+        has_trigger = bool(trigger_event)
+
+        action, owner, rationale = route_decision(
+            score, tier, has_trigger,
+            args.threshold_high, args.threshold_mid, args.threshold_low,
+        )
+
+        action_counts[action] = action_counts.get(action, 0) + 1
+
+        out_row = {**row}
+        out_row["tier"] = tier
+        out_row["has_recent_trigger"] = "yes" if has_trigger else "no"
+        out_row["recent_trigger_type"] = trigger_event
+        out_row["routed_action"] = action
+        out_row["routed_owner"] = owner
+        out_row["routed_rationale"] = rationale
+        routed.append(out_row)
+
+    # Fast-track sanity check
+    fast_track = action_counts.get("fast-track", 0)
+    if routed and (fast_track / len(routed)) > 0.5 and not args.force:
+        print(f"REFUSED: {fast_track}/{len(routed)} ({fast_track / len(routed):.0%}) routed to fast-track", file=sys.stderr)
+        print(f"  fast-track is by definition top-of-intent; >50% suggests threshold mis-calibration.", file=sys.stderr)
+        print(f"  raise --threshold-high or pass --force to proceed.", file=sys.stderr)
+        return 3
+
+    # ---- Write outputs ----
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if args.output:
+        out_csv = Path(args.output).resolve()
+    else:
+        out_dir = client_root / "sales" / "intent-routing"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_csv = out_dir / f"{today}-routed.csv"
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    if routed:
+        # Preserve feed columns + appended routing columns
+        original_columns = [c.lower() for c in columns]
+        appended = ["tier", "has_recent_trigger", "recent_trigger_type",
+                    "routed_action", "routed_owner", "routed_rationale"]
+        all_columns = original_columns + [c for c in appended if c not in original_columns]
+        with out_csv.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=all_columns)
+            writer.writeheader()
+            for r in routed:
+                # Fill missing keys with empty for DictWriter
+                clean = {k: r.get(k, "") for k in all_columns}
+                writer.writerow(clean)
+
+    # Summary md
+    summary_path = out_csv.with_suffix(".summary.md")
+    summary_lines = [
+        "---",
+        "asset_type: intent-routing-summary",
+        f"client: {args.client}",
+        f"date: {today}",
+        f"feed: {feed_path.name}",
+        f"rows_in: {len(rows)}",
+        f"rows_routed: {len(routed)}",
+        f"dropped_anti_icp: {dropped_anti_icp}",
+        "---",
+        "",
+        f"# Intent routing — {today}",
+        "",
+        f"**Client:** {args.client}",
+        f"**Feed:** `{feed_path.relative_to(SUBSTRATE_ROOT) if str(feed_path).startswith(str(SUBSTRATE_ROOT)) else feed_path}`",
+        f"**Routed:** {len(routed)} accounts (dropped {dropped_anti_icp} anti-ICP)",
+        f"**Output CSV:** `{out_csv.relative_to(SUBSTRATE_ROOT) if str(out_csv).startswith(str(SUBSTRATE_ROOT)) else out_csv}`",
+        "",
+        "## Thresholds applied",
+        "",
+        "| Threshold | Value |",
+        "|---|---|",
+        f"| high (fast-track when score ≥) | {args.threshold_high} |",
+        f"| mid (outbound-now when score ≥) | {args.threshold_mid} |",
+        f"| low (disqualify when score <) | {args.threshold_low} |",
+        "",
+        "## Action distribution",
+        "",
+        "| Action | Count | Owner |",
+        "|---|---|---|",
+    ]
+    owner_for_action = {
+        "fast-track": "AE",
+        "outbound-now": "SDR / SDR-AE",
+        "nurture": "SDR pool / marketing",
+        "nurture-with-trigger-anchor": "SDR (light)",
+        "disqualify-this-cycle": "—",
+    }
+    for action, count in sorted(action_counts.items(), key=lambda kv: -kv[1]):
+        summary_lines.append(f"| {action} | {count} | {owner_for_action.get(action, '?')} |")
+
+    summary_lines += [
+        "",
+        "## Top fast-track accounts (immediate AE action)",
+        "",
+    ]
+    fast_rows = [r for r in routed if r["routed_action"] == "fast-track"]
+    if fast_rows:
+        summary_lines.append("| Account | Tier | Score | Trigger | Rationale |")
+        summary_lines.append("|---|---|---|---|---|")
+        for r in fast_rows[:15]:
+            score = r.get("total_score") or r.get("score") or r.get("intent_score") or "?"
+            trigger_val = r.get("recent_trigger_type") or "—"
+            summary_lines.append(
+                f"| {r.get('company', '?')} | {r['tier']} | {score} | {trigger_val} | "
+                f"{r['routed_rationale'][:80]} |"
+            )
+    else:
+        summary_lines.append("_(no fast-track accounts in this batch)_")
+
+    summary_lines += [
+        "",
+        "## Contradiction-resolution log",
+        "",
+        "- `con_personalization-vs-scale`: fast-track + tier-1A → hand-personalized AE outreach (Holland/Nelson position); ",
+        "  outbound-now + tier-2 → scaled SDR cadence (Barrows/Bertuzzi/Roberge position); ",
+        "  nurture buckets respect tier (1A nurture is still warmer than 2 nurture).",
+        "",
+        "## Substrate cited",
+        "",
+        f"- `clients/{args.client}/icp/00-INDEX.md` (anti-ICP filter)",
+        f"- `{feed_path.relative_to(SUBSTRATE_ROOT) if str(feed_path).startswith(str(SUBSTRATE_ROOT)) else feed_path}` (intent feed)",
+    ]
+    if tier_map:
+        summary_lines.append(f"- `clients/{args.client}/sales/account-rankings/<latest>-ranked.csv` (tier lookup)")
+    if triggers_by_company:
+        summary_lines.append(f"- `clients/{args.client}/sales/triggers/<latest>.md` (trigger cross-reference)")
+    summary_lines += [
+        "",
+        "## Patterns grounded",
+        "",
+        "- `knowledge/patterns/account-not-lead-as-unit.md`",
+        "- `knowledge/patterns/trigger-events-beat-cadence-blast.md`",
+        "",
+        "## Next steps",
+        "",
+        "1. AE: handle all fast-track accounts within SLA window.",
+        "2. SDR pool: load outbound-now + nurture buckets into the cadence tool.",
+        "3. Pipe fast-track + outbound-now through `outbound-sequence-design --tier <tier>`.",
+        "4. Recheck disqualified accounts in 90 days.",
+    ]
+    summary_path.write_text("\n".join(summary_lines), encoding="utf-8")
+
+    print(f"\n[intent-data-route] routed: {out_csv}", file=sys.stderr)
+    print(f"[intent-data-route] summary: {summary_path}", file=sys.stderr)
+    print(f"[intent-data-route] action counts: {action_counts}", file=sys.stderr)
+    print(f"PASS: {len(routed)} routed, {dropped_anti_icp} dropped (anti-ICP)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

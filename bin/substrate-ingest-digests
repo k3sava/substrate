@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# substrate-ingest-digests — pulls daily research digests, extracts substrate-applicable items.
+# See routines/digest-ingest.md for the full contract.
+#
+# Usage:
+#   substrate-ingest-digests [--since YYYY-MM-DD] [--source <dir>] [--dry-run] [--verbose]
+#
+# Env:
+#   SUBSTRATE_DIGEST_DIR — path to the upstream digest folder (markdown files dated YYYY-MM-DD.md)
+#   ANTHROPIC_API_KEY    — required for the LLM extract step (Haiku is fine)
+#   SUBSTRATE_ROOT       — auto-detected from this script's location
+
+set -eu
+set -o pipefail
+
+# --- args ---
+SINCE=""
+SOURCE_DIR=""
+DRY_RUN=0
+VERBOSE=0
+SKILL_PROPOSALS=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) SINCE="$2"; shift 2 ;;
+    --source) SOURCE_DIR="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --no-skill-proposals) SKILL_PROPOSALS=0; shift ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 64 ;;
+  esac
+done
+
+# --- locate substrate root ---
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+LEARN_DIR="$SUBSTRATE_ROOT/knowledge/learnings"
+RAW_DIR="$LEARN_DIR/raw"
+LAST_RUN="$LEARN_DIR/.last-run.json"
+LOG_DIR="$SUBSTRATE_ROOT/logs"
+mkdir -p "$RAW_DIR" "$LEARN_DIR/proposals" "$LOG_DIR"
+
+# --- locate digest source ---
+DIGEST_DIR="${SOURCE_DIR:-${SUBSTRATE_DIGEST_DIR:-$SUBSTRATE_ROOT/digest-source}}"
+if [ ! -d "$DIGEST_DIR" ]; then
+  echo "no digest source at: $DIGEST_DIR" >&2
+  echo "set SUBSTRATE_DIGEST_DIR or pass --source" >&2
+  exit 1
+fi
+
+# --- determine since date ---
+if [ -z "$SINCE" ]; then
+  if [ -f "$LAST_RUN" ]; then
+    SINCE=$(python3 -c "import json; print(json.load(open('$LAST_RUN'))['last_date'])" 2>/dev/null || echo "")
+  fi
+  if [ -z "$SINCE" ]; then
+    # default: yesterday
+    SINCE=$(date -v-1d -u +"%Y-%m-%d" 2>/dev/null || date -d "yesterday" -u +"%Y-%m-%d")
+  fi
+fi
+
+[ "$VERBOSE" -eq 1 ] && echo "[ingest] root=$SUBSTRATE_ROOT" && echo "[ingest] source=$DIGEST_DIR" && echo "[ingest] since=$SINCE"
+
+# --- find new digests ---
+NEW_DIGESTS=$(find "$DIGEST_DIR" -maxdepth 1 -name "????-??-??.md" -type f \
+  | xargs -I{} basename {} .md \
+  | awk -v since="$SINCE" '$1 > since' \
+  | sort)
+
+if [ -z "$NEW_DIGESTS" ]; then
+  echo "[ingest] no new digests since $SINCE"
+  exit 0
+fi
+
+[ "$VERBOSE" -eq 1 ] && echo "[ingest] new digests:" && echo "$NEW_DIGESTS" | sed 's/^/  /'
+
+# --- process each ---
+LATEST_DATE=""
+PROCESSED=0
+
+for DATE in $NEW_DIGESTS; do
+  SRC="$DIGEST_DIR/$DATE.md"
+  RAW_DEST="$RAW_DIR/$DATE.md"
+  EXTRACT_DEST="$LEARN_DIR/$DATE.md"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[ingest] would copy $SRC → $RAW_DEST"
+    echo "[ingest] would extract substrate-applicables → $EXTRACT_DEST"
+    LATEST_DATE="$DATE"
+    PROCESSED=$((PROCESSED+1))
+    continue
+  fi
+
+  # 1. Verbatim copy
+  cp "$SRC" "$RAW_DEST"
+  [ "$VERBOSE" -eq 1 ] && echo "[ingest] copied raw: $RAW_DEST"
+
+  # 2. LLM extract — prefer ask-flash (DeepSeek V4 Flash, ~$0.001/digest) when
+  # available, fall back to Anthropic API, fall back to stub.
+  EXTRACT_PROMPT='List the items in this digest that should change substrate (a context-first GTM operating system). For each: a) target file (skills/<name>/SKILL.md OR PRINCIPLES.md§<section> OR knowledge/<topic>.md OR routines/<name>.md), b) 1-sentence summary, c) evidence (URL/person from the digest), d) confidence (high if a specific substrate file is named AND the change is concrete AND a source is cited; otherwise watch). Output: markdown with "## High-confidence proposals" and "## Watch list" sections. If no items apply, output exactly "(no substrate-applicable items)".'
+
+  if command -v ask-flash >/dev/null 2>&1; then
+    EXTRACTED=$(ask-flash --quiet "$EXTRACT_PROMPT" "$SRC" 2>/dev/null || true)
+    [ "$VERBOSE" -eq 1 ] && echo "[ingest] used ask-flash for $DATE"
+  elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    # Pull the system prompt from the template
+    SYS_PROMPT_FILE="$SUBSTRATE_ROOT/templates/digest-extract-prompt.md"
+    if [ ! -f "$SYS_PROMPT_FILE" ]; then
+      echo "[ingest] missing prompt template: $SYS_PROMPT_FILE" >&2
+      exit 2
+    fi
+    SYS_PROMPT=$(awk '/^## System prompt/,/^## Run command/' "$SYS_PROMPT_FILE" \
+      | sed -n '/^```$/,/^```$/p' | sed '1d;$d')
+
+    DIGEST_TEXT=$(cat "$SRC")
+
+    RESPONSE=$(jq -n --arg sys "$SYS_PROMPT" --arg user "$DIGEST_TEXT" '{
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 4000,
+        system: $sys,
+        messages: [{role: "user", content: $user}]
+      }' | curl -sX POST https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d @-)
+
+    EXTRACTED=$(echo "$RESPONSE" | jq -r '.content[0].text // ""')
+    [ "$VERBOSE" -eq 1 ] && echo "[ingest] used Anthropic API for $DATE"
+  else
+    EXTRACTED=""
+  fi
+
+  if [ -z "$EXTRACTED" ]; then
+    cat > "$EXTRACT_DEST" <<EOF
+# substrate-applicables — $DATE
+
+(extraction skipped — no extractor available. Install ask-flash or set ANTHROPIC_API_KEY. Raw digest at \`raw/$DATE.md\`.)
+EOF
+    [ "$VERBOSE" -eq 1 ] && echo "[ingest] no extractor; stubbed $DATE"
+  else
+    {
+      echo "# substrate-applicables — $DATE"
+      echo
+      echo "$EXTRACTED"
+      echo
+      echo "---"
+      echo "*Raw digest: \`raw/$DATE.md\`*"
+    } > "$EXTRACT_DEST"
+    [ "$VERBOSE" -eq 1 ] && echo "[ingest] extracted: $EXTRACT_DEST"
+  fi
+
+  # 3. Auto-skill-proposal scan (v1.2): for every knowledge/patterns/<slug>.md
+  # referenced in the extraction, check if any SKILL.md cites it under
+  # patterns_grounded. If no hook, file a skill-proposal for human review.
+  if [ "$SKILL_PROPOSALS" -eq 1 ] && [ -n "$EXTRACTED" ]; then
+    PROPOSALS_DIR="$LEARN_DIR/proposals"
+    PATTERN_SLUGS=$(echo "$EXTRACTED" \
+      | grep -oE 'knowledge/patterns/[a-z0-9-]+\.md' \
+      | sed 's|knowledge/patterns/||;s|\.md$||' \
+      | sort -u)
+    for SLUG in $PATTERN_SLUGS; do
+      [ -z "$SLUG" ] && continue
+      # Check if any skill grounds in this pattern. Look inside frontmatter
+      # patterns_grounded: arrays (both inline and block form).
+      HOOKS=$(grep -l "patterns_grounded:" "$SUBSTRATE_ROOT"/skills/*/SKILL.md 2>/dev/null \
+        | xargs grep -l "$SLUG" 2>/dev/null \
+        | xargs -I{} dirname {} 2>/dev/null \
+        | xargs -I{} basename {} 2>/dev/null \
+        | tr '\n' ' ')
+      if [ -z "$HOOKS" ]; then
+        PROP_FILE="$PROPOSALS_DIR/$DATE-skill-proposal-$SLUG.md"
+        if [ ! -f "$PROP_FILE" ]; then
+          cat > "$PROP_FILE" <<PROP
+---
+title: Skill proposal for unrooted pattern '$SLUG'
+status: pending
+proposed_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+trigger: digest-ingest auto-skill-proposal
+pattern_slug: $SLUG
+pattern_path: knowledge/patterns/$SLUG.md
+---
+
+# Auto-skill-proposal: '$SLUG' has no substrate hook
+
+The digest dated $DATE referenced \`knowledge/patterns/$SLUG.md\`. No skill in \`skills/*/SKILL.md\` declares this slug under \`patterns_grounded:\`. Per PRINCIPLES.md rule 9, a pattern with zero hooks is observational, not operational.
+
+## Decision options
+
+1. **Scaffold a new skill.** Accept this proposal and substrate generates a SKILL.md skeleton (name, frontmatter, refusal-pattern starter) for operator completion.
+2. **Update an existing skill.** Add \`$SLUG\` to an existing skill's \`patterns_grounded\` if the pattern is already implicit in its behavior.
+3. **Demote the pattern.** Move it from \`knowledge/patterns/\` to \`knowledge/learnings/\` if the pattern is observational only and won't ground a skill.
+
+## Suggested skill skeleton (option 1)
+
+\`\`\`yaml
+---
+name: <derive-from-pattern-slug>
+description: <one-line summary of what the skill does, drawn from the pattern's claim>
+version: 0.1
+amplifies: <operator role>
+masters: <operators cited in the pattern's convergence section>
+substrate_layers_required: []
+patterns_grounded: [$SLUG]
+contradictions_aware: []
+preflight_refusal: substrate-gap
+required_reads:
+  - knowledge/patterns/$SLUG.md
+---
+\`\`\`
+
+## Next step
+
+Operator: review the pattern at \`knowledge/patterns/$SLUG.md\`, decide which option, then either run \`bin/substrate accept-proposal $DATE-skill-proposal-$SLUG\` or close the proposal manually.
+
+PROP
+          [ "$VERBOSE" -eq 1 ] && echo "[ingest] auto-proposal: $PROP_FILE"
+        fi
+      else
+        [ "$VERBOSE" -eq 1 ] && echo "[ingest] pattern $SLUG already hooked by:$HOOKS"
+      fi
+    done
+  fi
+
+  LATEST_DATE="$DATE"
+  PROCESSED=$((PROCESSED+1))
+done
+
+# --- update last-run ---
+if [ "$DRY_RUN" -eq 0 ] && [ -n "$LATEST_DATE" ]; then
+  jq -n --arg d "$LATEST_DATE" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{last_date: $d, last_run: $ts}' > "$LAST_RUN"
+fi
+
+echo "[ingest] processed $PROCESSED digest(s) through $LATEST_DATE"

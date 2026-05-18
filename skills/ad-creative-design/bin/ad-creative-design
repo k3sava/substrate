@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""ad-creative-design — generate channel-specific ad-creative briefs grounded
+in canonical positioning, status-quo or named-competitor framing, and a
+buyer-state cohort. Refuses without canonical positioning or competitive
+substrate.
+
+The brief is structured input to a downstream LLM call. It is not the
+finished ad copy. It carries the substrate context the writer needs:
+positioning anchors, cohort frictions, allowed claims, kill-list, channel
+format constraints.
+
+Usage:
+    ad-creative-design --client <client> --channel <channel>
+                       --cohort <buyer-state> --frame <status-quo|named-competitor>
+                       [--competitor <slug>] [--variants <int>]
+                       [--out <dir>]
+
+Exit codes:
+    0 — brief written
+    3 — refused (substrate gap)
+    4 — invalid args
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+
+
+# Channel format constraints — character limits per surface.
+CHANNEL_CONSTRAINTS = {
+    "google-search": {
+        "rsa_headline_max_chars": 30,
+        "rsa_headline_count": 3,
+        "rsa_description_max_chars": 90,
+        "rsa_description_count": 2,
+        "format": "responsive-search-ad",
+    },
+    "meta-paid-social": {
+        "primary_text_max_chars": 125,
+        "headline_max_chars": 27,
+        "description_max_chars": 27,
+        "format": "single-image-or-video",
+        "has_hook_window": True,
+        "hook_window_seconds": 3,
+    },
+    "linkedin-sponsored": {
+        "headline_max_chars": 70,
+        "intro_text_max_chars": 600,
+        "intro_text_visible_before_more": 150,
+        "format": "single-image-or-video-or-carousel",
+    },
+    "x": {
+        "tweet_max_chars": 280,
+        "format": "tweet-or-thread",
+        "supports_image": True,
+    },
+    "tiktok": {
+        "hook_window_seconds": 1.5,
+        "primary_window_seconds": 15,
+        "caption_max_chars": 2200,
+        "format": "vertical-video-9-16",
+    },
+    "reddit": {
+        "title_max_chars": 300,
+        "body_max_chars": 40000,
+        "format": "promoted-post",
+        "needs_second_less-promo_variant": True,
+    },
+}
+
+
+REFUSAL_HEADER = "REFUSED: "
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\n{REFUSAL_HEADER}{reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def read_file_or_none(path: Path) -> str | None:
+    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+
+def extract_canonical_statement(text: str) -> str:
+    in_block = False
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(canonical|the position|statement|positioning)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s:
+                out.append(s)
+    return "\n".join(out).strip() or text[:400].strip()
+
+
+def extract_anchors(positioning_text: str) -> list[str]:
+    """Pull load-bearing terms from the canonical statement and Dunford-5."""
+    anchors: list[str] = []
+    canonical = extract_canonical_statement(positioning_text)
+    # Words 5+ chars
+    candidates = re.findall(r"[a-z][a-z-]{4,}", canonical.lower())
+    seen = set()
+    for w in candidates:
+        if w not in seen and w not in {"unlike", "which", "their", "every", "those"}:
+            seen.add(w)
+            anchors.append(w)
+    return anchors[:20]
+
+
+def extract_value_pillars(positioning_text: str) -> list[str]:
+    out: list[str] = []
+    in_pillars = False
+    for line in positioning_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(value|value themes|value pillars|3\.\s*value)\b", s, re.IGNORECASE):
+            in_pillars = True
+            continue
+        if in_pillars:
+            if s.startswith("#"):
+                break
+            if s.startswith("-") or s.startswith("*"):
+                out.append(s.lstrip("-* ").strip())
+    return out[:6]
+
+
+def extract_unique_attributes(positioning_text: str) -> list[str]:
+    out: list[str] = []
+    in_block = False
+    for line in positioning_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(unique attributes|2\.\s*unique)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s.startswith("-") or s.startswith("*"):
+                out.append(s.lstrip("-* ").strip())
+    return out[:6]
+
+
+def extract_status_quo_frame(competitive_text: str) -> str:
+    in_block = False
+    out: list[str] = []
+    for line in competitive_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(status[-\s]?quo|no[-\s]?decision|alternative)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s:
+                out.append(s)
+    return "\n".join(out).strip()
+
+
+def extract_competitor_block(competitive_text: str, competitor_slug: str) -> str:
+    """Look for a section header that includes the competitor's display name."""
+    slug = competitor_slug.lower().replace("-", " ")
+    in_block = False
+    out: list[str] = []
+    for line in competitive_text.splitlines():
+        s = line.strip()
+        if s.startswith("#") and slug in s.lower():
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("##"):
+                break
+            if s:
+                out.append(s)
+    return "\n".join(out).strip()
+
+
+def find_persona_file(client: str, cohort: str) -> Path | None:
+    """Look for a buyer-state persona at:
+       1. clients/<client>/personas/<cohort>.md
+       2. personas/buyer-state/<cohort>.md
+    """
+    candidates = [
+        SUBSTRATE_ROOT / "clients" / client / "personas" / f"{cohort}.md",
+        SUBSTRATE_ROOT / "clients" / client / "personas" / "buyer-state" / f"{cohort}.md",
+        SUBSTRATE_ROOT / "personas" / "buyer-state" / f"{cohort}.md",
+        SUBSTRATE_ROOT / "personas" / f"{cohort}.md",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
+
+
+def extract_cohort_signals(persona_text: str) -> dict[str, list[str]]:
+    """Pull frictions, objections, decision criteria, voice signals from the persona."""
+    out: dict[str, list[str]] = {
+        "frictions": [], "objections": [], "criteria": [],
+        "voice": [], "goals": [], "snapshot": [],
+    }
+    cur = None
+    for line in persona_text.splitlines():
+        s = line.strip()
+        m = re.match(r"^#+\s*(.+)$", s)
+        if m:
+            h = m.group(1).lower()
+            if "snapshot" in h or "one-line" in h:
+                cur = "snapshot"
+            elif "friction" in h:
+                cur = "frictions"
+            elif "objection" in h:
+                cur = "objections"
+            elif "criteri" in h or "decision" in h:
+                cur = "criteria"
+            elif "voice" in h or "tone" in h:
+                cur = "voice"
+            elif "goal" in h:
+                cur = "goals"
+            else:
+                cur = None
+            continue
+        if cur and s and (s.startswith("-") or s.startswith("*")):
+            out[cur].append(s.lstrip("-* ").strip())
+        elif cur == "snapshot" and s:
+            out["snapshot"].append(s)
+    return out
+
+
+def extract_brand_voice_kill_list(brand_voice_text: str | None) -> list[str]:
+    if not brand_voice_text:
+        return ["orchestration", "seamless", "strategic", "leverage", "transform",
+                "holistic", "synergy", "bespoke", "unlock", "robust", "sophisticated",
+                "comprehensive", "all-in-one", "everything-in-one"]
+    out: list[str] = []
+    in_block = False
+    for line in brand_voice_text.splitlines():
+        s = line.strip()
+        if re.match(r"^#+\s*(kill[-\s]?list|words to avoid|banned|do not use)\b", s, re.IGNORECASE):
+            in_block = True
+            continue
+        if in_block:
+            if s.startswith("#"):
+                break
+            if s.startswith("-") or s.startswith("*"):
+                out.append(s.lstrip("-* ").strip().lower())
+    if not out:
+        out = ["orchestration", "seamless", "strategic", "leverage", "transform",
+               "holistic", "synergy", "bespoke", "unlock", "robust"]
+    return out
+
+
+def render_variant_scaffold(channel: str, variant_idx: int,
+                            anchors: list[str], pillars: list[str],
+                            uniques: list[str], cohort: dict[str, list[str]],
+                            frame: str, competitor: str | None,
+                            canonical: str, status_quo_or_comp_block: str) -> list[str]:
+    """Render a single variant scaffold. Channel-specific shape with character
+    counts and slot-by-slot guidance.
+    """
+    out: list[str] = []
+    out.append(f"### Variant {variant_idx + 1}")
+    out.append("")
+    pillar = pillars[variant_idx % len(pillars)] if pillars else "<value pillar>"
+    unique = uniques[variant_idx % len(uniques)] if uniques else "<unique attribute>"
+    objection = cohort["objections"][variant_idx % len(cohort["objections"])] if cohort.get("objections") else "<objection>"
+    friction = cohort["frictions"][variant_idx % len(cohort["frictions"])] if cohort.get("frictions") else "<friction>"
+
+    constraints = CHANNEL_CONSTRAINTS[channel]
+
+    if channel == "google-search":
+        out.append(f"**Headline 1** (max {constraints['rsa_headline_max_chars']} chars). "
+                   f"Anchor: include the canonical category from positioning. "
+                   f"Source: clients/<client>/01-position.md.")
+        out.append(f"**Headline 2** (max {constraints['rsa_headline_max_chars']} chars). "
+                   f"Anchor: unique attribute = '{unique[:60]}'. "
+                   f"Source: clients/<client>/01-position.md §unique-attributes.")
+        out.append(f"**Headline 3** (max {constraints['rsa_headline_max_chars']} chars). "
+                   f"Call: cohort-specific. For cohort objection '{objection[:60]}', "
+                   f"the call should answer it directly.")
+        out.append(f"**Description 1** (max {constraints['rsa_description_max_chars']} chars). "
+                   f"Value theme: '{pillar[:80]}'. Avoid kill-list.")
+        out.append(f"**Description 2** (max {constraints['rsa_description_max_chars']} chars). "
+                   f"Proof or specificity. Cite a number from product-knowledge or VOC if available; "
+                   f"do not fabricate.")
+        out.append("")
+        out.append("**Match-type and keyword note** — this brief does not generate keywords. "
+                   "Pair with Keyword Planner output. For the cohort's buyer-state, prefer "
+                   "exact and phrase match over broad.")
+
+    elif channel == "meta-paid-social":
+        out.append(f"**Hook (first {constraints['hook_window_seconds']} seconds)** — open on the "
+                   f"cohort's friction: '{friction[:120]}'. The hook does NOT name the product; "
+                   f"it names the friction the cohort is feeling right now.")
+        out.append(f"**Primary text** (max {constraints['primary_text_max_chars']} chars). "
+                   f"State the value pillar in the cohort's language: '{pillar[:100]}'.")
+        out.append(f"**Headline** (max {constraints['headline_max_chars']} chars). Carry an anchor "
+                   f"from the canonical statement.")
+        out.append(f"**Description** (max {constraints['description_max_chars']} chars). The call.")
+        out.append("**Image / video direction**:")
+        out.append("  - Composition: cohort-relevant (e.g., a sales-leader screen for a sales-leader cohort).")
+        out.append("  - On-creative text size: large enough to read at thumbnail (rule: 50% of screen height for a 3-word hook).")
+        out.append("  - Motion (if video): pattern interrupt at the 3-second mark; payoff at 12-15 seconds.")
+        out.append("  - Reference: the creative-fatigue-window pattern requires a refresh every 2-4 weeks, so build for variant production not for one-shot polish.")
+
+    elif channel == "linkedin-sponsored":
+        out.append(f"**Headline** (max {constraints['headline_max_chars']} chars). "
+                   f"Anchor on the cohort's role + the unique attribute: '{unique[:80]}'.")
+        out.append(f"**Intro text** (max {constraints['intro_text_max_chars']} chars; first "
+                   f"{constraints['intro_text_visible_before_more']} chars before 'see more'). "
+                   f"Open on the cohort's friction; pivot to the value pillar by char 150.")
+        out.append("**Format direction**:")
+        out.append("  - Single-image preferred for prospecting; carousel for product-deep cohorts.")
+        out.append("  - Composition: business-environment, not consumer.")
+        out.append("**Targeting note**:")
+        out.append("  - Read clients/<client>/02-icp.md §roles, §sizes for layered targeting.")
+        out.append("  - LinkedIn rewards narrow targeting on this audience type; resist 'broad' temptation.")
+
+    elif channel == "x":
+        out.append(f"**Tweet 1** (max {constraints['tweet_max_chars']} chars). "
+                   f"Hook: name the cohort's objection and answer in one breath. "
+                   f"Objection: '{objection[:120]}'.")
+        out.append(f"**Tweet 2** (max {constraints['tweet_max_chars']} chars). "
+                   f"Proof: a specific, citable number. Cite product-knowledge or VOC. "
+                   f"Anti-fabrication: no invented stats; mark unverified or cut.")
+        out.append("**Optional thread continuation** — 1-2 more tweets that detail the unique attribute "
+                   "and end with a soft call. The cohort's voice signature determines whether the call "
+                   "is direct or contrarian.")
+        out.append("**Image / video direction**: single screenshot of the proof, OR a 6-12 second clip.")
+
+    elif channel == "tiktok":
+        out.append(f"**Hook (first {constraints['hook_window_seconds']} seconds)**: "
+                   f"voice-over line that names the cohort's friction in one sentence: '{friction[:100]}'.")
+        out.append("**Pattern interrupt (3-5 second mark)**: visual change OR claim contradiction.")
+        out.append(f"**Payoff (15-30 second mark)**: the unique attribute = '{unique[:80]}'.")
+        out.append(f"**Caption** (max {constraints['caption_max_chars']} chars). Lead with the value pillar; "
+                   f"close with a contextual call (visit URL, book demo, or comment).")
+        out.append("**Production note**: the creative-fatigue-window pattern is most aggressive on TikTok. "
+                   "Plan for at least 1 new variant per week; this variant is one of that cadence.")
+
+    elif channel == "reddit":
+        out.append(f"**Title** (max {constraints['title_max_chars']} chars). "
+                   f"Pose a question the cohort is actually asking. Reddit titles that read as ad copy "
+                   f"underperform; titles that read as posts overperform.")
+        out.append("**Body**: 250-500 words. Open with the cohort's friction. Spend 70% of the body on "
+                   "context (the friction, why it matters), 20% on the value pillar, 10% on the call.")
+        out.append("**Anti-pattern**: avoid 'we' / 'our product' framing. Reddit's audience is hostile to "
+                   "first-person ad copy. Frame the post as analysis or report.")
+        out.append("**Second variant** (less promotional): the same body with 0% direct product mention; "
+                   "the post links to a long-form asset that does the selling. Required by Reddit's "
+                   "audience pattern; not optional.")
+
+    out.append("")
+    out.append("**Substrate cites** for this variant:")
+    out.append(f"- canonical positioning: clients/<client>/01-position.md")
+    out.append(f"- value pillar: clients/<client>/01-position.md §value-themes ('{pillar[:60]}')")
+    out.append(f"- unique attribute: clients/<client>/01-position.md §unique-attributes ('{unique[:60]}')")
+    out.append(f"- cohort friction: personas/buyer-state/<cohort>.md")
+    if frame == "named-competitor" and competitor:
+        out.append(f"- competitor frame: clients/<client>/04-competitive.md §{competitor}")
+    else:
+        out.append("- status-quo frame: clients/<client>/04-competitive.md §status-quo")
+    out.append("")
+    return out
+
+
+def render_brief(*,
+                 client: str,
+                 channel: str,
+                 cohort: str,
+                 frame: str,
+                 competitor: str | None,
+                 variants: int,
+                 canonical: str,
+                 anchors: list[str],
+                 pillars: list[str],
+                 uniques: list[str],
+                 status_quo_or_comp_block: str,
+                 cohort_signals: dict[str, list[str]],
+                 cohort_path: Path,
+                 kill_list: list[str],
+                 today: str) -> str:
+    constraints = CHANNEL_CONSTRAINTS[channel]
+    fence = "|"
+
+    lines = []
+    lines.append("---")
+    lines.append(f"brief_id: {client}-ads-{channel}-{cohort}-{frame}-{today}")
+    lines.append(f"channel: {channel}")
+    lines.append(f"cohort: {cohort}")
+    lines.append(f"frame: {frame}")
+    lines.append(f"competitor: {competitor or ''}")
+    lines.append(f"variants_requested: {variants}")
+    lines.append("substrate_layers_read: [positioning, icp, voc, competitive, brand-voice]")
+    lines.append("patterns_applied: [creative-fatigue-window, intent-vs-interest-targeting, buyer-mindset-not-product-features]")
+    lines.append("contradictions_resolved: [no-decision-vs-named-competitor]")
+    lines.append("canonical_position_excerpt: |")
+    for line in canonical.splitlines()[:8]:
+        lines.append(f"  {line}")
+    lines.append("status_quo_or_competitor_frame: |")
+    for line in status_quo_or_comp_block.splitlines()[:10]:
+        lines.append(f"  {line}")
+    lines.append("cohort_voice_signals: |")
+    for s in (cohort_signals.get("snapshot") or [])[:3]:
+        lines.append(f"  {s}")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# ad-creative-design: {client} | {channel} | {cohort} | {frame} | {today}")
+    lines.append("")
+
+    lines.append("## Brief context")
+    lines.append("")
+    lines.append("**Canonical positioning** (verbatim):")
+    lines.append("")
+    lines.append("> " + canonical.replace("\n", "\n> "))
+    lines.append("")
+    lines.append(f"**Cohort**: `{cohort}` (read from `{cohort_path.relative_to(SUBSTRATE_ROOT) if str(cohort_path).startswith(str(SUBSTRATE_ROOT)) else cohort_path}`)")
+    lines.append("")
+    if cohort_signals.get("snapshot"):
+        lines.append("Cohort one-line snapshot:")
+        for s in cohort_signals["snapshot"][:2]:
+            lines.append(f"> {s}")
+        lines.append("")
+    if cohort_signals.get("frictions"):
+        lines.append("Cohort top frictions:")
+        for f in cohort_signals["frictions"][:5]:
+            lines.append(f"- {f}")
+        lines.append("")
+    if cohort_signals.get("objections"):
+        lines.append("Cohort objections to expect:")
+        for o in cohort_signals["objections"][:5]:
+            lines.append(f"- {o}")
+        lines.append("")
+    lines.append(f"**Frame**: `{frame}`")
+    if frame == "named-competitor" and competitor:
+        lines.append(f"**Named competitor**: `{competitor}`")
+    lines.append("")
+    if status_quo_or_comp_block:
+        lines.append("Frame block (verbatim):")
+        lines.append("")
+        for fl in status_quo_or_comp_block.splitlines()[:8]:
+            lines.append(f"> {fl}")
+        lines.append("")
+
+    lines.append("## Format constraints")
+    lines.append("")
+    lines.append(f"Channel format: `{constraints.get('format', '<unknown>')}`.")
+    for k, v in constraints.items():
+        if k == "format":
+            continue
+        lines.append(f"- {k}: {v}")
+    lines.append("")
+
+    lines.append("## Anchor terms")
+    lines.append("")
+    lines.append("Variants must include at least one of these anchor terms in the headline (per `creative-fatigue-window` and `copywriting-craft-fundamentals`):")
+    lines.append("")
+    for a in anchors[:15]:
+        lines.append(f"- `{a}`")
+    lines.append("")
+
+    lines.append("## Avoid list")
+    lines.append("")
+    lines.append("These terms are off-position or kill-list. Variants that include them are rejected:")
+    lines.append("")
+    for k in kill_list[:20]:
+        lines.append(f"- `{k}`")
+    lines.append("")
+
+    lines.append("## Variant scaffolds")
+    lines.append("")
+    for i in range(variants):
+        lines.extend(render_variant_scaffold(
+            channel=channel,
+            variant_idx=i,
+            anchors=anchors,
+            pillars=pillars,
+            uniques=uniques,
+            cohort=cohort_signals,
+            frame=frame,
+            competitor=competitor,
+            canonical=canonical,
+            status_quo_or_comp_block=status_quo_or_comp_block,
+        ))
+
+    lines.append("## Test design")
+    lines.append("")
+    lines.append("Variant 1 vs Variant 2 form the primary A/B contrast. The hypothesis is named below; "
+                 "if both variants are statistically indistinguishable after the planned spend window, "
+                 "the test concludes NULL (no signal). Per `incrementality-not-attribution`, channel "
+                 "platform-reported CAC is not a sufficient resolution signal for cross-channel decisions; "
+                 "for within-channel creative tests, platform-reported CTR and CVR are acceptable.")
+    lines.append("")
+    lines.append("**Hypothesis**: Variant 1's hook (which leads with cohort friction) outperforms "
+                 "Variant 2's hook (which leads with the unique attribute) on CTR by at least 15% "
+                 "for the cohort. Pattern grounding: `buyer-mindset-not-product-features`.")
+    lines.append("")
+    lines.append("**Resolution signal**: 7-day CTR difference, statistically significant (p < 0.10), "
+                 "minimum 1,000 clicks per variant, same audience and bid strategy.")
+    lines.append("")
+    lines.append("Pair the test with `open-goal` so the result lands in the calibration ledger.")
+    lines.append("")
+
+    lines.append("## Substrate citations")
+    lines.append("")
+    lines.append(f"- positioning: `clients/{client}/01-position.md`")
+    lines.append(f"- competitive: `clients/{client}/04-competitive.md`")
+    lines.append(f"- ICP: `clients/{client}/02-icp.md`")
+    lines.append(f"- brand voice: `clients/{client}/07-brand-voice.md`")
+    lines.append(f"- cohort: `{cohort_path.relative_to(SUBSTRATE_ROOT) if str(cohort_path).startswith(str(SUBSTRATE_ROOT)) else cohort_path}`")
+    lines.append("")
+
+    lines.append("## Refusal-pattern compliance")
+    lines.append("")
+    lines.append("This brief does NOT:")
+    lines.append("")
+    lines.append("- Claim numbers without a substrate path (downstream writer must keep the discipline).")
+    lines.append("- Invent customer names or quote attributions.")
+    lines.append("- Use kill-list terms.")
+    lines.append("- Promise an outcome not in the allowed-claims set.")
+    lines.append("- Use the named competitor's framing without the operator passing `--frame named-competitor`.")
+    lines.append("")
+    lines.append("If the downstream LLM emits any of the above, run `voice-enforce` and `claim-verify` "
+                 "before the variant ships. Both gates are mandatory before any spend goes against the variants.")
+    lines.append("")
+
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `ad-diagnose` — flagged the campaign(s) this brief responds to.")
+    lines.append("- `ad-spend-allocate` — sets the budget allocation this variant set spends against.")
+    lines.append("- `ad-fatigue-monitor` — schedules the next refresh trigger when these variants tire.")
+    lines.append("- `voice-enforce` and `claim-verify` — gates the downstream finished copy must pass before ship.")
+    lines.append("- `routines/ad-fatigue-routine.md` — operating cadence; this brief is one cycle's input.")
+    return "\n".join(lines)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="ad-creative-design")
+    p.add_argument("--client", required=True)
+    p.add_argument("--channel", required=True, choices=list(CHANNEL_CONSTRAINTS.keys()))
+    p.add_argument("--cohort", required=True)
+    p.add_argument("--frame", required=True, choices=["status-quo", "named-competitor"])
+    p.add_argument("--competitor", default=None)
+    p.add_argument("--variants", type=int, default=4)
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Required substrate files
+    pos_path = SUBSTRATE_ROOT / "clients" / args.client / "01-position.md"
+    comp_path = SUBSTRATE_ROOT / "clients" / args.client / "04-competitive.md"
+    pos = read_file_or_none(pos_path)
+    comp = read_file_or_none(comp_path)
+    if pos is None:
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/01-position.md not found. "
+                      f"Run positioning-forge first; the brief cannot be grounded.")
+    if comp is None:
+        return refuse("missing-competitive",
+                      f"clients/{args.client}/04-competitive.md not found. "
+                      f"Run competitive-scout first; the brief cannot pick a frame.")
+
+    # Frame validation
+    if args.frame == "named-competitor":
+        if not args.competitor:
+            return refuse("competitor-required-with-named-frame",
+                          "--frame named-competitor requires --competitor <slug>.")
+        block = extract_competitor_block(comp, args.competitor)
+        if not block:
+            return refuse("competitor-not-in-substrate",
+                          f"competitor '{args.competitor}' not found in clients/{args.client}/04-competitive.md. "
+                          f"Add to the competitive layer first.")
+    else:
+        block = extract_status_quo_frame(comp)
+        if not block:
+            return refuse("status-quo-not-in-substrate",
+                          f"clients/{args.client}/04-competitive.md has no status-quo / no-decision section. "
+                          f"Add §Status quo before running with --frame status-quo.")
+
+    # Cohort persona
+    cohort_path = find_persona_file(args.client, args.cohort)
+    if cohort_path is None:
+        return refuse("missing-buyer-state",
+                      f"buyer-state cohort '{args.cohort}' not found. Looked in: "
+                      f"clients/{args.client}/personas/, personas/buyer-state/. "
+                      f"Add the persona file before briefing prospecting creative.")
+
+    # Brand voice (optional but recommended)
+    bv_path = SUBSTRATE_ROOT / "clients" / args.client / "07-brand-voice.md"
+    bv = read_file_or_none(bv_path)
+    if bv is None:
+        sys.stderr.write(f"  warn: brand-voice layer absent at {bv_path}; "
+                         f"using default kill-list. Add 07-brand-voice.md for sharper voice gating.\n")
+    kill_list = extract_brand_voice_kill_list(bv)
+
+    canonical = extract_canonical_statement(pos)
+    anchors = extract_anchors(pos)
+    pillars = extract_value_pillars(pos)
+    uniques = extract_unique_attributes(pos)
+    cohort_text = cohort_path.read_text(encoding="utf-8")
+    cohort_signals = extract_cohort_signals(cohort_text)
+
+    out_dir = Path(args.out) if args.out else (SUBSTRATE_ROOT / "clients" / args.client / "ads" / "briefs")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{args.channel}-{args.cohort}-{args.frame}-{today}.md"
+
+    md = render_brief(
+        client=args.client,
+        channel=args.channel,
+        cohort=args.cohort,
+        frame=args.frame,
+        competitor=args.competitor,
+        variants=args.variants,
+        canonical=canonical,
+        anchors=anchors,
+        pillars=pillars,
+        uniques=uniques,
+        status_quo_or_comp_block=block,
+        cohort_signals=cohort_signals,
+        cohort_path=cohort_path,
+        kill_list=kill_list,
+        today=today,
+    )
+    out_path.write_text(md, encoding="utf-8")
+
+    sys.stderr.write(f"\n[ad-creative-design] wrote {out_path}\n")
+    sys.stderr.write(f"  channel={args.channel}  cohort={args.cohort}  frame={args.frame}  variants={args.variants}\n")
+    sys.stderr.write(f"  anchors_count={len(anchors)}  pillars_count={len(pillars)}  uniques_count={len(uniques)}\n")
+    sys.stderr.write(f"  kill_list_size={len(kill_list)}\n")
+    print(str(out_path))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

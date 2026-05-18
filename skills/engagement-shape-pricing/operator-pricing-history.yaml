@@ -1,0 +1,251 @@
+# Operator pricing history — substrate-grade ledger of engagement closes
+#
+# Canonical pricing source: portfolio.iamkesava.com/consulting-offer
+# Mirrored at: canonical/portfolio-consulting-offer.md
+#
+# 2026-05-18 OVERHAUL: replaced benchmark-derived hourly/day/retainer floors with
+# the operator's actual published pricing model (outcomes-based, three-phase,
+# $100K annualised minimum per client). Per Kesava's correction: NO hourly,
+# NO retainer without measurement contract. Substrate enforces the published
+# offer, not invented bands.
+#
+# Anti-fabrication rule: empty is honest. `engagements` is empty by design and
+# fills only as real closes happen. The annual floor + Phase 1 fee + Phase 2
+# structures are calibration hooks; tighten upward as engagements accrue.
+
+operator: kesava
+canonical_source: canonical/portfolio-consulting-offer.md
+last_updated: 2026-05-18
+
+# ============================================================================
+# HARD REFUSAL LINES (published doctrine — substrate enforces)
+# ============================================================================
+
+refuses:
+  - shape: hourly
+    skill_response: HOURLY-SHAPE-REQUESTED
+    rationale: |
+      Per portfolio "What I won't do": the unit of pricing is the outcome,
+      not the hour. If the work needs 60 hours and produces zero lift,
+      neither party wins. If it needs 4 hours and produces the lift, the
+      price is the lift.
+    redirect: propose Phase 0 free diagnostic instead
+
+  - shape: pure-retainer-no-measurement
+    skill_response: PURE-RETAINER-REQUESTED
+    rationale: |
+      Per portfolio "What I won't do": "Strategic advisor, $X/month, no
+      scoring" is the contract that lets consultants hide.
+    redirect: redirect to Phase 1 measurement-contract scoping
+
+  - shape: multi-rep
+    skill_response: MULTI-REP-REQUESTED
+    rationale: |
+      Per portfolio "What I won't do": operator does not subcontract the
+      work to people who don't share calibration history.
+
+  - shape: no-verification-path
+    skill_response: MISSING-VERIFICATION-PATH
+    rationale: |
+      Per portfolio "What I won't do": if the metric can't be pulled from
+      a source-of-truth system at the window, the contract can't be
+      written and the work doesn't start.
+
+# ============================================================================
+# ANNUAL FLOOR PER CLIENT — THE HARD LINE
+# ============================================================================
+
+annual_floor_per_client:
+  amount_usd: 100000
+  rule: |
+    Minimum total operator-side revenue contracted per client, projected
+    to 12 months. Includes Phase 1 fee + Phase 2 floor + expected Phase 2
+    variable (at operator's Brier-scored confidence on the metric hit).
+  pro_rate_for_shorter_engagements:
+    twelve_month: 100000
+    six_month: 50000
+    three_month: 25000
+    eight_week: 15400   # 8/52 of $100K
+    four_week: 7700     # 4/52 of $100K
+  calibration_direction: upward
+  override: |
+    Permitted only with logged rationale in engagements[].override_reason.
+    Example legitimate overrides: high-trust referral with downstream
+    pipeline value, first-engagement-of-year at internal rate to seed
+    Brier history, calibration-only engagement to test a new vertical.
+
+# ============================================================================
+# PHASE 1 FIXED FEE
+# ============================================================================
+
+phase_1_fixed_fee:
+  fee_usd_band:
+    low: 15000
+    mid: 20000
+    high: 25000
+  scope: |
+    5 working days. Deliverables: populated clients/<prospect>/ substrate
+    (10-layer context model, cited, freshness-windowed) + signed
+    measurement contract (metric, source, baseline, window, verification
+    path) + 90-day skill roadmap (substrate's 37 skills ranked by
+    leverage for the prospect's stage).
+  pricing_by_prospect_stage:
+    pre-seed: 15000
+    seed: 15000
+    series-a: 18000
+    series-b: 20000
+    series-b-plus: 22000
+    growth: 22000
+    established: 25000
+  gate: |
+    Phase 1 is the contract-producing gate for Phase 2. No signed
+    measurement contract → no Phase 2.
+
+# ============================================================================
+# PHASE 2 — FLOOR + VARIABLE (the three continuation shapes)
+# ============================================================================
+
+phase_2_embedded_operator:
+  cadence: 4-8 weeks, daily standup, weekly review
+  best_when: |
+    Specific high-leverage move (re-positioning, launch, replatform,
+    competitive displacement campaign).
+  floor:
+    monthly_usd_band:
+      low: 8000
+      mid: 11500
+      high: 15000
+    fee_period: monthly
+    nature: outcome-independent operator draw
+    conditioned_on: signed measurement contract from Phase 1
+    not_a_retainer: |
+      Substrate refuses to treat this floor as a retainer. It is a draw,
+      CONDITIONED on the measurement contract. No contract → no floor.
+  variable_structure: pct_of_attributable_lift
+  variable_share_band:
+    low_pct: 15
+    typical_pct: 20
+    high_pct: 30
+  measurement_required: true
+
+phase_2_monthly_retainer_measurement_tied:
+  cadence: 3-month minimum, one strategic skill per month + measurement loop
+  best_when: |
+    Sustained substrate operation; team learns by running alongside.
+  floor:
+    monthly_usd_band:
+      low: 10000
+      mid: 14000
+      high: 18000
+    fee_period: monthly
+    nature: outcome-conditioned monthly draw
+    measurement_required: true
+    refuses_without_measurement_contract: true
+  variable_structure: per_skill_variable
+  variable_bounded_ceiling: true
+
+phase_2_train_the_team:
+  cadence: 2-week sprint
+  best_when: |
+    Team will run substrate; operator sets calibration baseline.
+  pricing_model: fixed_scoping_fee_plus_brier_bonus
+  fixed_scoping_fee_usd_band:
+    low: 25000
+    mid: 32000
+    high: 40000
+  variable_structure: brier_bonus_on_team_first_90_day_calibration
+
+# ============================================================================
+# VARIABLE STRUCTURES (the three published options)
+# ============================================================================
+
+variable_structures:
+
+  pct_of_attributable_lift:
+    description: |
+      % of incremental revenue, conversions, pipeline, or retention
+      attributable to the engagement, measured against cited baseline
+      at the cited window.
+    typical_share_pct:
+      low: 15
+      high: 30
+    window_days_options: [30, 60, 90]
+    measured_against: baseline timestamp recorded in Phase 1 measurement contract
+    failure_mode: lift doesn't materialise → variable doesn't either; floor is the floor
+
+  per_unit_bonus:
+    description: |
+      Discrete outcomes. Per logo retained above churn baseline, per
+      deal won at competitive displacement, per new prompt won in AEO
+      citation.
+    ceiling: bounded; agreed in Phase 1
+    failure_mode: zero qualifying units → zero variable; floor is the floor
+
+  brier_bonus:
+    description: |
+      Operator opens engagement with calibrated probability that the
+      metric hits target. Full bonus on correct high-confidence call;
+      floor only on wrong call.
+    requires: published Brier history OR internal-rate first-engagement
+    failure_mode: wrong call → variable doesn't pay; calibration history takes a hit
+
+# ============================================================================
+# WALK-AWAY CRITERIA (universal refusal list)
+# ============================================================================
+
+walk_away_criteria:
+  - no_founder_or_ceo_on_phase_0_call
+  - no_customer_call_access_within_phase_1
+  - no_source_of_truth_system_for_metric_resolution_at_window
+  - stealth_mode_no_public_surface_to_audit
+  - prospect_refuses_phase_1_before_phase_2
+  - prospect_asks_for_multi_rep_engagement
+  - prospect_asks_to_hide_brier_history_from_public_track_record
+  - prospect_asks_for_hourly_billing
+  - prospect_asks_for_pure_retainer_no_measurement
+  - prospect_demands_below_annual_floor_without_compelling_calibration_value
+  - prospect_asks_operator_to_ship_claims_without_substrate_citations
+
+# ============================================================================
+# ENGAGEMENTS HISTORY (empty by design — fills as closes happen)
+# ============================================================================
+
+engagements: []
+# Each entry, when closed:
+# - prospect: <slug>
+# - engagement_shape: <phase-1|phase-2-embedded|phase-2-monthly|phase-2-train-team>
+# - prospect_stage: <pre-seed|seed|series-a|series-b-plus|growth|established>
+# - phase_1_fee_usd: <number>
+# - phase_2_floor_monthly_usd: <number, if applicable>
+# - phase_2_floor_total_usd: <number = monthly × duration>
+# - phase_2_variable_structure: <pct-lift|per-unit|brier-bonus>
+# - variable_share_or_per_unit: <number or text>
+# - measurement_contract_path: <path>
+# - window_days: <30|60|90|other>
+# - resolution_brier_score: <0..1>
+# - actual_variable_paid_usd: <number>
+# - total_engagement_revenue_usd: <number>
+# - duration_weeks: <number>
+# - annualised_projection_usd: <number = total × (52/duration_weeks)>
+# - hit_annual_floor: <true|false>
+# - override_reason: <text, required if floor was overridden>
+# - close_outcome: <accepted|declined|negotiated|withdrawn>
+# - walk_away_triggered: <true|false>
+# - close_date: <YYYY-MM-DD>
+# - notes: <text>
+
+# ============================================================================
+# CALIBRATION STATUS (tightens as engagements accrue)
+# ============================================================================
+
+calibration_status:
+  prior_engagements_scored: 0
+  phase_1_close_rate: null         # populated after 5+ Phase 1 proposals
+  phase_2_conversion_rate: null    # populated after 3+ Phase 1 closures
+  median_annualised_revenue_per_client_usd: null
+  brier_history_url: null          # public history opens with first Phase 2 closure
+  first_engagement_internal_rate_active: true
+  first_engagement_internal_rate_rationale: |
+    Per portfolio doctrine: first engagement may run at internal rate to
+    open the public Brier history; published track record begins at the
+    first engagement's closure window.

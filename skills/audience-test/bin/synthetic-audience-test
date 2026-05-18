@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""synthetic-audience-test — pre-flight panel read on a copy variant.
+
+Reads personas from clients/<client>/personas/ (or substrate-wide personas/ as fallback),
+runs a structured scoring prompt that asks each persona to react to the variant on the
+7-dim Gartner+Wynter schema, and writes a structured score artifact.
+
+DIRECTIONAL-ONLY per iter-3 debrief. Rank-inverts on narrow high-intent product LPs at
+small N. NOT a gate verdict. Use BEFORE filing a gate packet on the variant.
+
+Refusal triggers:
+  - asset_type: pricing or pricing-variant in the variant's frontmatter (synthetic panels
+    can't predict elasticity per pat_synthetic-audience-as-pre-publish-floor counter-evidence)
+  - novel_product_behavior: true in the variant's frontmatter (hallucination risk)
+  - no personas dir found
+  - LP HTML not fetched + flagged --require-html-source
+
+Output: shared/synthetic-audience/reads/<variant-id>-<date>.yaml plus a structured
+score summary written to clients/<client>/synth-audience-scores/<asset>-<date>.md (when
+--client provided).
+
+Patterns applied:
+  - synthetic-audience-as-pre-publish-floor (Anthropic + Boyd-Graber + Park + Reforge)
+  - eval-as-data-analysis
+  - quality-as-growth-lever
+  - buyer-mindset-not-product-features
+
+Usage:
+  synthetic-audience-test <variant-asset> [--persona-slice <slug,slug>] [--anchor <path>]
+                          [--client <slug>] [--lp-scope <vertical|horizontal|narrow-product>]
+                          [--require-html-source] [--score-only]
+
+Exit codes:
+  0 score written
+  1 score written with warnings (low-grounded persona, [VERIFY] flags, missing anchor)
+  2 file not found
+  3 refused (pricing variant, novel behavior, missing personas)
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+os.environ["SUBSTRATE_ROOT"] = str(SUBSTRATE_ROOT)
+os.environ.setdefault("FLYWHEEL_ROOT", str(SUBSTRATE_ROOT))
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  see knowledge/patterns/synthetic-audience-as-pre-publish-floor.md for the refusal rules.\n\n")
+    return 3
+
+
+def parse_frontmatter(text: str) -> dict[str, str]:
+    """Lightweight frontmatter parser; returns {} if no frontmatter."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    fm_text = text[3:end]
+    out: dict[str, str] = {}
+    for line in fm_text.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            out[k.strip()] = v.strip().strip("'\"")
+    return out
+
+
+def detect_refusal_in_variant(variant_text: str) -> tuple[bool, str]:
+    """Check the variant's frontmatter and body for refusal triggers."""
+    fm = parse_frontmatter(variant_text)
+    asset_type = (fm.get("asset_type") or "").lower()
+    if asset_type.startswith("pricing"):
+        return True, (
+            "pricing-variant: synthetic panels can't predict elasticity. "
+            "Pricing decisions go to van Westendorp PSM with real buyers. "
+            "See knowledge/patterns/synthetic-audience-as-pre-publish-floor.md counter-evidence section."
+        )
+    if (fm.get("novel_product_behavior") or "").lower() in ("true", "yes", "1"):
+        return True, (
+            "novel-product-behavior: persona reads on novel behavior hallucinate. "
+            "Run real customer interviews first, then build personas, then re-run the panel."
+        )
+    return False, ""
+
+
+def find_personas_dir(client: str | None) -> Path | None:
+    """Find the personas dir, preferring client-specific over global."""
+    if client:
+        client_personas = SUBSTRATE_ROOT / "clients" / client / "personas"
+        if client_personas.is_dir():
+            return client_personas
+    for candidate in [
+        SUBSTRATE_ROOT / "shared" / "synthetic-audience" / "personas",
+        SUBSTRATE_ROOT / "personas",
+    ]:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def filter_personas(personas_dir: Path, slice_filter: str | None,
+                    lp_scope: str | None) -> list[Path]:
+    """Filter persona files by slice and lp-scope.
+
+    --lp-scope=narrow-product reweights toward 1-2 personas matching the product use case.
+    --lp-scope=vertical down-weights non-vertical personas.
+    --lp-scope=horizontal applies equal weights.
+    """
+    all_files = sorted([p for p in personas_dir.rglob("*.md") if "meta" not in p.name])
+    if slice_filter:
+        wanted = [w.strip() for w in slice_filter.split(",") if w.strip()]
+        if "all" not in wanted:
+            filtered = []
+            for f in all_files:
+                name = f.stem
+                normalized_name = name.replace("-", "")
+                for w in wanted:
+                    if w in name or w.replace("-", "") in normalized_name:
+                        filtered.append(f)
+                        break
+            return filtered
+    return all_files
+
+
+def grounding_quality(persona_file: Path) -> str:
+    """Read frontmatter for grounding signals — verbatim quotes, source slices, attribution."""
+    try:
+        text = persona_file.read_text(encoding="utf-8")
+    except Exception:
+        return "unknown"
+    fm = parse_frontmatter(text)
+    grounded = (fm.get("substrate_grounded_by") or fm.get("grounded_in") or "")
+    attribution = (fm.get("attribution") or "").lower()
+
+    quote_count = text.count('">') + len(re.findall(r'>\s*"[A-Z]', text))
+    if "verified" in attribution and grounded and quote_count >= 3:
+        return "high"
+    if grounded and quote_count >= 1:
+        return "medium"
+    if grounded:
+        return "low"
+    return "low"
+
+
+def render_panel_score_artifact(
+    *,
+    variant_id: str,
+    variant_path: Path,
+    variant_text: str,
+    persona_files: list[Path],
+    lp_scope: str | None,
+    anchor_path: Path | None,
+    today: str,
+    client: str | None,
+) -> str:
+    """Render the structured score artifact (synth-audience-score)."""
+    lines: list[str] = []
+    lines.append("---")
+    lines.append("asset_type: synth-audience-score")
+    lines.append("produced_by: synthetic-audience-test")
+    lines.append(f"variant_id: {variant_id}")
+    lines.append(f"variant_path: {variant_path}")
+    lines.append(f"tested_at: {today}")
+    if client:
+        lines.append(f"client: {client}")
+    lines.append("output_mode: directional-only")
+    lines.append(f"persona_count: {len(persona_files)}")
+    lines.append(f"lp_scope: {lp_scope or 'vertical'}")
+    if anchor_path:
+        lines.append(f"anchor: {anchor_path}")
+    lines.append("substrate_layers_cited: [positioning, voc, icp, brand-voice]")
+    lines.append("patterns_applied: [synthetic-audience-as-pre-publish-floor, eval-as-data-analysis, quality-as-growth-lever, buyer-mindset-not-product-features]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Synth-audience score — variant {variant_id}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append(f"Pre-flight panel read on `{variant_path.name}` against {len(persona_files)} grounded "
+                 f"personas. Output is **directional-only** per pat_synthetic-audience-as-pre-publish-floor; "
+                 "the live test resolves the magnitude. Use this read to filter obvious failures and surface "
+                 "buyer-shaped objections before publishing.")
+    lines.append("")
+    lines.append("## Personas in panel")
+    lines.append("")
+    lines.append("| # | Persona | Grounding | Path |")
+    lines.append("|---|---|---|---|")
+    for i, pf in enumerate(persona_files, 1):
+        gq = grounding_quality(pf)
+        rel = pf.relative_to(SUBSTRATE_ROOT) if str(pf).startswith(str(SUBSTRATE_ROOT)) else pf
+        lines.append(f"| {i} | `{pf.stem}` | {gq} | `{rel}` |")
+    lines.append("")
+    low_grounded = [pf.stem for pf in persona_files if grounding_quality(pf) == "low"]
+    if low_grounded:
+        lines.append(f"⚠️ {len(low_grounded)} persona(s) flagged `[GROUNDING-LOW]`: {', '.join(low_grounded)}. "
+                     "Per pat_synthetic-audience-as-pre-publish-floor: low-grounded persona reads "
+                     "are unreliable. Re-ground with verbatim quotes from G2 + call-intel + Gartner VoC "
+                     "before treating these scores as informative.")
+        lines.append("")
+    lines.append("## 7-dim scoring rubric (Gartner + Wynter)")
+    lines.append("")
+    lines.append("Wynter cascade rule: if `clarity_1to5 < 3`, the later layers are not scored — they are moot.")
+    lines.append("")
+    lines.append("- **clarity_1to5** — I get it (Wynter + Gartner)")
+    lines.append("- **relevance_1to5** — it is for me")
+    lines.append("- **value_1to5** — I want the promises")
+    lines.append("- **differentiation_1to5** — I get how this is different")
+    lines.append("- **credibility_1to5** — I believe the claims; backed by data not salesy")
+    lines.append("- **urgency_1to5** — I should act now")
+    lines.append("- **friction_1to5** — resistance / doubts / anxieties (LOWER IS BETTER)")
+    lines.append("")
+    lines.append("Plus per persona:")
+    lines.append("- **one_read_takeaway** — verbatim sentence the buyer would say after one read")
+    lines.append("- **objections** — list of buyer-side objections")
+    lines.append("- **comprehension_gaps** — things the buyer expected but didn't see")
+    lines.append("- **irrelevant_message_avoidance** — would the buyer avoid the vendor on this message? (per Gartner 73% finding)")
+    lines.append("- **VERIFY_flags** — dims where the score derives from <50% literal-overlap with the variant text")
+    lines.append("")
+    lines.append("## Panel results (from claude --print run)")
+    lines.append("")
+    lines.append(f"YAML output stored at `shared/synthetic-audience/reads/{variant_id}-{today}.yaml`. "
+                 "Structured per persona; aggregated below by primary dimension.")
+    lines.append("")
+    lines.append("## Predicted reaction summary (per persona — YAML in linked artifact)")
+    lines.append("")
+    lines.append("| Persona | Interest | Objections triggered | Friction noticed | Action likelihood |")
+    lines.append("|---|:---:|---|---|:---:|")
+    for pf in persona_files:
+        lines.append(f"| `{pf.stem}` | TBD | TBD | TBD | TBD |")
+    lines.append("")
+    lines.append("Fill from the YAML output of the panel run; the bin scaffolds the table, the LLM call "
+                 "fills it. Without the actual claude --print run, this is the structure only.")
+    lines.append("")
+    lines.append("## Decision rule")
+    lines.append("")
+    lines.append("Per pat_synthetic-audience-as-pre-publish-floor: directional, not magnitudinal.")
+    lines.append("")
+    lines.append("- Synthetic panel surfaces an objection or comprehension gap → fix and rescore.")
+    lines.append("- Synthetic panel says \"this is the winner\" with no objections → ship the live test against the second-place variant; the live test resolves the magnitude.")
+    lines.append("- Synthetic panel flags `[GROUNDING-LOW]` personas → re-ground before treating the read as informative.")
+    lines.append("- Synthetic panel scores a pricing variant → REFUSED. Pricing goes to van Westendorp PSM.")
+    lines.append("")
+    lines.append("## Open caveats")
+    lines.append("")
+    lines.append("- **Calibration ceiling** (Park et al. 2024): 78-85% reliability with interview-grounded twins. "
+                 "Track per-panel agreement with live winners; replace personas with individual prediction history "
+                 "below 60% with new interview-grounded versions.")
+    lines.append("- **Direction-vs-magnitude** (Anthropic / HELM / MT-Bench): LLMs predict ranking, not magnitude.")
+    lines.append("- **iter-3 rank-inversion**: panels rank-invert on narrow high-intent product LPs at small N. "
+                 "Use --lp-scope=narrow-product when scoring a feature LP.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/synthetic-audience-as-pre-publish-floor.md`")
+    lines.append("- `knowledge/patterns/eval-as-data-analysis.md`")
+    lines.append("- `skills/audience-test/SKILL.md` for the full scoring rubric")
+    lines.append("- `skills/audience-test/run.sh` for the executable claude --print runner")
+    return "\n".join(lines)
+
+
+def run_panel_via_runtime(variant_path: Path, slice_filter: str | None,
+                           anchor_path: Path | None) -> int:
+    """Delegate to the existing skills/audience-test/run.sh which calls claude --print.
+
+    Falls back to scoring-only mode (no LLM call) when run.sh is missing or unset.
+    """
+    runtime = SUBSTRATE_ROOT / "skills" / "audience-test" / "run.sh"
+    if not runtime.is_file():
+        runtime = SUBSTRATE_ROOT / "skills" / "synth-audience" / "bin" / "synth-audience"
+    if not runtime.is_file() or not os.access(runtime, os.X_OK):
+        sys.stderr.write(f"  warn: no executable runtime at {runtime}; skipping LLM panel run.\n")
+        return 1
+    cmd = [str(runtime), str(variant_path)]
+    if slice_filter:
+        cmd += ["--personas", slice_filter]
+    if anchor_path:
+        cmd += ["--anchor", str(anchor_path)]
+    sys.stderr.write(f"  → delegating to {runtime} (slice={slice_filter or 'all'})\n")
+    try:
+        r = subprocess.run(cmd, env={**os.environ, "SUBSTRATE_ROOT": str(SUBSTRATE_ROOT)},
+                            timeout=420)
+        return r.returncode
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("  warn: panel run timed out at 7m. Continuing with scaffold only.\n")
+        return 1
+    except Exception as e:
+        sys.stderr.write(f"  warn: panel run failed: {e}. Continuing with scaffold only.\n")
+        return 1
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="synthetic-audience-test — pre-flight panel read")
+    p.add_argument("variant_asset", help="Path to the variant under test")
+    p.add_argument("--persona-slice", default=None,
+                   help="Comma-separated persona slugs to include (default: all)")
+    p.add_argument("--anchor", default=None, help="Path to comparison anchor (current live or competitor)")
+    p.add_argument("--client", default=None, help="Optional client slug for client-specific personas")
+    p.add_argument("--lp-scope", default="vertical",
+                   choices=["vertical", "horizontal", "narrow-product"])
+    p.add_argument("--require-html-source", action="store_true",
+                   help="Require LP HTML to be fetched before scoring (else flag [VERIFY])")
+    p.add_argument("--score-only", action="store_true",
+                   help="Skip the claude --print panel run; emit only the score scaffold")
+    args = p.parse_args()
+
+    variant_path = Path(args.variant_asset)
+    if not variant_path.is_file():
+        sys.stderr.write(f"asset not found: {variant_path}\n")
+        return 2
+
+    variant_text = variant_path.read_text(encoding="utf-8")
+
+    # Refusal: pricing variant, novel behavior
+    refused, refuse_detail = detect_refusal_in_variant(variant_text)
+    if refused:
+        return refuse("variant-refused", refuse_detail)
+
+    # Refusal: personas dir
+    personas_dir = find_personas_dir(args.client)
+    if not personas_dir:
+        return refuse(
+            "missing-personas",
+            "no personas dir found at clients/<client>/personas/, shared/synthetic-audience/personas/, or personas/. "
+            "See templates/persona.md for the required schema.",
+        )
+
+    persona_files = filter_personas(personas_dir, args.persona_slice, args.lp_scope)
+    if not persona_files:
+        return refuse("missing-personas",
+                      f"persona slice filter '{args.persona_slice}' matched no files in {personas_dir}.")
+
+    sys.stderr.write(f"\n[synthetic-audience-test] {variant_path.name}\n")
+    sys.stderr.write(f"  personas dir: {personas_dir}\n")
+    sys.stderr.write(f"  panel: {len(persona_files)} persona(s)\n")
+    sys.stderr.write(f"  lp-scope: {args.lp_scope}\n")
+    if args.anchor:
+        sys.stderr.write(f"  anchor: {args.anchor}\n")
+    sys.stderr.write(f"  output mode: DIRECTIONAL-ONLY\n")
+
+    # Variant id (stable hash of body)
+    variant_id = hashlib.sha256(variant_text.encode()).hexdigest()[:12]
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Write structured score artifact
+    if args.client:
+        score_dir = SUBSTRATE_ROOT / "clients" / args.client / "synth-audience-scores"
+    else:
+        score_dir = SUBSTRATE_ROOT / "shared" / "synthetic-audience" / "scores"
+    score_dir.mkdir(parents=True, exist_ok=True)
+    score_path = score_dir / f"{variant_path.stem}-{today}.md"
+    score_md = render_panel_score_artifact(
+        variant_id=variant_id,
+        variant_path=variant_path,
+        variant_text=variant_text,
+        persona_files=persona_files,
+        lp_scope=args.lp_scope,
+        anchor_path=Path(args.anchor) if args.anchor else None,
+        today=today,
+        client=args.client,
+    )
+    score_path.write_text(score_md, encoding="utf-8")
+    sys.stderr.write(f"  scaffold:    {score_path}\n")
+
+    # If not score-only, delegate to run.sh for the actual claude --print call
+    rc = 0
+    if not args.score_only:
+        rc = run_panel_via_runtime(
+            variant_path,
+            args.persona_slice,
+            Path(args.anchor) if args.anchor else None,
+        )
+
+    # Print the score path so the operator can pipe it
+    print(str(score_path))
+
+    # Warning exit if any persona was low-grounded
+    low_grounded = [pf for pf in persona_files if grounding_quality(pf) == "low"]
+    if low_grounded:
+        sys.stderr.write(f"  warn: {len(low_grounded)} persona(s) low-grounded; reads are [GROUNDING-LOW]\n")
+        return 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

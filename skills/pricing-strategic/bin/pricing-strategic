@@ -1,0 +1,1036 @@
+#!/usr/bin/env python3
+"""pricing-strategic — pricing analysis from positioning + cohort LTV + competitor pricing matrix.
+
+Modes:
+  wtp-survey       compute van Westendorp PSM intersections from a buyer-response CSV
+  anchor-design    propose a three-tier package with anchor-high / target / decoy structure
+  packaging        feature-to-tier matrix with Leaders / Fillers / Killers tagging
+  price-test       design a falsifiable price-test with kill criterion + measurement contract
+  review           quarterly pricing audit; reads pricing/ledger.md + recent CSV data
+
+Refuses without:
+  - clients/<client>/positioning/ (canonical positioning required)
+  - clients/<client>/competitive/competitor-pricing.yaml (matrix required for context)
+  - --segment for wtp-survey + anchor-design
+  - --wtp-csv with at least 20 in-segment responses (Mickos / Campbell floor)
+
+This skill grounds every recommendation in named substrate paths. The output assets
+carry `produced_by: pricing-strategic` so Gate 7 (pattern-applied) can verify the
+patterns the skill claims to ground in actually show up in the body.
+
+Patterns applied:
+  - pricing-as-the-most-leveraged-org-failure (Simon: 1% price ≈ 11% profit)
+  - behavioral-pricing-architecture (Ariely / Kahneman / Ramanujam / Hormozi)
+  - van-westendorp-over-vibes-pricing (PSM method, structured research)
+  - frontline-as-pmm-substrate (pricing reactions from real calls)
+  - economic-turing-test-rev-per-employee (revenue per operator framing)
+
+Exit codes:
+  0  artifact written
+  1  artifact written with warnings
+  3  refused (substrate gap, missing WTP data, missing competitor matrix)
+  4  invalid args
+  5  config error
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import re
+import statistics
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def find_substrate_root() -> Path:
+    for var in ("SUBSTRATE_ROOT", "FLYWHEEL_ROOT"):
+        v = os.environ.get(var)
+        if v:
+            p = Path(v)
+            if (p / "skills").is_dir() and (p / "knowledge").is_dir():
+                return p
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "skills").is_dir() and (parent / "knowledge").is_dir():
+            return parent
+    return Path.cwd()
+
+
+SUBSTRATE_ROOT = find_substrate_root()
+os.environ["SUBSTRATE_ROOT"] = str(SUBSTRATE_ROOT)
+os.environ.setdefault("FLYWHEEL_ROOT", str(SUBSTRATE_ROOT))
+
+
+def refuse(reason: str, detail: str = "") -> int:
+    sys.stderr.write(f"\nREFUSED: {reason}\n")
+    if detail:
+        sys.stderr.write(f"  {detail}\n")
+    sys.stderr.write("  fix the substrate gap, then re-run.\n\n")
+    return 3
+
+
+def run_preflight(client: str) -> int:
+    """Delegate to skill-preflight.sh via bash for the standard frontmatter checks."""
+    import subprocess
+    skill_md = SUBSTRATE_ROOT / "skills" / "pricing-strategic" / "SKILL.md"
+    if not skill_md.is_file():
+        sys.stderr.write(f"config error: missing {skill_md}\n")
+        return 5
+    preflight_lib = SUBSTRATE_ROOT / "bin" / "lib" / "skill-preflight.sh"
+    if not preflight_lib.is_file():
+        return 0
+    cmd = [
+        "bash", "-c",
+        f'set -uo pipefail; SUBSTRATE_ROOT="{SUBSTRATE_ROOT}" . "{preflight_lib}"; '
+        f'skill_preflight "pricing-strategic" "{client}"',
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            sys.stderr.write(r.stderr)
+            return r.returncode
+    except Exception as e:
+        sys.stderr.write(f"  preflight runner failed: {e}\n")
+    return 0
+
+
+# ---------- van Westendorp PSM ----------
+
+def cumulative_curve(values: list[float], reverse: bool = False) -> list[tuple[float, float]]:
+    """For each price point, fraction of respondents at or below (or above) that price.
+
+    `reverse=True` returns the fraction at or above the price (used for "too cheap" /
+    "cheap" curves which decline with price).
+    """
+    if not values:
+        return []
+    sorted_vals = sorted(values)
+    n = len(sorted_vals)
+    pts: list[tuple[float, float]] = []
+    unique_prices = sorted(set(sorted_vals))
+    for p in unique_prices:
+        if reverse:
+            count = sum(1 for v in sorted_vals if v >= p)
+        else:
+            count = sum(1 for v in sorted_vals if v <= p)
+        pts.append((p, count / n))
+    return pts
+
+
+def find_intersection(curve_a: list[tuple[float, float]],
+                      curve_b: list[tuple[float, float]]) -> float | None:
+    """Find the price at which cumulative shares of two curves cross.
+
+    Walks all unique price points in either curve, evaluates both curves' shares at
+    each (taking the running cumulative as a step function), and returns the price
+    where the difference flips sign or is zero. Linear-interpolates between the two
+    bracketing prices for sub-resolution accuracy.
+    """
+    if not curve_a or not curve_b:
+        return None
+    all_prices = sorted(set(p for p, _ in curve_a) | set(p for p, _ in curve_b))
+
+    def eval_curve(curve: list[tuple[float, float]], target: float) -> float:
+        # step-function: at price p, share is the share recorded at the closest
+        # price at or below p (or above, depending on curve direction).
+        # We use the recorded share at the nearest-boundary price.
+        best = None
+        best_dist = float("inf")
+        for price, share in curve:
+            d = abs(price - target)
+            if d < best_dist:
+                best = share
+                best_dist = d
+        return best if best is not None else 0.0
+
+    diffs = [(p, eval_curve(curve_a, p) - eval_curve(curve_b, p)) for p in all_prices]
+    for i in range(1, len(diffs)):
+        prev_p, prev_d = diffs[i - 1]
+        curr_p, curr_d = diffs[i]
+        if prev_d == 0:
+            return prev_p
+        if curr_d == 0:
+            return curr_p
+        if (prev_d > 0) != (curr_d > 0):
+            # linear interpolation between prev_p and curr_p
+            if (curr_d - prev_d) == 0:
+                return (prev_p + curr_p) / 2
+            t = -prev_d / (curr_d - prev_d)
+            return prev_p + t * (curr_p - prev_p)
+    return None
+
+
+def compute_van_westendorp(rows: list[dict[str, float]]) -> dict:
+    """Compute the four canonical van Westendorp PSM intersections from buyer responses.
+
+    Inputs: list of dicts with keys too_cheap, cheap, expensive, too_expensive (USD).
+
+    Returns:
+      OPP  Optimal Price Point   intersection of "too cheap" and "expensive"
+      IPP  Indifference Price    intersection of "cheap" and "expensive"
+      PMC  Marginal Cheapness    intersection of "too cheap" and "cheap"
+      PME  Marginal Expensiveness intersection of "expensive" and "too expensive"
+
+    Plus the count, the four curve point lists, and price band [PMC, PME].
+    """
+    if not rows:
+        return {"error": "no rows"}
+
+    too_cheap = [r["too_cheap"] for r in rows if r.get("too_cheap") is not None]
+    cheap = [r["cheap"] for r in rows if r.get("cheap") is not None]
+    expensive = [r["expensive"] for r in rows if r.get("expensive") is not None]
+    too_expensive = [r["too_expensive"] for r in rows if r.get("too_expensive") is not None]
+
+    # Reverse curves: "too cheap" and "cheap" decline with price
+    curve_too_cheap = cumulative_curve(too_cheap, reverse=True)
+    curve_cheap = cumulative_curve(cheap, reverse=True)
+    # Forward curves: "expensive" and "too expensive" rise with price
+    curve_expensive = cumulative_curve(expensive, reverse=False)
+    curve_too_expensive = cumulative_curve(too_expensive, reverse=False)
+
+    opp = find_intersection(curve_too_cheap, curve_expensive)
+    ipp = find_intersection(curve_cheap, curve_expensive)
+    pmc = find_intersection(curve_too_cheap, curve_cheap)
+    pme = find_intersection(curve_expensive, curve_too_expensive)
+
+    return {
+        "n": len(rows),
+        "OPP": opp,
+        "IPP": ipp,
+        "PMC": pmc,
+        "PME": pme,
+        "band_low": pmc,
+        "band_high": pme,
+        "median_too_cheap": statistics.median(too_cheap) if too_cheap else None,
+        "median_cheap": statistics.median(cheap) if cheap else None,
+        "median_expensive": statistics.median(expensive) if expensive else None,
+        "median_too_expensive": statistics.median(too_expensive) if too_expensive else None,
+        "stdev_expensive": statistics.stdev(expensive) if len(expensive) > 1 else None,
+    }
+
+
+# ---------- competitor pricing matrix ----------
+
+def parse_minimal_yaml(text: str) -> dict:
+    root: dict = {}
+    stack: list[tuple[int, dict | list]] = [(-1, root)]
+    for raw in text.splitlines():
+        line = re.sub(r"(\s)#.*$", r"\1", raw).rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            value_part = stripped[2:].strip()
+            if isinstance(parent, list):
+                if ":" in value_part and not value_part.endswith(":"):
+                    k, _, v = value_part.partition(":")
+                    new_map = {k.strip(): _scalar(v.strip())}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+                elif value_part:
+                    parent.append(_scalar(value_part))
+                else:
+                    new_map = {}
+                    parent.append(new_map)
+                    stack.append((indent, new_map))
+            continue
+        if ":" in stripped:
+            key, _, val = stripped.partition(":")
+            key = key.strip()
+            val = val.strip()
+            if not val:
+                if isinstance(parent, dict):
+                    parent[key] = {}
+                stack.append((indent, parent[key]))
+            else:
+                if isinstance(parent, dict):
+                    parent[key] = _scalar(val)
+    return root
+
+
+def _scalar(v: str):
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        if not inner:
+            return []
+        return [_scalar(p.strip()) for p in inner.split(",")]
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        return v[1:-1]
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
+    if v.lower() in ("null", "~"):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    if re.fullmatch(r"-?\d+(\.\d+)?", v):
+        return float(v)
+    return v
+
+
+def load_competitor_pricing(client: str) -> dict | None:
+    """Load competitor-pricing.yaml from competitive/. Returns None when absent."""
+    path = SUBSTRATE_ROOT / "clients" / client / "competitive" / "competitor-pricing.yaml"
+    if not path.is_file():
+        return None
+    try:
+        import yaml  # type: ignore[import-not-found]
+        return yaml.safe_load(path.read_text())
+    except ImportError:
+        return parse_minimal_yaml(path.read_text())
+
+
+def compute_competitor_band(matrix: dict) -> dict:
+    """From competitor-pricing.yaml, compute the price band, median, and per-tier
+    medians across competitors. The matrix shape (informational):
+
+      competitors:
+        slug:
+          tiers:
+            starter:   { monthly_usd: 49, currency: USD }
+            growth:    { monthly_usd: 99, currency: USD }
+            enterprise: { monthly_usd: null, model: contact-sales }
+    """
+    if not matrix:
+        return {}
+    competitors = matrix.get("competitors") or {}
+    by_tier: dict[str, list[float]] = {}
+    for slug, block in competitors.items():
+        if not isinstance(block, dict):
+            continue
+        tiers = block.get("tiers") or {}
+        if not isinstance(tiers, dict):
+            continue
+        for tier_name, tier_data in tiers.items():
+            if not isinstance(tier_data, dict):
+                continue
+            mu = tier_data.get("monthly_usd")
+            if isinstance(mu, (int, float)):
+                by_tier.setdefault(tier_name, []).append(float(mu))
+    summary = {}
+    for tier, prices in by_tier.items():
+        if prices:
+            summary[tier] = {
+                "median": statistics.median(prices),
+                "min": min(prices),
+                "max": max(prices),
+                "n": len(prices),
+            }
+    return summary
+
+
+# ---------- LTV from closed-won deals ----------
+
+def compute_ltv_from_csv(client: str) -> dict | None:
+    """If clients/<client>/closed-won-deals.csv exists, compute median ARR and a
+    naïve LTV = median ARR × 1 / churn_rate (where churn_rate is read from the CSV's
+    `monthly_churn` column if present, else assumed 0.02).
+    """
+    path = SUBSTRATE_ROOT / "clients" / client / "closed-won-deals.csv"
+    if not path.is_file():
+        return None
+    arrs: list[float] = []
+    churns: list[float] = []
+    try:
+        with path.open() as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if "arr_usd" in row and row["arr_usd"]:
+                    try:
+                        arrs.append(float(row["arr_usd"]))
+                    except ValueError:
+                        pass
+                if "monthly_churn" in row and row["monthly_churn"]:
+                    try:
+                        churns.append(float(row["monthly_churn"]))
+                    except ValueError:
+                        pass
+    except Exception:
+        return None
+    if not arrs:
+        return None
+    median_arr = statistics.median(arrs)
+    monthly_churn = statistics.median(churns) if churns else 0.02
+    annual_churn = 1 - (1 - monthly_churn) ** 12
+    ltv = median_arr / max(annual_churn, 0.01)
+    return {
+        "n_deals": len(arrs),
+        "median_arr_usd": median_arr,
+        "monthly_churn": monthly_churn,
+        "ltv_usd": ltv,
+    }
+
+
+# ---------- mode handlers ----------
+
+def mode_wtp_survey(args, client_root: Path, out_dir: Path) -> int:
+    if not args.wtp_csv:
+        return refuse("missing-wtp-data",
+                      "--wtp-csv <path> required for wtp-survey mode. "
+                      "CSV columns: respondent_id, segment, too_cheap, cheap, expensive, too_expensive.")
+    if not args.segment:
+        return refuse("missing-segment",
+                      "--segment <pinned-icp> required for wtp-survey mode.")
+    csv_path = Path(args.wtp_csv)
+    if not csv_path.is_file():
+        return refuse("missing-wtp-data", f"--wtp-csv path not found: {csv_path}")
+
+    rows: list[dict] = []
+    with csv_path.open() as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            seg = (r.get("segment") or "").strip()
+            if seg and seg != args.segment:
+                continue
+            try:
+                rows.append({
+                    "respondent_id": r.get("respondent_id"),
+                    "too_cheap": float(r["too_cheap"]) if r.get("too_cheap") else None,
+                    "cheap": float(r["cheap"]) if r.get("cheap") else None,
+                    "expensive": float(r["expensive"]) if r.get("expensive") else None,
+                    "too_expensive": float(r["too_expensive"]) if r.get("too_expensive") else None,
+                })
+            except (KeyError, ValueError):
+                continue
+
+    if len(rows) < 20:
+        return refuse(
+            "missing-wtp-data",
+            f"only {len(rows)} responses for segment '{args.segment}' (need ≥20). "
+            "Mickos and Campbell both name 20 as the floor; below it the curves are noisy "
+            "and the OPP is unstable. Collect more responses, then re-run.",
+        )
+
+    psm = compute_van_westendorp(rows)
+    matrix = load_competitor_pricing(args.client) or {}
+    competitor_summary = compute_competitor_band(matrix)
+    ltv_data = compute_ltv_from_csv(args.client)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_path = out_dir / "wtp-curves" / f"{args.segment}-{today}.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = []
+    lines.append("---")
+    lines.append(f"asset_type: wtp-curve")
+    lines.append(f"produced_by: pricing-strategic")
+    lines.append(f"client: {args.client}")
+    lines.append(f"segment: {args.segment}")
+    lines.append(f"tested_at: {today}")
+    lines.append(f"response_count: {psm['n']}")
+    lines.append(f"opp_usd: {psm['OPP']}")
+    lines.append(f"ipp_usd: {psm['IPP']}")
+    lines.append(f"pmc_usd: {psm['PMC']}")
+    lines.append(f"pme_usd: {psm['PME']}")
+    lines.append(f"input_csv: {csv_path}")
+    lines.append("substrate_layers_cited: [voc, positioning, competitive]")
+    lines.append("patterns_applied: [van-westendorp-over-vibes-pricing, behavioral-pricing-architecture, pricing-as-the-most-leveraged-org-failure, frontline-as-pmm-substrate]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# WTP curve — {args.client} | {args.segment} | {today}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append("Van Westendorp PSM analysis on " + str(psm["n"]) + " in-segment buyer "
+                 "responses produces a defensible price band of "
+                 f"${(psm['PMC'] or 0):.0f}-${(psm['PME'] or 0):.0f}/month, with the "
+                 f"Optimal Price Point at ${(psm['OPP'] or 0):.0f}/month and the "
+                 f"Indifference Price Point at ${(psm['IPP'] or 0):.0f}/month. The "
+                 "OPP minimises buyer rejection; the IPP is the perception-balance "
+                 "price; the band is bounded by the floor where buyers question "
+                 "quality and the ceiling where buyers walk.")
+    lines.append("")
+    lines.append("Method: structured price-sensitivity research per "
+                 "`knowledge/patterns/van-westendorp-over-vibes-pricing.md`. Sample "
+                 "size is at the Mickos / Campbell floor (≥20). Reference the "
+                 "behavioral-pricing-architecture pattern for the cognitive substrate "
+                 "behind the curves.")
+    lines.append("")
+    lines.append("## Four canonical intersections")
+    lines.append("")
+    lines.append("| Intersection | Curves | Price | Meaning |")
+    lines.append("|---|---|---:|---|")
+    lines.append(f"| OPP (Optimal Price Point) | too cheap × expensive | ${(psm['OPP'] or 0):.2f} | Minimises buyer rejection (most balanced view) |")
+    lines.append(f"| IPP (Indifference Price Point) | cheap × expensive | ${(psm['IPP'] or 0):.2f} | As many see it as cheap as see it as expensive |")
+    lines.append(f"| PMC (Point of Marginal Cheapness) | too cheap × cheap | ${(psm['PMC'] or 0):.2f} | Floor — below this, buyers question quality |")
+    lines.append(f"| PME (Point of Marginal Expensiveness) | expensive × too expensive | ${(psm['PME'] or 0):.2f} | Ceiling — above this, buyers walk |")
+    lines.append("")
+    lines.append("## Defensible price band")
+    lines.append("")
+    lines.append(f"Bounded by [PMC, PME] = [${(psm['PMC'] or 0):.2f}, ${(psm['PME'] or 0):.2f}]/month.")
+    lines.append("")
+    lines.append("Within the band:")
+    lines.append("- Anchor (high tier) sits near or just above PME for a deliberate anchor effect (Ariely arbitrary coherence).")
+    lines.append(f"- Target tier sits at OPP (${(psm['OPP'] or 0):.2f}) — the rejection-minimising point.")
+    lines.append("- Decoy / starter tier sits between PMC and OPP, deliberately under-bundled.")
+    lines.append("")
+    lines.append("## Median responses (sanity check)")
+    lines.append("")
+    lines.append("| Question | Median response | n |")
+    lines.append("|---|---:|---:|")
+    lines.append(f"| Too cheap (quality concern) | ${(psm.get('median_too_cheap') or 0):.2f} | {psm['n']} |")
+    lines.append(f"| A bargain (cheap) | ${(psm.get('median_cheap') or 0):.2f} | {psm['n']} |")
+    lines.append(f"| Expensive but considerable | ${(psm.get('median_expensive') or 0):.2f} | {psm['n']} |")
+    lines.append(f"| Too expensive (walks away) | ${(psm.get('median_too_expensive') or 0):.2f} | {psm['n']} |")
+    if psm.get("stdev_expensive"):
+        lines.append("")
+        lines.append(f"Standard deviation on the 'expensive' response: ${psm['stdev_expensive']:.2f}. "
+                     "Wide spread suggests segment heterogeneity; consider sub-segmenting.")
+    lines.append("")
+    lines.append("## Competitor pricing matrix context")
+    lines.append("")
+    if competitor_summary:
+        lines.append("From `clients/" + args.client + "/competitive/competitor-pricing.yaml`:")
+        lines.append("")
+        lines.append("| Tier | Median | Min | Max | n competitors |")
+        lines.append("|---|---:|---:|---:|---:|")
+        for tier, summary in sorted(competitor_summary.items()):
+            lines.append(f"| {tier} | ${summary['median']:.2f} | ${summary['min']:.2f} | ${summary['max']:.2f} | {summary['n']} |")
+        lines.append("")
+        lines.append("Mickos rule: do not ship a pricing page from competitor scans. The competitor matrix is "
+                     "context, not the load-bearing input. The WTP curve above is.")
+    else:
+        lines.append("No competitor-pricing.yaml at `clients/" + args.client + "/competitive/competitor-pricing.yaml` "
+                     "or no entries with `monthly_usd` populated. Run the competitive-scout skill plus a manual fill-in "
+                     "to populate the matrix.")
+    lines.append("")
+    if ltv_data:
+        lines.append("## Cohort LTV reference")
+        lines.append("")
+        lines.append(f"From `clients/{args.client}/closed-won-deals.csv` (n={ltv_data['n_deals']}):")
+        lines.append("")
+        lines.append(f"- Median ARR: ${ltv_data['median_arr_usd']:,.2f}")
+        lines.append(f"- Monthly churn: {ltv_data['monthly_churn']*100:.2f}%")
+        lines.append(f"- LTV (= median ARR / annualised churn): ${ltv_data['ltv_usd']:,.2f}")
+        lines.append("")
+        if psm["OPP"]:
+            target_arr_at_opp = (psm["OPP"] or 0) * 12
+            lines.append(f"At OPP (${psm['OPP']:.2f}/month → ${target_arr_at_opp:,.2f} ARR), the implied LTV with "
+                         f"current churn is ${target_arr_at_opp / max(annual_churn := 1 - (1 - ltv_data['monthly_churn']) ** 12, 0.01):,.2f}.")
+            lines.append("")
+            lines.append("If LTV: CAC ≥ 3 is the target, the implied max CAC at OPP pricing is "
+                         f"${(target_arr_at_opp / max(annual_churn, 0.01)) / 3:,.2f}.")
+        lines.append("")
+    lines.append("## Anti-fabrication notes")
+    lines.append("")
+    lines.append(f"- Sample size: {psm['n']} responses (Mickos / Campbell floor: 20). PASS.")
+    lines.append(f"- Source: `{csv_path.relative_to(SUBSTRATE_ROOT) if str(csv_path).startswith(str(SUBSTRATE_ROOT)) else csv_path}`")
+    lines.append("- Method: the four-question van Westendorp PSM as published in 1976 ESOMAR paper.")
+    lines.append(f"- Curves: cumulative empirical distributions, intersections via linear interpolation between bracketing prices.")
+    lines.append("")
+    lines.append("## Open questions")
+    lines.append("")
+    if not competitor_summary:
+        lines.append("- Competitor-pricing.yaml is empty for this client; populate it before the next "
+                     "anchor-design run so tier construction has a competitive context.")
+    if psm.get("stdev_expensive") and psm.get("median_expensive") and psm["stdev_expensive"] > psm["median_expensive"] * 0.5:
+        lines.append("- Wide stdev on the 'expensive' response (>50% of median): segment heterogeneity is high. "
+                     "Consider sub-segmenting and re-running per sub-segment before tier construction.")
+    if not ltv_data:
+        lines.append("- No closed-won-deals.csv at `clients/" + args.client + "/closed-won-deals.csv`. The cohort "
+                     "LTV grounding is missing; populate before running --mode review with a calibrated prediction.")
+    lines.append("- Refresh cadence: every 6 months (Campbell) in markets with mobile competitor pricing; "
+                 "every 12 months otherwise. Schedule next refresh.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/van-westendorp-over-vibes-pricing.md`")
+    lines.append("- `knowledge/patterns/behavioral-pricing-architecture.md`")
+    lines.append("- `knowledge/patterns/pricing-as-the-most-leveraged-org-failure.md`")
+    lines.append("- `skills/pricing-strategic/` — to run anchor-design from this curve")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    sys.stderr.write(f"\n[pricing-strategic] wrote: {out_path}\n")
+    sys.stderr.write(f"  segment={args.segment}  n={psm['n']}\n")
+    sys.stderr.write(f"  OPP=${psm['OPP']:.2f}  IPP=${psm['IPP']:.2f}  band=[${psm['PMC']:.2f}, ${psm['PME']:.2f}]\n")
+    print(str(out_path))
+    return 0
+
+
+def mode_anchor_design(args, client_root: Path, out_dir: Path) -> int:
+    if not args.segment:
+        return refuse("missing-segment",
+                      "--segment <pinned-icp> required for anchor-design mode.")
+
+    # Find the most recent WTP curve for the segment
+    wtp_dir = out_dir / "wtp-curves"
+    if not wtp_dir.is_dir():
+        return refuse(
+            "missing-wtp-data",
+            f"no wtp-curves dir at {wtp_dir}. Run --mode wtp-survey first.",
+        )
+    wtp_files = sorted(wtp_dir.glob(f"{args.segment}-*.md"), reverse=True)
+    if not wtp_files:
+        return refuse(
+            "missing-wtp-data",
+            f"no WTP curve for segment '{args.segment}' in {wtp_dir}. "
+            "Run --mode wtp-survey for this segment first.",
+        )
+    wtp_file = wtp_files[0]
+    wtp_text = wtp_file.read_text(encoding="utf-8")
+
+    def fm(key: str) -> str:
+        m = re.search(r"^" + key + r":\s*(.+)$", wtp_text, re.MULTILINE)
+        return m.group(1).strip() if m else ""
+
+    try:
+        opp = float(fm("opp_usd"))
+        ipp = float(fm("ipp_usd"))
+        pmc = float(fm("pmc_usd"))
+        pme = float(fm("pme_usd"))
+    except (ValueError, AttributeError):
+        return refuse("missing-wtp-data",
+                      f"could not parse PSM intersections from {wtp_file}; re-run --mode wtp-survey.")
+
+    matrix = load_competitor_pricing(args.client) or {}
+    competitor_summary = compute_competitor_band(matrix)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    package_name = f"{args.segment}-tiered-{today}"
+    out_path = out_dir / "packaging" / f"{package_name}.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Tier construction logic from behavioral-pricing-architecture pattern
+    starter_price = round(max(pmc * 1.1, 0), -1) if pmc else 0
+    target_price = round(opp, -1) if opp else 0
+    anchor_price = round(pme * 1.1, -1) if pme else 0
+
+    lines = []
+    lines.append("---")
+    lines.append(f"asset_type: pricing-package")
+    lines.append(f"produced_by: pricing-strategic")
+    lines.append(f"client: {args.client}")
+    lines.append(f"segment: {args.segment}")
+    lines.append(f"package: {package_name}")
+    lines.append(f"tested_at: {today}")
+    lines.append(f"wtp_curve_source: {wtp_file.relative_to(SUBSTRATE_ROOT) if str(wtp_file).startswith(str(SUBSTRATE_ROOT)) else wtp_file}")
+    lines.append("substrate_layers_cited: [voc, positioning, competitive, product-knowledge]")
+    lines.append("patterns_applied: [behavioral-pricing-architecture, van-westendorp-over-vibes-pricing, pricing-as-the-most-leveraged-org-failure]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Pricing package — {args.client} | {args.segment} | {today}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append("Three-tier package with anchor-high / target / decoy structure, sourced from "
+                 f"the WTP curve at `{wtp_file.name}`. The anchor sits at ${anchor_price:.0f}/month "
+                 "(just above PME, deliberate Ariely arbitrary-coherence anchor); the target sits at "
+                 f"${target_price:.0f}/month (OPP, rejection-minimising); the starter sits at "
+                 f"${starter_price:.0f}/month (between PMC and OPP, deliberately under-bundled).")
+    lines.append("")
+    lines.append("## Tier structure")
+    lines.append("")
+    lines.append("| Tier | Monthly | Annual | Position | Architecture role |")
+    lines.append("|---|---:|---:|---|---|")
+    lines.append(f"| **Anchor** | ${anchor_price:.0f} | ${anchor_price * 12:.0f} | High | Deliberate anchor (Ariely arbitrary coherence). Genuinely earns the price via DFY delivery + Leaders feature set per Hormozi value equation. |")
+    lines.append(f"| **Target** | ${target_price:.0f} | ${target_price * 12:.0f} | Middle | OPP — minimises buyer rejection. The expected default. |")
+    lines.append(f"| **Starter** | ${starter_price:.0f} | ${starter_price * 12:.0f} | Low | Decoy + entry path. Under-bundled deliberately so the upgrade path is visible. |")
+    lines.append("")
+    lines.append("## Switching-feature analysis")
+    lines.append("")
+    lines.append("The skill refuses to ship a tier without a stated switching-feature — the feature that "
+                 "moves the buyer from tier A to tier B. Without it, the architecture is feature-checkbox "
+                 "parity, not buyer-perception architecture.")
+    lines.append("")
+    lines.append(f"- **Starter → Target switching feature**: NAME THIS — the one feature whose absence on Starter "
+                 "drives the upgrade. Sourced from `clients/" + args.client + "/voc/processed/win-loss/` "
+                 "where buyers explicitly named the missing feature as the reason they upgraded.")
+    lines.append(f"- **Target → Anchor switching feature**: NAME THIS — the one capability whose absence on "
+                 "Target drives the upgrade. Sourced from the same path; in mid-market the switching feature "
+                 "is often access (SLA, dedicated CSM, multi-region) rather than a product capability.")
+    lines.append("")
+    lines.append("Replace the NAME THIS placeholders with the actual features before shipping; the skill flags "
+                 "any artifact that ships with NAME THIS still in the body.")
+    lines.append("")
+    lines.append("## Behavioral architecture cues (per pat_behavioral-pricing-architecture)")
+    lines.append("")
+    lines.append("| Cue | Applied here |")
+    lines.append("|---|---|")
+    lines.append("| Relativity (Ariely) | Three tiers; the Target is read against the Anchor and the Starter, not absolutely. |")
+    lines.append("| Anchoring + arbitrary coherence (Ariely + Kahneman) | Anchor priced just above PME; reset of the buyer's reference for the category. |")
+    lines.append("| Power of free | Decision deferred to the operator: a free entry tier is a separate business decision (per category economics + Power-of-Free counter-evidence). |")
+    lines.append("| Pain of paying modulators | Annual billing offered with a 15-20% discount; the cadence reduces per-cycle pain. |")
+    lines.append("| Pennies-a-day effect | Use only if the product is daily-use (per Ariely's published rule); otherwise frame at the cadence the buyer actually uses. |")
+    lines.append("| Decoy effect | Starter is deliberately under-bundled to surface the upgrade path. |")
+    lines.append("| Loss aversion (Kahneman) | The 'what you lose by not upgrading' framing is in the comparison table, not the hero. |")
+    lines.append("")
+    lines.append("## Leaders / Fillers / Killers (per Ramanujam)")
+    lines.append("")
+    lines.append("Every feature falls into one of three buckets per the WTP-keyed feature research:")
+    lines.append("")
+    lines.append("- **Leaders**: features that drive purchase decisions; concentrate them in the Target and Anchor tiers.")
+    lines.append("- **Fillers**: features the buyer expects but doesn't pay extra for; spread across all tiers.")
+    lines.append("- **Killers**: features that, when present, reduce willingness to pay (over-engineering, complexity penalty); cut from the package.")
+    lines.append("")
+    lines.append("Source: WTP-keyed feature research per segment. If the research hasn't been done, ship without "
+                 "feature-by-feature WTP attribution and tag this section `requires_research`.")
+    lines.append("")
+    lines.append("## Competitor matrix context")
+    lines.append("")
+    if competitor_summary:
+        lines.append("Competitor pricing per tier:")
+        lines.append("")
+        lines.append("| Competitor tier | Median | This package's tier | Position |")
+        lines.append("|---|---:|---|---|")
+        cmp_starter = competitor_summary.get("starter", {}).get("median")
+        cmp_growth = competitor_summary.get("growth", {}).get("median") or competitor_summary.get("target", {}).get("median")
+        cmp_enterprise = competitor_summary.get("enterprise", {}).get("median") or competitor_summary.get("anchor", {}).get("median")
+        if cmp_starter:
+            diff = (starter_price - cmp_starter) / cmp_starter * 100
+            lines.append(f"| starter | ${cmp_starter:.2f} | Starter ${starter_price:.0f} | {diff:+.0f}% vs market |")
+        if cmp_growth:
+            diff = (target_price - cmp_growth) / cmp_growth * 100
+            lines.append(f"| growth/target | ${cmp_growth:.2f} | Target ${target_price:.0f} | {diff:+.0f}% vs market |")
+        if cmp_enterprise:
+            diff = (anchor_price - cmp_enterprise) / cmp_enterprise * 100
+            lines.append(f"| enterprise/anchor | ${cmp_enterprise:.2f} | Anchor ${anchor_price:.0f} | {diff:+.0f}% vs market |")
+        lines.append("")
+        lines.append("Mickos rule: the competitor matrix is context, not the load-bearing input. The WTP curve is.")
+    else:
+        lines.append("No competitor-pricing.yaml populated. Match against competitors after the matrix is filled.")
+    lines.append("")
+    lines.append("## Discount discipline")
+    lines.append("")
+    lines.append("Per Simon: every discount resets the reference price downward. Bound the discount distribution:")
+    lines.append("")
+    lines.append("- Sales rep discretion: max 15% off list, no manager approval.")
+    lines.append("- Manager approval: 15-25% off list.")
+    lines.append("- VP approval: 25-40% off list.")
+    lines.append("- Above 40%: explicit deal review with revenue-impact memo.")
+    lines.append("")
+    lines.append("Track the distribution monthly. Drift right (more deals at higher discount) is a structural "
+                 "drift signal, not deal-by-deal noise.")
+    lines.append("")
+    lines.append("## Falsifiable predictions for the price-test mode")
+    lines.append("")
+    lines.append(f"Hypothesis: shipping the Target tier at ${target_price:.0f} (OPP) produces conversion-to-paid "
+                 "rates within 10% of the prior baseline at the prior price, with a meaningful lift in MRR-per-customer "
+                 "via tier-mix shift toward Target and Anchor.")
+    lines.append("")
+    lines.append("Run via `pricing-strategic --mode price-test --client " + args.client + " --segment " + args.segment + "`.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append(f"- `{wtp_file.relative_to(SUBSTRATE_ROOT) if str(wtp_file).startswith(str(SUBSTRATE_ROOT)) else wtp_file}` — the WTP curve this package rests on")
+    lines.append("- `knowledge/patterns/behavioral-pricing-architecture.md`")
+    lines.append("- `knowledge/patterns/van-westendorp-over-vibes-pricing.md`")
+    lines.append(f"- `clients/{args.client}/voc/processed/win-loss/` — the source of the switching-feature names")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    sys.stderr.write(f"\n[pricing-strategic] wrote: {out_path}\n")
+    sys.stderr.write(f"  starter=${starter_price}  target=${target_price}  anchor=${anchor_price}\n")
+    print(str(out_path))
+    return 0
+
+
+def mode_packaging(args, client_root: Path, out_dir: Path) -> int:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    package_name = (args.segment or "all-segments") + f"-features-{today}"
+    out_path = out_dir / "packaging" / f"{package_name}.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Read product knowledge + value pillars to enumerate features
+    pk_paths = list((client_root / "product-knowledge").glob("*.md")) if (client_root / "product-knowledge").is_dir() else []
+
+    lines = []
+    lines.append("---")
+    lines.append(f"asset_type: pricing-feature-matrix")
+    lines.append(f"produced_by: pricing-strategic")
+    lines.append(f"client: {args.client}")
+    lines.append(f"segment: {args.segment or 'all-segments'}")
+    lines.append(f"tested_at: {today}")
+    lines.append("substrate_layers_cited: [product-knowledge, voc, positioning]")
+    lines.append("patterns_applied: [behavioral-pricing-architecture, pricing-as-the-most-leveraged-org-failure]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Pricing feature matrix — {args.client} | {args.segment or 'all-segments'} | {today}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append("Feature-to-tier matrix with Ramanujam Leaders / Fillers / Killers tagging. Each feature is "
+                 "binary (free / target / anchor). Switching features are the load-bearing entries — the "
+                 "features whose absence on a lower tier drives the upgrade.")
+    lines.append("")
+    lines.append("## Source product knowledge")
+    lines.append("")
+    if pk_paths:
+        for p in pk_paths:
+            lines.append(f"- `{p.relative_to(SUBSTRATE_ROOT)}`")
+    else:
+        lines.append("No product-knowledge files found at `clients/" + args.client + "/product-knowledge/`. "
+                     "Populate before running this mode in production.")
+    lines.append("")
+    lines.append("## Feature → tier matrix (template)")
+    lines.append("")
+    lines.append("Replace the example rows with the actual features from the product knowledge. Tag each one.")
+    lines.append("")
+    lines.append("| Feature | Bucket | Starter | Target | Anchor | Switching feature for | Source |")
+    lines.append("|---|---|:---:|:---:|:---:|---|---|")
+    lines.append("| Core capability A | Filler | ✓ | ✓ | ✓ | — | product-knowledge/value-pillars.md |")
+    lines.append("| Capability B (advanced) | Leader | ✗ | ✓ | ✓ | Starter → Target | voc/processed/win-loss/ |")
+    lines.append("| Capability C (enterprise) | Leader | ✗ | ✗ | ✓ | Target → Anchor | voc/processed/win-loss/ |")
+    lines.append("| Capability D (over-engineered) | Killer | ✗ | ✗ | ✗ | — | (cut from package) |")
+    lines.append("")
+    lines.append("## Switching features (load-bearing)")
+    lines.append("")
+    lines.append("Per the SKILL.md quality criterion: every tier transition must name a switching feature. "
+                 "Without it, the matrix is feature-checkbox parity, not buyer-perception architecture.")
+    lines.append("")
+    lines.append("- **Starter → Target**: TBD — fill from `voc/processed/win-loss/` analysis, the cases where "
+                 "the buyer explicitly named the missing feature as the upgrade reason.")
+    lines.append("- **Target → Anchor**: TBD — fill from the same source. Often the switching feature is access "
+                 "(SLA, dedicated CSM, multi-region) rather than a capability in mid-market.")
+    lines.append("")
+    lines.append("## Killer-feature audit")
+    lines.append("")
+    lines.append("Per Ramanujam: features that reduce WTP when present (over-engineering, complexity penalty, "
+                 "checkbox bloat) belong in no tier. Audit the existing package for Killers; their removal lifts "
+                 "perceived value without any pricing change.")
+    lines.append("")
+    lines.append("Run a feature-WTP survey on a representative buyer panel: each feature scored on 'must have / "
+                 "nice to have / don't care / would not pay for' to identify Killers explicitly. Without that "
+                 "research, Killer identification is speculative.")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `knowledge/patterns/behavioral-pricing-architecture.md` (Leaders / Fillers / Killers)")
+    lines.append("- `knowledge/patterns/pricing-as-the-most-leveraged-org-failure.md` (Ramanujam pricing-officer rule)")
+    lines.append(f"- `clients/{args.client}/voc/processed/win-loss/` — the source of the switching-feature names")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    sys.stderr.write(f"\n[pricing-strategic] wrote: {out_path}\n")
+    print(str(out_path))
+    return 0
+
+
+def mode_price_test(args, client_root: Path, out_dir: Path) -> int:
+    if not args.ltv:
+        return refuse("missing-ltv",
+                      "--ltv <usd> required for price-test mode. Cite from cohort modeling, not back-of-envelope.")
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    test_id = f"{args.segment or 'segment'}-pricetest-{today}"
+    out_path = out_dir / "tests" / f"{test_id}.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines = []
+    lines.append("---")
+    lines.append(f"asset_type: price-test-design")
+    lines.append(f"produced_by: pricing-strategic")
+    lines.append(f"test_id: {test_id}")
+    lines.append(f"client: {args.client}")
+    lines.append(f"segment: {args.segment or 'all-segments'}")
+    lines.append(f"tested_at: {today}")
+    lines.append(f"ltv_usd: {args.ltv}")
+    lines.append("substrate_layers_cited: [voc, positioning, competitive, product-knowledge]")
+    lines.append("patterns_applied: [van-westendorp-over-vibes-pricing, pricing-as-the-most-leveraged-org-failure, behavioral-pricing-architecture]")
+    lines.append("---")
+    lines.append("")
+    lines.append(f"# Price test — {args.client} | {test_id}")
+    lines.append("")
+    lines.append("## TL;DR")
+    lines.append("")
+    lines.append("A measured price change with a registered prediction. Test runs on new signups (cohort-clean), "
+                 f"with cited LTV ${args.ltv:,.2f}, predicted lift, and explicit kill criterion.")
+    lines.append("")
+    lines.append("## Hypothesis")
+    lines.append("")
+    lines.append("Replace the brackets with the actual values:")
+    lines.append("")
+    lines.append("Increasing the **[tier]** price from **$[old]** to **$[new]** (a [+X]% change) produces a "
+                 "[Y]% lift in MRR-per-customer with conversion-to-paid degrading by no more than [Z]%. The "
+                 "net effect on revenue per cohort is positive.")
+    lines.append("")
+    lines.append("Source for the prediction: WTP curve at `pricing/wtp-curves/" + (args.segment or "segment") + "-*.md`. "
+                 "The new price sits within the [PMC, PME] band; the lift target is bounded by the OPP-vs-current-price gap.")
+    lines.append("")
+    lines.append("## Measurement design")
+    lines.append("")
+    lines.append("```")
+    lines.append("Variant: pricing/<tier>/A (control: current price)")
+    lines.append("         pricing/<tier>/B (treatment: new price)")
+    lines.append("Cohort: new signups in segment '" + (args.segment or "segment") + "' (cohort-clean — no existing customers).")
+    lines.append("Source: Stripe (or billing system); first-party event in CRM for conversion to paid.")
+    lines.append("Method: random assignment 50/50 by signup-week.")
+    lines.append("Window: 8 weeks minimum (4 cohort weeks × 2 for retention signal).")
+    lines.append("Sample size: assume 5% MDE on conversion rate, alpha=0.05, power=0.80.")
+    lines.append("```")
+    lines.append("")
+    lines.append("## Predicted outcomes (falsifiable)")
+    lines.append("")
+    lines.append("| Metric | Direction | Threshold | Window |")
+    lines.append("|---|---|---|---|")
+    lines.append("| MRR per converting customer | up | +[X]% vs control | 8 weeks |")
+    lines.append("| Conversion to paid | flat or down | no worse than -[Y]% vs control | 8 weeks |")
+    lines.append("| Net revenue per signup | up | +[Z]% vs control | 8 weeks |")
+    lines.append("| Net revenue retention (NRR) | flat or up | no worse than control | 12 weeks |")
+    lines.append("")
+    lines.append("## Kill criterion")
+    lines.append("")
+    lines.append("Per Simon: every discount resets the reference price downward; the test is symmetric.")
+    lines.append("")
+    lines.append("- If conversion-to-paid drops more than [2 × predicted Y]% in the first 4 weeks, kill the "
+                 "test. Roll back to control. The pricing perception did not absorb the increase.")
+    lines.append("- If NRR drops more than 5pp from control over the first 12 weeks, kill the test. Cohort "
+                 "retention is the long-run pricing signal; an early NRR drop is the canary.")
+    lines.append("")
+    lines.append("## Resolution")
+    lines.append("")
+    lines.append("After 8 weeks (or 12 for NRR), open the cohort cut, compute the metric deltas, score the "
+                 f"prediction. LTV input: ${args.ltv:,.2f}. The prediction is a calibrated bet; Brier score "
+                 "feeds the calibration ledger.")
+    lines.append("")
+    lines.append("Resolution outputs:")
+    lines.append("- YES: ship the new price as the live default; archive the test artifact under `pricing/tests/resolved/`.")
+    lines.append("- NO: roll back; document the failure mode in `pricing/ledger.md`; route to discovery for re-research.")
+    lines.append("- AMBIGUOUS: data quality failed; mark and reopen with sharper measurement.")
+    lines.append("")
+    lines.append("## Anti-fabrication notes")
+    lines.append("")
+    lines.append(f"- LTV: ${args.ltv:,.2f} (operator-passed; cite source path before resolution).")
+    lines.append(f"- WTP source: `pricing/wtp-curves/{(args.segment or 'segment')}-*.md`.")
+    lines.append("- Discount discipline: bound rep discretion in the live test (no overrides on either variant).")
+    lines.append("")
+    lines.append("## See also")
+    lines.append("")
+    lines.append("- `goals/measurement-contracts/` — open this test as a goal contract")
+    lines.append("- `knowledge/patterns/van-westendorp-over-vibes-pricing.md`")
+    lines.append("- `knowledge/patterns/pricing-as-the-most-leveraged-org-failure.md`")
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    sys.stderr.write(f"\n[pricing-strategic] wrote: {out_path}\n")
+    print(str(out_path))
+    return 0
+
+
+def mode_review(args, client_root: Path, out_dir: Path) -> int:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ledger_path = out_dir / "ledger.md"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load current ledger
+    if ledger_path.is_file():
+        existing = ledger_path.read_text(encoding="utf-8")
+    else:
+        existing = "# Pricing ledger\n\nAppend-only. Each entry: date | change | predicted | observed | resolution.\n\n"
+
+    new_entry = f"""
+## Quarterly review — {today}
+
+**Client:** {args.client}
+**Period:** TBD — fill the prior quarter's start/end.
+**LTV input:** {f'${args.ltv:,.2f}' if args.ltv else 'unset (--ltv required for live audit)'}
+
+### Pricing changes shipped this quarter
+
+(Fill from `pricing/tests/resolved/` plus any out-of-band changes.)
+
+### Realised vs predicted
+
+| Test | Predicted lift | Observed lift | Brier score | Status |
+|---|---:|---:|---:|---|
+| (fill) | (fill) | (fill) | (fill) | YES / NO / AMBIGUOUS |
+
+### Discount distribution drift
+
+(Per Simon: every discount resets reference. Track the shape of the distribution, not the average.)
+
+| Quarter | <15% | 15-25% | 25-40% | >40% | Mean |
+|---|---:|---:|---:|---:|---:|
+| Q-2 | (fill) | (fill) | (fill) | (fill) | (fill) |
+| Q-1 | (fill) | (fill) | (fill) | (fill) | (fill) |
+| Current | (fill) | (fill) | (fill) | (fill) | (fill) |
+
+If the distribution shifted right (more deals at higher discount), flag `discount-erosion` and route to "
+"discovery on the operating cause (rep discipline, deal-desk approvals, competitive pressure).
+
+### NRR delta
+
+(Per Campbell: NRR > 100% is the discipline that hides pricing mistakes. NRR drift is the long-run signal.)
+
+| Quarter | NRR | Pricing-attributed delta |
+|---|---:|---:|
+| Q-1 | (fill) | (fill) |
+| Current | (fill) | (fill) |
+
+### Pricing freshness
+
+- Last WTP refresh: (fill — cite the wtp-curves file)
+- Cadence rule: 6 months in mobile-pricing markets, 12 months otherwise.
+- Next refresh due: (fill)
+
+### Open actions
+
+- (fill)
+
+---
+"""
+    new_text = existing + new_entry
+    ledger_path.write_text(new_text, encoding="utf-8")
+    sys.stderr.write(f"\n[pricing-strategic] appended quarterly review to: {ledger_path}\n")
+    print(str(ledger_path))
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="pricing-strategic — pricing analysis from positioning + LTV + competitive matrix.")
+    p.add_argument("--client", required=True)
+    p.add_argument("--mode", required=True,
+                   choices=["wtp-survey", "anchor-design", "packaging", "price-test", "review"])
+    p.add_argument("--segment", default=None,
+                   help="Pinned ICP segment (required for wtp-survey and anchor-design)")
+    p.add_argument("--wtp-csv", default=None,
+                   help="Path to a CSV with respondent_id, segment, too_cheap, cheap, expensive, too_expensive")
+    p.add_argument("--ltv", type=float, default=None,
+                   help="Cohort LTV in USD (required for price-test and review)")
+    p.add_argument("--out", default=None)
+    args = p.parse_args()
+
+    # Refusal: positioning + competitive (skill_check_layers reads from frontmatter)
+    pos_dir = SUBSTRATE_ROOT / "clients" / args.client / "positioning"
+    pos_file = SUBSTRATE_ROOT / "clients" / args.client / "positioning.md"
+    if not pos_dir.is_dir() and not pos_file.is_file():
+        return refuse("missing-positioning",
+                      f"clients/{args.client}/positioning/ not found. "
+                      "Run positioning-forge first; this skill refuses without canonical positioning "
+                      "(per the SKILL.md substrate_layers_required).")
+
+    matrix_path = SUBSTRATE_ROOT / "clients" / args.client / "competitive" / "competitor-pricing.yaml"
+    if not matrix_path.is_file():
+        # warn but proceed for wtp-survey; refuse for anchor-design
+        if args.mode == "anchor-design":
+            return refuse(
+                "missing-competitor-pricing",
+                f"competitor-pricing.yaml not found at {matrix_path}. "
+                "anchor-design refuses without the competitor matrix; populate from "
+                "templates/competitor-pricing-example.yaml or run competitive-scout first.",
+            )
+
+    # Run preflight (best-effort; non-blocking on failure)
+    pf = run_preflight(args.client)
+    if pf == 5:
+        return 5
+
+    client_root = SUBSTRATE_ROOT / "clients" / args.client
+    out_dir = Path(args.out) if args.out else (client_root / "pricing")
+
+    if args.mode == "wtp-survey":
+        return mode_wtp_survey(args, client_root, out_dir)
+    if args.mode == "anchor-design":
+        return mode_anchor_design(args, client_root, out_dir)
+    if args.mode == "packaging":
+        return mode_packaging(args, client_root, out_dir)
+    if args.mode == "price-test":
+        return mode_price_test(args, client_root, out_dir)
+    if args.mode == "review":
+        return mode_review(args, client_root, out_dir)
+    return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main())

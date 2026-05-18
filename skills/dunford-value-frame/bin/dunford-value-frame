@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# dunford-value-frame — value-frame rewrite scored against Dunford's 5-axis rubric.
+#
+# Usage:
+#   dunford-value-frame <hero-asset> --client <slug> --icp <icp-id> --competitors <c1,c2,c3> [--dry-run]
+#
+# Pipeline (gates):
+#   1. preflight (substrate-cite + voice + copy-quality + refusal-pattern)
+#   2. ≥3 competitor refs (Dunford: differentiation requires concrete alternatives)
+#   3. ICP anchor present
+#   4. positioning canonical present (clients/<client>/substrate/positioning-canonical-statement-*.md)
+#
+# Exit codes: 0 pass, 1 gate fail, 2 file not found
+
+set -uo pipefail
+SUBSTRATE_ROOT="${SUBSTRATE_ROOT:-${FLYWHEEL_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}}"
+
+ASSET="${1:?hero asset required}"
+[ -f "$ASSET" ] || { echo "asset not found: $ASSET" >&2; exit 2; }
+
+CLIENT="${SUBSTRATE_CLIENT:-${CLIENT:-}}"
+ICP=""; COMPETITORS=""
+shift || true
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --client) CLIENT="$2"; shift 2 ;;
+    --client=*) CLIENT="${1#--client=}"; shift ;;
+    --icp) ICP="$2"; shift 2 ;;
+    --competitors) COMPETITORS="$2"; shift 2 ;;
+    --dry-run|--stage|--prod) shift ;;
+    *) shift ;;
+  esac
+done
+
+# Infer client from asset path if not passed.
+if [ -z "$CLIENT" ]; then
+  case "$ASSET" in
+    */clients/*/*) CLIENT=$(echo "$ASSET" | sed -E 's@.*/clients/([^/]+)/.*@\1@') ;;
+  esac
+fi
+if [ -z "$CLIENT" ]; then
+  echo "  ✗ --client required (or set SUBSTRATE_CLIENT, or pass an asset under clients/<slug>/)" >&2
+  exit 1
+fi
+
+echo "=== dunford-value-frame: $ASSET (client=$CLIENT) ===" >&2
+
+# Gate 1: preflight
+echo "→ Gate 1: preflight" >&2
+if "$SUBSTRATE_ROOT/skills/pre-publish-check/bin/preflight" "$ASSET" --client "$CLIENT" 2>/dev/null >/dev/null; then
+  echo "  ✓ preflight PASS" >&2
+else
+  echo "  ✗ preflight FAIL" >&2
+  exit 1
+fi
+
+# Gate 2: ≥3 competitors
+COMP_COUNT=$(echo "$COMPETITORS" | tr ',' '\n' | grep -c .)
+echo "→ Gate 2: ≥3 competitors" >&2
+if [ "$COMP_COUNT" -lt 3 ]; then
+  echo "  ✗ need 3+ competitor refs (got $COMP_COUNT). Dunford: differentiation requires concrete alternatives." >&2
+  exit 1
+fi
+echo "  ✓ competitors=$COMP_COUNT" >&2
+
+# Gate 3: ICP
+echo "→ Gate 3: ICP anchor" >&2
+if [ -z "$ICP" ]; then
+  echo "  ✗ --icp required" >&2
+  exit 1
+fi
+echo "  ✓ icp=$ICP" >&2
+
+# Gate 4: positioning canonical
+POS_CANONICAL=$(ls "$SUBSTRATE_ROOT/clients/$CLIENT/substrate/"positioning-canonical-statement-*.md 2>/dev/null | head -1)
+if [ -z "$POS_CANONICAL" ]; then
+  echo "  ✗ positioning canonical statement missing in substrate" >&2
+  exit 1
+fi
+echo "  ✓ positioning canonical present" >&2
+
+echo "DRY-RUN: gates passed; rubric-scored rewrites produced by Claude Code session at value-frame-rewrites.md" >&2
+echo "PASS-DRY: $ASSET"
+exit 0

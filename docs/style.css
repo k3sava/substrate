@@ -220,7 +220,7 @@ header {
 /* ---------- typography ---------- */
 .kicker {
   font-family: var(--mono); font-size: clamp(10px, 1.1vw, 13px); font-weight: 500;
-  text-transform: uppercase; letter-spacing: .16em;
+  text-transform: uppercase; letter-spacing: .16em; white-space: nowrap;
   color: var(--accent); margin-bottom: clamp(14px, 2vh, 22px);
 }
 h1 {

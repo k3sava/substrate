@@ -41,7 +41,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-<link rel="stylesheet" href="style.css?v=7" />
+<link rel="stylesheet" href="style.css?v=8" />
 
 <script type="application/ld+json">
 {
@@ -161,7 +161,7 @@
     <div class="card-body">
       <p class="kicker">context-first · open-source · MIT</p>
       <h1>One human.<br/><span class="accent">Marketing machine.</span></h1>
-      <p class="big">An AI-native operating system for go-to-market. Any team size. Context is the load-bearing layer — not the headcount.</p>
+      <p class="big">An AI-native operating system for go-to-market. Any&nbsp;team size. Context is the load-bearing layer — not the headcount.</p>
       <div class="stat-row">
         <div class="stat-item"><span class="si-n">86</span><span class="si-l">skills</span></div>
         <div class="stat-item"><span class="si-n">84</span><span class="si-l">patterns</span></div>
@@ -181,7 +181,7 @@
     <div class="card-body split">
       <div class="card-text">
         <h2>One person, end-to-end.</h2>
-        <p class="big">Positioning that cites itself. Sales narrative that holds up under audit. Pages, sequences, playbooks, and AEO content all reading from the same canonical layer.</p>
+        <p class="big">Positioning that cites itself. Sales&nbsp;narrative that holds up under audit. Pages, sequences, playbooks, and AEO&nbsp;content all reading from the same canonical&nbsp;layer.</p>
         <p class="med">What a six-person GTM team used to ship — one operator end-to-end, or a team running the same shared canonical layer.</p>
       </div>
       <div class="surfaces card-viz">
@@ -215,33 +215,15 @@
         <p class="punchline">Missing context? Refused. Voice drift? Refused. Unverifiable claim? Refused.</p>
       </div>
       <div class="card-viz">
-        <svg viewBox="0 0 200 230" xmlns="http://www.w3.org/2000/svg" class="viz-flow" aria-hidden="true">
-          <!-- context -->
-          <rect class="vf-node" x="50" y="4" width="100" height="42" rx="4"/>
-          <text class="vf-label" x="100" y="22">context</text>
-          <text class="vf-sub" x="100" y="36">ICP · voice · position</text>
-          <!-- arrow ↓ -->
-          <line class="vf-line" x1="100" y1="46" x2="100" y2="62"/>
-          <polygon class="vf-arr" points="96,60 100,68 104,60"/>
-          <!-- skill -->
-          <rect class="vf-node" x="50" y="68" width="100" height="42" rx="4"/>
-          <text class="vf-label" x="100" y="86">skill</text>
-          <text class="vf-sub" x="100" y="100">86 wired</text>
-          <!-- arrow ↓ -->
-          <line class="vf-line" x1="100" y1="110" x2="100" y2="124"/>
-          <polygon class="vf-arr" points="96,122 100,130 104,122"/>
-          <!-- gate diamond: center(100,152), pts top(100,130) right(138,152) bottom(100,174) left(62,152) -->
-          <polygon class="vf-gate" points="100,130 138,152 100,174 62,152"/>
-          <text class="vf-gate-lbl" x="100" y="156">gate</text>
-          <!-- pass → right -->
-          <line class="vf-line-pass" x1="138" y1="152" x2="168" y2="152"/>
-          <polygon class="vf-arr-pass" points="166,148 174,152 166,156"/>
-          <text class="vf-pass-lbl" x="178" y="156">✓</text>
-          <!-- fail ↓ -->
-          <line class="vf-line-fail" x1="100" y1="174" x2="100" y2="200"/>
-          <polygon class="vf-arr-fail" points="96,198 100,206 104,198"/>
-          <text class="vf-fail-lbl" x="100" y="222">refused</text>
-        </svg>
+        <div class="gate-check" role="img" aria-label="Example pre-publish-check output showing context and voice passing, claim-verify and pattern-applied failing, result: REFUSED — 2 blocks">
+          <code class="gc-cmd">pre-publish-check draft.md</code>
+          <hr class="gc-divider" />
+          <div class="gc-row"><span class="gc-pass">✓</span><span class="gc-name">context</span><span class="gc-detail">ICP · voice · position</span></div>
+          <div class="gc-row"><span class="gc-pass">✓</span><span class="gc-name">voice</span><span class="gc-detail">kill-list clear</span></div>
+          <div class="gc-row"><span class="gc-fail">✗</span><span class="gc-name">claim-verify</span><span class="gc-detail">rivals/a.md not found</span></div>
+          <div class="gc-row"><span class="gc-fail">✗</span><span class="gc-name">pattern-applied</span><span class="gc-detail">displacement-frame missing</span></div>
+          <code class="gc-result refused">REFUSED — 2 blocks</code>
+        </div>
       </div>
     </div>
   </article>
@@ -286,7 +268,7 @@
     <div class="card-body split">
       <div class="card-text">
         <h2>The floor and the ceiling.</h2>
-        <p class="big">Substrate handles the floor: citation, voice, freshness, drift detection, the gate check before every asset ships.</p>
+        <p class="big">Substrate handles the floor: citation, voice, freshness, drift detection, the gate&nbsp;check before every asset ships.</p>
         <p class="med">What's worth saying. What's worth shipping. What real value means in the room you're in. That part is still yours.</p>
       </div>
       <div class="taste-split card-viz">
@@ -318,7 +300,7 @@
     <div class="card-rail"><span class="rail-num">06</span><span class="rail-tag">who it's for</span></div>
     <div class="card-body">
       <h2>Three ways to run it.</h2>
-      <p class="big">Solo operator, shared team substrate, or a private fork per client. The framework is the same. The context layer is yours.</p>
+      <p class="big">Solo operator, shared team substrate, or a private&nbsp;fork per client. The framework is the same. The context layer is yours.</p>
       <div class="run-modes">
         <div class="run-mode">
           <div class="rm-label">solo operator</div>

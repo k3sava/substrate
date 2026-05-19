@@ -127,6 +127,6 @@ Be direct. Be operator-grade. Disagree with the work, not the person. If a claim
 
 GitHub issues for bugs / feature requests. Discussions for "should the framework do X?" questions.
 
-For consulting (helping a team set Substrate up for their context): open a GitHub discussion on the repo.
+For help getting your team set up: open a GitHub discussion on the repo.
 
 *Maintainer: [Kesava Mandiga](https://github.com/k3sava)*

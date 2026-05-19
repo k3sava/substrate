@@ -2,7 +2,6 @@
 
 Clone substrate and stand up your first client team in under 30 minutes. Designed for a new operator (PMM, GTM, marketing lead) who has never run substrate before.
 
-If you'd like the maintainer to install substrate for you on Phase 1 of a paid engagement, open a GitHub discussion. Otherwise, read on.
 
 ## What you'll have at the end
 
@@ -134,4 +133,4 @@ Day 1 through day 5, step by step. By Friday you have positioning, status-quo co
 
 **`substrate --list` shows fewer skills than expected.** Check `bin/` is on your PATH and that you ran `chmod +x bin/*` if you copied the repo across machines.
 
-**You want to install substrate on a client team's machine.** Open a GitHub discussion on the repo and reference this Quickstart. The maintainer can walk through Phase 1 setup with you.
+**You want to stand up substrate for a client team.** Follow this Quickstart from their machine. The bootstrap command and 5-day orchestration (`new-client-onboarding-week-1`) are the starting points.

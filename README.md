@@ -1,6 +1,6 @@
 # Substrate
 
-> An AI-native operating system for PMM, GTM, and marketing workflows. The open-source artifact behind a working consulting practice. Clone it, install it, run it for your team.
+> An AI-native operating system for PMM, GTM, and marketing workflows. Context is the load-bearing layer — not the headcount. Clone it, install it, run it for your team.
 
 Most marketing teams treat AI as a faster typist. Substrate treats it as a function of context. Same operator, same model, with shared canonical context, produces materially better work than the same operator without it. The system is the floor; people set the ceiling.
 
@@ -14,7 +14,7 @@ Substrate ships 86 wired skills across 16 surfaces, 84 codex-grounded patterns (
 
 A context-first operating system for go-to-market work. Every external draft (landing page, ad, email, content piece, video, sales sequence, CS playbook) is grounded in canonical context, gated by a pre-publish check, scored against a stand-in buyer panel, and tied to a goal with a calibration score. Context is the multiplier, not AI.
 
-Substrate is the open-source distillation of a working PMM / GTM consulting practice. The maintainer installs it on Phase 1 of a paid engagement; the artifact stays with the client. The public repo is what a client team clones and runs after the engagement closes (or what any operator picks up cold).
+The traditional GTM org has a dedicated head for every function because each function used to need one. Context infrastructure changes that math. One operator with substrate covers positioning, content, AEO, performance, sales enablement, and retention — what used to need six dedicated seats. A team on a shared substrate layer covers what used to need twenty. Run it solo, run it with a team, or private-fork per client. The OS is the same; the context layer is yours.
 
 ---
 
@@ -28,11 +28,11 @@ substrate positioning-forge --diagnose --client <slug>
 substrate ad-creative-design --client <slug> --channel meta --variants 4
 ```
 
-**Pick an orchestration, run a cycle.** A new client engagement. A quarter of PMM work. A launch. A funnel audit. An AEO publish month. A competitor watch week. An expansion play. Orchestrations compose 4-12 skills into a named operator cycle with declared cadence, owner, inputs, outputs, failure modes, and calibration hooks. End-to-end, not artifact-at-a-time.
+**Pick an orchestration, run a cycle.** A new team onboarding. A quarter of PMM work. A launch. A funnel audit. An AEO publish month. A competitor watch week. An expansion play. Orchestrations compose 4-12 skills into a named operator cycle with declared cadence, owner, inputs, outputs, failure modes, and calibration hooks. End-to-end, not artifact-at-a-time.
 
 | Orchestration | Cadence | What it produces |
 |---|---|---|
-| [`new-client-onboarding-week-1`](routines/new-client-onboarding-week-1.md) | Day 1 to day 5 of a paid engagement | Bootstrapped client, positioning, narrative, messaging matrix, one customer-facing artifact, 90-day roadmap, three calibrated goals |
+| [`new-client-onboarding-week-1`](routines/new-client-onboarding-week-1.md) | Day 1 to day 5 of a new team or client onboarding | Bootstrapped client, positioning, narrative, messaging matrix, one customer-facing artifact, 90-day roadmap, three calibrated goals |
 | [`quarterly-pmm-cycle`](routines/quarterly-pmm-cycle.md) | Quarterly, with mid-quarter checkpoint | Refresh + open at week 1, signal continuous, mid-quarter checkpoint, resolve + calibrate at week 13 |
 | [`launch-flow`](routines/launch-flow.md) | Per-launch, T-12w through T+12w | Plan, brief and generate, gate every asset, ship in cadence, holdout, debrief and Brier score |
 | [`full-funnel-audit`](routines/full-funnel-audit.md) | Quarterly, week 1 of the quarter | Paid + email + activation + retention + churn diagnosis, three opened goals naming next quarter's funnel-shaping bets |
@@ -64,7 +64,7 @@ If your team operates inside a GTM motion and your work could be wrong in measur
 
 ## The thesis, in one paragraph
 
-The same team, with the same model, with shared context, produces materially better work than the same team without it. Faster, sharper, with citations that hold up. Most teams treat context as documentation. Substrate treats it as the load-bearing layer, alongside goals you can score, skills that refuse bad input, and orchestrations that compose the skills into named cycles. AI is not the multiplier. The context AI reads is.
+The same team, with the same model, with shared context, produces materially better work than the same team without it. Faster, sharper, with citations that hold up. Most teams treat context as documentation. Substrate treats it as the load-bearing layer, alongside goals you can score, skills that refuse bad input, and orchestrations that compose the skills into named cycles. AI is not the multiplier. The context AI reads is. The result: one operator end-to-end covers what a traditional GTM org used to staff six dedicated seats for. A small team on a shared substrate layer covers what twenty used to. Context infrastructure makes role compression structural, not heroic.
 
 ---
 
@@ -154,17 +154,17 @@ Per-skill specs live at `skills/<name>/SKILL.md` with `patterns_grounded` + `con
 
 ---
 
-## Consulting-poc, the engagement entry point
+## consulting-poc, the team onboarding skill
 
-`consulting-poc` orchestrates a productized 5-day fixed-price proof-of-concept for a consulting prospect. Most consulting proposals offer capability ("I have a system, let's try it"). This skill offers *artifacts the prospect keeps* and *a diagnostic they can audit*. Substrate makes the offer different in kind, not in degree: every claim cites a substrate path, every pattern cites 3+ operators, the prospect's team can run the same skills after the engagement.
+`consulting-poc` orchestrates a productized 5-day proof-of-concept for a new team or client. The skill offers *artifacts the team keeps* and *a diagnostic they can audit*: every claim cites a substrate path, every pattern cites 3+ operators, the team can run the same skills independently after the onboarding closes.
 
 The flow:
 
-- **Phase 0 (free, 60-90 min)**: bootstrap a `clients/<prospect>/` from public surface; walk into the discovery call carrying their positioning audit, AEO triangle status, status-quo competitor map, and Tier A pattern coverage. The 90-min call shows the team their business through substrate. The pitch ends: "Here's what a 5-day POC produces. Here's the price."
-- **Phase 1 (5-day fixed-price)**: day 1 bootstrap + ICP cut + 3 customer calls booked; day 2 positioning + status-quo + Dunford value frame; day 3 narrative spine + messaging matrix; day 4 a high-leverage artifact (LP variant, content brief, or win-loss interview); day 5 diagnostic report + 90-day roadmap with three calibrated goals.
-- **Phase 2 (optional continuation)**: embedded operator (4-8 weeks), monthly retainer (3-month minimum), train-the-team (2-week sprint).
+- **Phase 0 (free, 60-90 min)**: bootstrap a `clients/<prospect>/` from public surface; carry a positioning audit, AEO triangle status, status-quo competitor map, and Tier A pattern coverage into the first call. The call shows the team their business through substrate.
+- **Phase 1 (5-day sprint)**: day 1 bootstrap + ICP cut + 3 customer calls booked; day 2 positioning + status-quo + Dunford value frame; day 3 narrative spine + messaging matrix; day 4 a high-leverage artifact (LP variant, content brief, or win-loss interview); day 5 diagnostic report + 90-day roadmap with three calibrated goals.
+- **Phase 2 (optional continuation)**: embedded operator (4-8 weeks), shared substrate (team runs it with you), or train-the-team (2-week sprint).
 
-Run the engagement through the [`new-client-onboarding-week-1`](routines/new-client-onboarding-week-1.md) orchestration; the consulting-poc skill is the load-bearing primitive, the orchestration wraps it with a day-by-day script.
+Run Phase 1 through the [`new-client-onboarding-week-1`](routines/new-client-onboarding-week-1.md) orchestration; `consulting-poc` is the load-bearing skill, the orchestration wraps it with a day-by-day script.
 
 ---
 
@@ -275,11 +275,9 @@ Substrate doesn't carry `produced_by: <skill>` frontmatter on its own structural
 
 ## A note on the work
 
-Substrate is the open-source distillation of an operating system the maintainer has built and run across multiple PMM / GTM engagements. The framework is field-tested. The public release strips every client-specific artifact (positioning, ICP, competitive, voice-of-customer, deliverables) and ships the structure: the loop, the principles, the skills, the gates, the calibration ledger, the personas-as-fragments architecture, the codex-grounded knowledge layer, the behavioral grounding gates, and the orchestrations.
+Substrate is the open-source distillation of a system built and run across PMM, content marketing, performance, AEO, sales enablement, and customer success functions. Field-tested against real clients, real copy, real measurement contracts. The public release strips every client-specific artifact and ships the structure: the loop, the principles, the skills, the gates, the calibration ledger, the knowledge layer, the behavioral grounding gates, and the orchestrations.
 
-The first-pass v1.5 is what you can run today. Issues and PRs welcome via GitHub.
-
-For consulting engagements (the maintainer installs Substrate on Phase 1, the artifact stays with the team), open a GitHub issue or a discussion.
+v1.6.0 is the current release. Issues and PRs welcome via GitHub.
 
 ---
 

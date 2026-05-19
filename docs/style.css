@@ -420,6 +420,37 @@ pre code { font-family: inherit; background: transparent; padding: 0; }
 .ts-item:last-child { border-bottom: none; }
 .ts-divider { width: 1px; background: var(--line); flex: none; }
 
+/* ---------- run modes (card 06) ---------- */
+.run-modes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+  margin-top: 28px;
+}
+.run-mode {
+  padding: 20px 22px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.rm-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .12em;
+  color: var(--accent);
+  margin-bottom: 12px;
+}
+.rm-body {
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--ink);
+  margin: 0;
+}
+@media (max-width: 900px) {
+  .run-modes { grid-template-columns: 1fr; }
+}
+
 /* ---------- metric visual (card 07) ---------- */
 .metric-viz {
   display: flex; flex-direction: column; gap: 20px;
